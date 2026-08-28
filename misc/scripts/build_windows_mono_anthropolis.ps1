@@ -6,7 +6,7 @@
 # .NET SDK 8+; run `python misc\scripts\install_d3d12_sdk_windows.py` once for the D3D12 deps.
 $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..\..')
-python -m SCons platform=windows arch=x86_64 target=editor module_mono_enabled=yes d3d12=yes vsproj=no -j([Environment]::ProcessorCount - 4)
+python -m SCons platform=windows arch=x86_64 target=editor production=yes module_mono_enabled=yes d3d12=yes vsproj=no -j([Environment]::ProcessorCount - 4)
 if ($LASTEXITCODE -ne 0) { throw "scons failed ($LASTEXITCODE)" }
 & .\bin\godot.windows.editor.x86_64.mono.exe --headless --generate-mono-glue modules/mono/glue
 if ($LASTEXITCODE -ne 0) { throw "glue generation failed ($LASTEXITCODE)" }
