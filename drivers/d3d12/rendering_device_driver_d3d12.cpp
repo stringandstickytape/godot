@@ -2224,9 +2224,11 @@ static void _rd_stages_and_access_to_d3d12(BitField<RDD::PipelineStageBits> p_st
 			// No valid synchronization scope was defined and no access in particular is required.
 			r_access = D3D12_BARRIER_ACCESS_NO_ACCESS;
 		} else {
-			// Access is required but the synchronization scope wasn't compatible. We fall back to the global synchronization scope and access.
+			// Access is required but the synchronization scope wasn't compatible. Fall back to the global
+			// synchronization scope, which is compatible with every access bit. Do NOT widen the access to
+			// COMMON: a barrier with COMMON on one side is only legal when the other side is COMMON too
+			// (D3D12 STATE_SETTING ERROR #1331 INCOMPATIBLE_BARRIER_VALUES -> failed Close() -> device removal).
 			r_sync = D3D12_BARRIER_SYNC_ALL;
-			r_access = D3D12_BARRIER_ACCESS_COMMON;
 		}
 	}
 }
