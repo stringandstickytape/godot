@@ -5796,6 +5796,57 @@ uint64_t RenderingDeviceDriverD3D12::get_lazily_memory_used() {
 	return 0;
 }
 
+static Dictionary _d3d12ma_detailed_statistics_to_dictionary(const D3D12MA::DetailedStatistics &p_statistics) {
+	Dictionary result;
+	result["block_count"] = p_statistics.Stats.BlockCount;
+	result["allocation_count"] = p_statistics.Stats.AllocationCount;
+	result["block_bytes"] = p_statistics.Stats.BlockBytes;
+	result["allocation_bytes"] = p_statistics.Stats.AllocationBytes;
+	result["block_slack_bytes"] = p_statistics.Stats.BlockBytes - p_statistics.Stats.AllocationBytes;
+	result["unused_range_count"] = p_statistics.UnusedRangeCount;
+	result["allocation_size_min_bytes"] = p_statistics.Stats.AllocationCount > 0 ? p_statistics.AllocationSizeMin : 0;
+	result["allocation_size_max_bytes"] = p_statistics.AllocationSizeMax;
+	result["unused_range_size_min_bytes"] = p_statistics.UnusedRangeCount > 0 ? p_statistics.UnusedRangeSizeMin : 0;
+	result["unused_range_size_max_bytes"] = p_statistics.UnusedRangeSizeMax;
+	return result;
+}
+
+static Dictionary _d3d12ma_memory_segment_to_dictionary(const D3D12MA::DetailedStatistics &p_statistics, const D3D12MA::Budget &p_budget) {
+	Dictionary result = _d3d12ma_detailed_statistics_to_dictionary(p_statistics);
+	result["usage_bytes"] = p_budget.UsageBytes;
+	result["budget_bytes"] = p_budget.BudgetBytes;
+	return result;
+}
+
+Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics() {
+	D3D12MA::TotalStatistics statistics = {};
+	allocator->CalculateStatistics(&statistics);
+
+	D3D12MA::Budget local_budget = {};
+	D3D12MA::Budget non_local_budget = {};
+	allocator->GetBudget(&local_budget, &non_local_budget);
+
+	Dictionary heap_types;
+	heap_types["default"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.HeapType[0]);
+	heap_types["upload"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.HeapType[1]);
+	heap_types["readback"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.HeapType[2]);
+	heap_types["custom"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.HeapType[3]);
+	heap_types["gpu_upload"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.HeapType[4]);
+
+	Dictionary memory_segments;
+	memory_segments["local"] = _d3d12ma_memory_segment_to_dictionary(statistics.MemorySegmentGroup[0], local_budget);
+	memory_segments["non_local"] = _d3d12ma_memory_segment_to_dictionary(statistics.MemorySegmentGroup[1], non_local_budget);
+
+	Dictionary result;
+	result["backend"] = "d3d12";
+	result["is_uma"] = allocator->IsUMA() != FALSE;
+	result["gpu_upload_heap_supported"] = allocator->IsGPUUploadHeapSupported() != FALSE;
+	result["total"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.Total);
+	result["heap_types"] = heap_types;
+	result["memory_segments"] = memory_segments;
+	return result;
+}
+
 uint64_t RenderingDeviceDriverD3D12::limit_get(Limit p_limit) {
 	uint64_t safe_unbounded = ((uint64_t)1 << 30);
 	switch (p_limit) {

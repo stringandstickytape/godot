@@ -8045,6 +8045,120 @@ uint64_t RenderingDevice::get_memory_usage(MemoryType p_type) const {
 	}
 }
 
+Dictionary RenderingDevice::get_memory_diagnostics() {
+	ERR_RENDER_THREAD_GUARD_V(Dictionary());
+	// Explicit CPU-side snapshot only: no GPU readback, fence wait, or resource retirement.
+	Dictionary result;
+	result["schema_version"] = 1;
+	result["snapshot_non_atomic"] = true;
+	result["frames_drawn"] = frames_drawn;
+	result["driver"] = driver->get_memory_diagnostics();
+
+	Array workers;
+	uint64_t worker_capacity = 0;
+	uint64_t worker_allocation_bytes = 0;
+	uint64_t worker_used = 0;
+	{
+		// Match acquisition's pool -> worker lock order. Do not hold the RD resource mutex here.
+		MutexLock pool_lock(transfer_worker_pool_mutex);
+		result["transfer_worker_max_count"] = transfer_worker_pool_max_size;
+		for (uint32_t i = 0; i < transfer_worker_pool_size; i++) {
+			TransferWorker *worker = transfer_worker_pool[i];
+			MutexLock worker_lock(worker->thread_mutex);
+			Dictionary row;
+			row["index"] = worker->index;
+			row["capacity_bytes"] = worker->staging_buffer_size_allocated;
+			uint64_t allocation_bytes = worker->staging_buffer ? driver->buffer_get_allocation_size(worker->staging_buffer) : 0;
+			row["allocation_bytes"] = allocation_bytes;
+			row["used_bytes"] = worker->staging_buffer_size_in_use;
+			row["largest_transfer_bytes"] = worker->max_transfer_size;
+			row["recording"] = worker->recording;
+			row["submitted"] = worker->submitted;
+			workers.push_back(row);
+			worker_capacity += worker->staging_buffer_size_allocated;
+			worker_allocation_bytes += allocation_bytes;
+			worker_used += worker->staging_buffer_size_in_use;
+		}
+	}
+	result["transfer_workers"] = workers;
+	result["transfer_worker_capacity_bytes"] = worker_capacity;
+	result["transfer_worker_allocation_bytes"] = worker_allocation_bytes;
+	result["transfer_worker_used_bytes"] = worker_used;
+
+	const StagingBuffers *rings[] = { &upload_staging_buffers, &download_staging_buffers };
+	const char *ring_names[] = { "upload_ring", "download_ring" };
+	for (int i = 0; i < 2; i++) {
+		const StagingBuffers &ring = *rings[i];
+		Dictionary row;
+		row["block_count"] = ring.blocks.size();
+		row["block_size_bytes"] = ring.block_size;
+		row["capacity_bytes"] = uint64_t(ring.blocks.size()) * ring.block_size;
+		row["max_size_bytes"] = ring.max_size;
+		uint64_t allocation_bytes = 0;
+		uint64_t last_fill_bytes = 0;
+		for (const StagingBufferBlock &block : ring.blocks) {
+			allocation_bytes += driver->buffer_get_allocation_size(block.driver_id);
+			last_fill_bytes += block.fill_amount;
+		}
+		row["allocation_bytes"] = allocation_bytes;
+		row["last_fill_bytes_sum"] = last_fill_bytes;
+		result[ring_names[i]] = row;
+	}
+
+	{
+		_THREAD_SAFE_METHOD_
+		result["rd_buffer_accounted_bytes_including_pending"] = buffer_memory;
+		result["rd_texture_allocation_bytes_including_pending"] = texture_memory;
+		Array pending_frames;
+		for (uint32_t i = 0; i < frames.size(); i++) {
+			const Frame &pending = frames[i];
+			Dictionary row;
+			row["frame_index"] = i;
+			row["buffer_count"] = pending.buffers_to_dispose_of.size();
+			row["texture_count"] = pending.textures_to_dispose_of.size();
+			uint64_t buffer_bytes = 0;
+			uint64_t texture_bytes = 0;
+			uint64_t fallback_buffer_bytes = 0;
+			uint64_t fallback_texture_bytes = 0;
+			uint32_t fallback_buffer_count = 0;
+			uint32_t fallback_texture_count = 0;
+			for (const Buffer &buffer : pending.buffers_to_dispose_of) {
+				buffer_bytes += driver->buffer_get_allocation_size(buffer.driver_id);
+			}
+			for (const Texture &texture : pending.textures_to_dispose_of) {
+				texture_bytes += driver->texture_get_allocation_size(texture.driver_id);
+				if (texture.shared_fallback != nullptr) {
+					if (texture.shared_fallback->texture) {
+						uint64_t bytes = driver->texture_get_allocation_size(texture.shared_fallback->texture);
+						texture_bytes += bytes;
+						fallback_texture_bytes += bytes;
+						fallback_texture_count++;
+					}
+					if (texture.shared_fallback->buffer) {
+						uint64_t bytes = driver->buffer_get_allocation_size(texture.shared_fallback->buffer);
+						buffer_bytes += bytes;
+						fallback_buffer_bytes += bytes;
+						fallback_buffer_count++;
+					}
+				}
+			}
+			row["buffer_allocation_bytes"] = buffer_bytes;
+			row["texture_allocation_bytes"] = texture_bytes;
+			row["texture_fallback_buffer_count"] = fallback_buffer_count;
+			row["texture_fallback_buffer_allocation_bytes"] = fallback_buffer_bytes;
+			row["texture_fallback_texture_count"] = fallback_texture_count;
+			row["texture_fallback_texture_allocation_bytes"] = fallback_texture_bytes;
+			row["uniform_set_count"] = pending.uniform_sets_to_dispose_of.size();
+			row["shader_count"] = pending.shaders_to_dispose_of.size();
+			row["render_pipeline_count"] = pending.render_pipelines_to_dispose_of.size();
+			row["compute_pipeline_count"] = pending.compute_pipelines_to_dispose_of.size();
+			pending_frames.push_back(row);
+		}
+		result["pending_frames"] = pending_frames;
+	}
+	return result;
+}
+
 void RenderingDevice::_begin_frame(bool p_presented) {
 	GodotProfileZoneGroupedFirst(_profile_zone, "_stall_for_frame");
 	// Before writing to this frame, wait for it to be finished.
@@ -9222,6 +9336,7 @@ void RenderingDevice::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_device_pipeline_cache_uuid"), &RenderingDevice::get_device_pipeline_cache_uuid);
 
 	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
+	ClassDB::bind_method(D_METHOD("_get_native_memory_snapshot"), &RenderingDevice::get_memory_diagnostics);
 
 	ClassDB::bind_method(D_METHOD("get_driver_resource", "resource", "rid", "index"), &RenderingDevice::get_driver_resource);
 
