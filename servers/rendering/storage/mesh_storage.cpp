@@ -59,10 +59,15 @@ void RendererMeshStorage::multimesh_allocate_data(RID p_multimesh, int p_instanc
 
 		mmi->_stride = mmi->_vf_size_xform + mmi->_vf_size_color + mmi->_vf_size_data;
 
-		int size_in_floats = p_instances * mmi->_stride;
-		mmi->_data_curr.resize_initialized(size_in_floats);
-		mmi->_data_prev.resize_initialized(size_in_floats);
-		mmi->_data_interpolated.resize_initialized(size_in_floats);
+		// GPU-driven and other non-interpolated MultiMeshes do not need three CPU
+		// copies of their instance buffer. Enabling interpolation reads the backend;
+		// explicit interpolated buffers can also activate these caches independently.
+		if (mmi->interpolated || !mmi->_data_curr.is_empty() || mmi->on_interpolate_update_list || mmi->on_transform_update_list) {
+			int size_in_floats = p_instances * mmi->_stride;
+			mmi->_data_curr.resize_initialized(size_in_floats);
+			mmi->_data_prev.resize_initialized(size_in_floats);
+			mmi->_data_interpolated.resize_initialized(size_in_floats);
+		}
 	}
 
 	_multimesh_allocate_data(p_multimesh, p_instances, p_transform_format, p_use_colors, p_use_custom_data, p_use_indirect);
@@ -266,8 +271,9 @@ Vector<float> RendererMeshStorage::multimesh_get_buffer(RID p_multimesh) const {
 void RendererMeshStorage::multimesh_set_buffer_interpolated(RID p_multimesh, const Vector<float> &p_buffer, const Vector<float> &p_buffer_prev) {
 	MultiMeshInterpolator *mmi = _multimesh_get_interpolator(p_multimesh);
 	if (mmi) {
-		ERR_FAIL_COND_MSG(p_buffer.size() != mmi->_data_curr.size(), "Buffer for current frame should have " + itos(mmi->_data_curr.size()) + " elements, got " + itos(p_buffer.size()) + " instead.");
-		ERR_FAIL_COND_MSG(p_buffer_prev.size() != mmi->_data_prev.size(), "Buffer for previous frame should have " + itos(mmi->_data_prev.size()) + " elements, got " + itos(p_buffer_prev.size()) + " instead.");
+		int expected_size = mmi->_num_instances * mmi->_stride;
+		ERR_FAIL_COND_MSG(p_buffer.size() != expected_size, "Buffer for current frame should have " + itos(expected_size) + " elements, got " + itos(p_buffer.size()) + " instead.");
+		ERR_FAIL_COND_MSG(p_buffer_prev.size() != expected_size, "Buffer for previous frame should have " + itos(expected_size) + " elements, got " + itos(p_buffer_prev.size()) + " instead.");
 
 		// We are assuming that mmi->interpolated is the case. (Can possibly assert this?)
 		// Even if this flag hasn't been set - just calling this function suggests interpolation is desired.
@@ -315,6 +321,10 @@ void RendererMeshStorage::multimesh_instance_reset_physics_interpolation(RID p_m
 	MultiMeshInterpolator *mmi = _multimesh_get_interpolator(p_multimesh);
 	if (mmi) {
 		ERR_FAIL_INDEX(p_index, mmi->_num_instances);
+		// No interpolation history exists until it is enabled or explicitly supplied.
+		if (mmi->_data_curr.is_empty()) {
+			return;
+		}
 
 		float *w = mmi->_data_prev.ptrw();
 		const float *r = mmi->_data_curr.ptr();

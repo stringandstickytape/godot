@@ -33,6 +33,10 @@
 #include "core/templates/rid_owner.h"
 #include "servers/rendering/storage/mesh_storage.h"
 
+namespace TestMultiMeshInterpolation {
+class MeshStorage;
+}
+
 namespace RendererDummy {
 
 struct DummyMesh {
@@ -45,6 +49,9 @@ struct DummyMesh {
 
 class MeshStorage : public RendererMeshStorage {
 private:
+	// The renderer regression fixture restores the existing dummy singleton.
+	friend class ::TestMultiMeshInterpolation::MeshStorage;
+
 	static MeshStorage *singleton;
 
 	mutable RID_Owner<DummyMesh> mesh_owner;
