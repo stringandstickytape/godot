@@ -974,6 +974,7 @@ public:
 	/* STATUS INFORMATION */
 
 	virtual uint64_t get_rendering_info(RSE::RenderingInfo p_info) = 0;
+	virtual Dictionary get_resource_memory_links() const = 0;
 	virtual String get_video_adapter_name() const = 0;
 	virtual String get_video_adapter_vendor() const = 0;
 	virtual RenderingDeviceEnums::DeviceType get_video_adapter_type() const = 0;

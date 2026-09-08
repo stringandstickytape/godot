@@ -325,6 +325,49 @@ uint64_t RenderingServerDefault::get_rendering_info(RSE::RenderingInfo p_info) {
 	return RSG::utilities->get_rendering_info(p_info);
 }
 
+Dictionary RenderingServerDefault::_get_resource_memory_links_render_thread() const {
+	Dictionary result;
+	result["resource_memory_links_schema_version"] = 1;
+
+	Array links = RSG::mesh_storage->get_memory_resource_links();
+	links.append_array(RSG::texture_storage->get_memory_resource_links());
+	int64_t incomplete_row_count = 0;
+	for (int64_t i = 0; i < links.size(); i++) {
+		const Dictionary row = links[i];
+		if (!(bool)row.get("inventory_complete", true)) {
+			incomplete_row_count++;
+		}
+	}
+	result["links"] = links;
+	result["link_count"] = links.size();
+	result["complete"] = incomplete_row_count == 0;
+	result["incomplete_row_count"] = incomplete_row_count;
+	result["capture_scope"] = "render-thread RS owner metadata; requested CPU/vector storage and RS-to-RD RID links only";
+	result["accounting_note"] = "GPU rows are ownership links into the separate RenderingDevice inventory and must not be charged independently. CPU requested_storage_bytes excludes allocator metadata, capacity slack, and shared backing.";
+
+	PackedStringArray unsupported_families;
+	unsupported_families.push_back("RendererRD default mesh buffers without an RS mesh owner");
+	unsupported_families.push_back("vertex arrays, index arrays, uniform sets, descriptors, shaders, and pipelines");
+	unsupported_families.push_back("canvas-texture composites and render-target internal textures outside TextureStorage::texture_owner");
+	unsupported_families.push_back("materials, skeletons, particles, lightmaps, decals, and other renderer storage families");
+	unsupported_families.push_back("render-buffer custom data including SDFGI, fog, screen-space effects, and temporal buffers");
+	result["unsupported_families"] = unsupported_families;
+	result["unsupported_note"] = "These families remain visible where covered by the separate RD inventory, but this endpoint does not assign them an RS mesh, mesh-instance, MultiMesh, or texture owner.";
+
+	return result;
+}
+
+Dictionary RenderingServerDefault::get_resource_memory_links() const {
+	if (Thread::get_caller_id() != server_thread) {
+		Dictionary result;
+		command_queue.push_and_ret(this, &RenderingServerDefault::_get_resource_memory_links_render_thread, &result);
+		return result;
+	}
+
+	command_queue.flush_if_pending();
+	return _get_resource_memory_links_render_thread();
+}
+
 RenderingDeviceEnums::DeviceType RenderingServerDefault::get_video_adapter_type() const {
 	return RSG::utilities->get_video_adapter_type();
 }

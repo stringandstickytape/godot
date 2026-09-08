@@ -3510,6 +3510,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("request_frame_drawn_callback", "callable"), &RenderingServer::request_frame_drawn_callback);
 	ClassDB::bind_method(D_METHOD("has_changed"), &RenderingServer::has_changed);
 	ClassDB::bind_method(D_METHOD("get_rendering_info", "info"), &RenderingServer::get_rendering_info);
+	ClassDB::bind_method(D_METHOD("_get_resource_memory_links"), &RenderingServer::get_resource_memory_links);
 	ClassDB::bind_method(D_METHOD("get_video_adapter_name"), &RenderingServer::get_video_adapter_name);
 	ClassDB::bind_method(D_METHOD("get_video_adapter_vendor"), &RenderingServer::get_video_adapter_vendor);
 	ClassDB::bind_method(D_METHOD("get_video_adapter_type"), &RenderingServer::get_video_adapter_type);

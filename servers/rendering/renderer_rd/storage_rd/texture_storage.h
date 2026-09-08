@@ -634,6 +634,7 @@ public:
 	virtual void texture_set_detect_roughness_callback(RID p_texture, RenderingServerTypes::TextureDetectRoughnessCallback p_callback, void *p_userdata) override;
 
 	virtual void texture_debug_usage(List<RenderingServerTypes::TextureInfo> *r_info) override;
+	virtual Array get_memory_resource_links() const override;
 
 	virtual void texture_set_force_redraw_if_visible(RID p_texture, bool p_enable) override;
 

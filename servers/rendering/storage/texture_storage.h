@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/variant/array.h"
 #include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/rendering_server_types.h"
 
@@ -106,6 +107,7 @@ public:
 	virtual void texture_set_detect_roughness_callback(RID p_texture, RenderingServerTypes::TextureDetectRoughnessCallback p_callback, void *p_userdata) = 0;
 
 	virtual void texture_debug_usage(List<RenderingServerTypes::TextureInfo> *r_info) = 0;
+	virtual Array get_memory_resource_links() const { return Array(); }
 
 	virtual void texture_set_force_redraw_if_visible(RID p_texture, bool p_enable) = 0;
 

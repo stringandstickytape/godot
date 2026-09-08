@@ -2153,6 +2153,139 @@ void TextureStorage::texture_debug_usage(List<RenderingServerTypes::TextureInfo>
 	}
 }
 
+Array TextureStorage::get_memory_resource_links() const {
+	Array links;
+
+	auto rid_string = [](RID p_rid) -> String {
+		return p_rid.is_valid() ? String::num_uint64(p_rid.get_id()) : String("0");
+	};
+	auto make_row = [&](RID p_rs_rid, RID p_rd_rid, const String &p_role, const String &p_kind, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key) -> Dictionary {
+		Dictionary row;
+		row["rs_rid"] = rid_string(p_rs_rid);
+		row["rd_rid"] = rid_string(p_rd_rid);
+		row["role"] = p_role;
+		row["kind"] = p_kind;
+		row["source"] = p_source;
+		row["sizing"] = p_sizing;
+		row["retention"] = p_retention;
+		row["logical_parent_key"] = p_parent_key;
+		row["inventory_complete"] = true;
+		return row;
+	};
+	auto append_inventory_error = [&](RID p_rs_rid, const String &p_role, const String &p_source, const String &p_parent_key, const String &p_error) {
+		Dictionary row = make_row(p_rs_rid, RID(), p_role, "inventory_error", p_source, "Requested storage size is unavailable because the owning record could not be resolved.", "The capture is incomplete; no ownership or lifetime conclusion should be drawn from this row.", p_parent_key);
+		row["inventory_complete"] = false;
+		row["error"] = p_error;
+		row["requested_storage_size_available"] = false;
+		links.push_back(row);
+	};
+	auto append_cpu_row = [&](RID p_rs_rid, const String &p_role, uint64_t p_bytes, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key, const String &p_path) {
+		if (p_bytes == 0) {
+			return;
+		}
+		Dictionary row = make_row(p_rs_rid, RID(), p_role, "cpu_requested_storage", p_source, p_sizing, p_retention, p_parent_key);
+		row["requested_storage_bytes"] = p_bytes;
+		row["path"] = p_path;
+		links.push_back(row);
+	};
+
+	for (const RID &texture_rid : texture_owner.get_owned_list()) {
+		Texture *texture = texture_owner.get_or_null(texture_rid);
+		if (texture == nullptr) {
+			append_inventory_error(texture_rid, "texture_owner_lookup_failed", "RendererRD::TextureStorage::texture_owner", "texture/" + rid_string(texture_rid), "texture_owner.get_owned_list() returned a RID which texture_owner.get_or_null() could not resolve.");
+			continue;
+		}
+
+		const String texture_key = "texture/" + rid_string(texture_rid);
+		uint64_t logical_image_bytes = 0;
+		bool logical_image_size_available = false;
+		if (texture->type == TextureType::TYPE_3D && texture->buffer_size_3d > 0) {
+			logical_image_bytes = texture->buffer_size_3d;
+			logical_image_size_available = true;
+		} else if (texture->type != TextureType::TYPE_3D && texture->format >= Image::FORMAT_L8 && texture->format < Image::FORMAT_MAX && texture->width > 0 && texture->height > 0) {
+			logical_image_bytes = Image::get_image_data_size(texture->width, texture->height, texture->format, texture->mipmaps > 1);
+			logical_image_size_available = true;
+			switch (texture->type) {
+				case TextureType::TYPE_LAYERED:
+					logical_image_bytes *= MAX(texture->layers, 0);
+					break;
+				default:
+					break;
+			}
+		}
+
+		auto fill_texture_metadata = [&](Dictionary &r_row) {
+			r_row["path"] = texture->path;
+			r_row["texture_type"] = int(texture->type);
+			r_row["layered_type"] = int(texture->layered_type);
+			r_row["image_format"] = int(texture->format);
+			r_row["validated_image_format"] = int(texture->validated_format);
+			r_row["rd_format"] = int(texture->rd_format);
+			r_row["width"] = texture->width;
+			r_row["height"] = texture->height;
+			r_row["depth"] = texture->depth;
+			r_row["layers"] = texture->layers;
+			r_row["mipmaps"] = texture->mipmaps;
+			r_row["logical_image_bytes"] = logical_image_bytes;
+			r_row["logical_image_size_available"] = logical_image_size_available;
+			r_row["is_proxy"] = texture->is_proxy;
+			r_row["is_render_target"] = texture->is_render_target;
+			r_row["proxy_to_rs_rid"] = rid_string(texture->proxy_to);
+			r_row["proxy_child_count"] = texture->proxies.size();
+		};
+
+		if (texture->rd_texture.is_valid()) {
+			Dictionary row = make_row(texture_rid, texture->rd_texture, texture->is_proxy ? "texture_proxy_view" : "texture_base", "gpu_texture_link", "RendererRD::TextureStorage::Texture::rd_texture", texture->is_proxy ? "Shared proxy view; requested storage is owned by proxy_to_rs_rid." : "2D/layered payload uses Image format sizing; 3D payload uses stored buffer_size_3d when present. Physical allocation and alignment come from the RD inventory.", texture->is_proxy ? "Retained by the RS proxy until proxy update or free; backing lifetime is owned by the proxy target." : "Owned by the RS texture until replacement or free; RD destruction may be deferred.", texture_key);
+			row["requested_storage_size_available"] = texture->is_proxy || logical_image_size_available;
+			if (texture->is_proxy) {
+				row["requested_storage_bytes"] = uint64_t(0);
+			} else if (logical_image_size_available) {
+				row["requested_storage_bytes"] = logical_image_bytes;
+			} else {
+				row["size_unavailable_reason"] = "Logical source payload size is unavailable for this texture type/format record; use the linked RD inventory for physical allocation bytes.";
+			}
+			fill_texture_metadata(row);
+			links.push_back(row);
+		}
+
+		if (texture->rd_texture_srgb.is_valid()) {
+			Dictionary row = make_row(texture_rid, texture->rd_texture_srgb, "texture_srgb_view", "gpu_texture_view_link", "RendererRD::TextureStorage::Texture::rd_texture_srgb", "Typed sRGB view of the texture backing; zero additional requested source storage.", "Retained with the RS texture or proxy and released when its base/view relationship changes or it is freed.", texture_key);
+			row["requested_storage_bytes"] = uint64_t(0);
+			row["requested_storage_size_available"] = true;
+			fill_texture_metadata(row);
+			links.push_back(row);
+		}
+
+		for (uint32_t slice_index = 0; slice_index < texture->cached_rd_slices.size(); slice_index++) {
+			RID slice = texture->cached_rd_slices[slice_index];
+			if (slice.is_null()) {
+				continue;
+			}
+			Dictionary row = make_row(texture_rid, slice, "texture_cached_slice_view", "gpu_texture_view_link", "RendererRD::TextureStorage::Texture::cached_rd_slices", "Cached RD mip/slice view; zero additional requested source storage.", "Retained in the RS texture cached slice vector until texture replacement or free.", texture_key);
+			row["requested_storage_bytes"] = uint64_t(0);
+			row["requested_storage_size_available"] = true;
+			row["slice_index"] = slice_index;
+			fill_texture_metadata(row);
+			links.push_back(row);
+		}
+
+		if (texture->rd_texture.is_null() && texture->rd_texture_srgb.is_null() && texture->cached_rd_slices.is_empty()) {
+			Dictionary row = make_row(texture_rid, RID(), "texture_without_rd_resource", "unsupported_or_uninitialized", "RendererRD::TextureStorage::Texture", "No RD texture/view RID is currently associated with this initialized RS texture record.", "RS metadata persists until the texture is initialized, replaced, or freed.", texture_key);
+			row["requested_storage_bytes"] = uint64_t(0);
+			row["requested_storage_size_available"] = true;
+			fill_texture_metadata(row);
+			links.push_back(row);
+		}
+
+		append_cpu_row(texture_rid, "texture_image_cache_2d", texture->image_cache_2d.is_valid() ? texture->image_cache_2d->get_data_size() : 0, "RendererRD::TextureStorage::Texture::image_cache_2d", "Image::get_data_size(); requested image payload only.", "Created lazily by texture readback and retained until texture update, replacement, render-target transition, or free.", texture_key, texture->path);
+		append_cpu_row(texture_rid, "texture_cached_slice_rid_vector", uint64_t(texture->cached_rd_slices.size()) * sizeof(RID), "RendererRD::TextureStorage::Texture::cached_rd_slices", "cached_rd_slices.size() * sizeof(RID); requested vector payload only.", "Retained with cached mip/slice views until texture replacement or free.", texture_key, texture->path);
+		append_cpu_row(texture_rid, "texture_proxy_child_rid_vector", uint64_t(texture->proxies.size()) * sizeof(RID), "RendererRD::TextureStorage::Texture::proxies", "proxies.size() * sizeof(RID); requested vector payload only.", "Retained by the proxy target while RS proxy textures refer to it.", texture_key, texture->path);
+		append_cpu_row(texture_rid, "texture_3d_buffer_slice_metadata", uint64_t(texture->buffer_slices_3d.size()) * sizeof(Texture::BufferSlice3D), "RendererRD::TextureStorage::Texture::buffer_slices_3d", "buffer_slices_3d.size() * sizeof(BufferSlice3D); requested vector payload only.", "Retained with 3D texture upload layout metadata until texture replacement or free.", texture_key, texture->path);
+	}
+
+	return links;
+}
+
 void TextureStorage::texture_set_force_redraw_if_visible(RID p_texture, bool p_enable) {
 }
 

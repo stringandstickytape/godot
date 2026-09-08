@@ -96,6 +96,7 @@ class RenderingServerDefault : public RenderingServer {
 	void _free(RID p_rid);
 
 	void _call_on_render_thread(const Callable &p_callable);
+	Dictionary _get_resource_memory_links_render_thread() const;
 
 public:
 	//if editor is redrawing when it shouldn't, enable this and put a breakpoint in _changes_changed()
@@ -1174,6 +1175,7 @@ public:
 #endif
 
 	virtual uint64_t get_rendering_info(RSE::RenderingInfo p_info) override;
+	virtual Dictionary get_resource_memory_links() const override;
 	virtual RenderingDeviceEnums::DeviceType get_video_adapter_type() const override;
 
 	virtual void set_frame_profiling_enabled(bool p_enable) override;

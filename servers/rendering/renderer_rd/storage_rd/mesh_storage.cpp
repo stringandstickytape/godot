@@ -970,6 +970,247 @@ void MeshStorage::mesh_debug_usage(List<RenderingServerTypes::MeshInfo> *r_info)
 	}
 }
 
+#define MULTIMESH_DIRTY_REGION_SIZE 512
+
+Array MeshStorage::get_memory_resource_links() const {
+	Array links;
+
+	auto rid_string = [](RID p_rid) -> String {
+		return p_rid.is_valid() ? String::num_uint64(p_rid.get_id()) : String("0");
+	};
+	auto make_row = [&](RID p_rs_rid, RID p_rd_rid, const String &p_role, const String &p_kind, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key) -> Dictionary {
+		Dictionary row;
+		row["rs_rid"] = rid_string(p_rs_rid);
+		row["rd_rid"] = rid_string(p_rd_rid);
+		row["role"] = p_role;
+		row["kind"] = p_kind;
+		row["source"] = p_source;
+		row["sizing"] = p_sizing;
+		row["retention"] = p_retention;
+		row["logical_parent_key"] = p_parent_key;
+		row["inventory_complete"] = true;
+		return row;
+	};
+	auto append_inventory_error = [&](RID p_rs_rid, const String &p_role, const String &p_source, const String &p_parent_key, const String &p_error) {
+		Dictionary row = make_row(p_rs_rid, RID(), p_role, "inventory_error", p_source, "Requested storage size is unavailable because the owning record could not be resolved.", "The capture is incomplete; no ownership or lifetime conclusion should be drawn from this row.", p_parent_key);
+		row["inventory_complete"] = false;
+		row["error"] = p_error;
+		row["requested_storage_size_available"] = false;
+		links.push_back(row);
+	};
+	auto append_cpu_row = [&](RID p_rs_rid, const String &p_role, uint64_t p_bytes, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key) {
+		if (p_bytes == 0) {
+			return;
+		}
+		Dictionary row = make_row(p_rs_rid, RID(), p_role, "cpu_requested_storage", p_source, p_sizing, p_retention, p_parent_key);
+		row["requested_storage_bytes"] = p_bytes;
+		links.push_back(row);
+	};
+
+	HashMap<Mesh *, RID> mesh_rids;
+	for (const RID &mesh_rid : mesh_owner.get_owned_list()) {
+		Mesh *mesh = mesh_owner.get_or_null(mesh_rid);
+		if (mesh == nullptr) {
+			append_inventory_error(mesh_rid, "mesh_owner_lookup_failed", "RendererRD::MeshStorage::mesh_owner", "mesh/" + rid_string(mesh_rid), "mesh_owner.get_owned_list() returned a RID which mesh_owner.get_or_null() could not resolve.");
+			continue;
+		}
+		mesh_rids.insert(mesh, mesh_rid);
+		const String mesh_key = "mesh/" + rid_string(mesh_rid);
+
+		auto append_surface_buffer = [&](Mesh::Surface *p_surface, uint32_t p_surface_index, RID p_rd_rid, uint64_t p_bytes, const String &p_role, const String &p_source, const String &p_sizing) {
+			if (p_rd_rid.is_null() && p_bytes == 0) {
+				return;
+			}
+			Dictionary row = make_row(mesh_rid, p_rd_rid, p_role, "gpu_buffer_link", p_source, p_sizing, "Owned by the RS mesh surface until surface removal, mesh clear, or mesh free; RD destruction may be deferred.", mesh_key);
+			row["requested_storage_bytes"] = p_bytes;
+			row["surface_index"] = p_surface_index;
+			row["mesh_path"] = mesh->path;
+			row["vertex_count"] = p_surface->vertex_count;
+			row["material_rs_rid"] = rid_string(p_surface->material);
+			row["rd_resource_available"] = p_rd_rid.is_valid();
+			links.push_back(row);
+		};
+
+		for (uint32_t surface_index = 0; surface_index < mesh->surface_count; surface_index++) {
+			Mesh::Surface *surface = mesh->surfaces[surface_index];
+			if (surface == nullptr) {
+				Dictionary row = make_row(mesh_rid, RID(), "mesh_surface_lookup_failed", "inventory_error", "RendererRD::MeshStorage::Mesh::surfaces", "Requested storage size is unavailable because the surface pointer is null.", "The capture is incomplete; no ownership or lifetime conclusion should be drawn from this row.", mesh_key);
+				row["inventory_complete"] = false;
+				row["error"] = "Mesh surface_count includes a null surface pointer.";
+				row["requested_storage_size_available"] = false;
+				row["surface_index"] = surface_index;
+				links.push_back(row);
+				continue;
+			}
+			append_surface_buffer(surface, surface_index, surface->vertex_buffer, surface->vertex_buffer_size, "surface_vertex_buffer", "RendererRD::MeshStorage::Mesh::Surface::vertex_buffer", "Stored vertex_buffer_size from validated SurfaceData vertex bytes.");
+			append_surface_buffer(surface, surface_index, surface->attribute_buffer, surface->attribute_buffer_size, "surface_attribute_buffer", "RendererRD::MeshStorage::Mesh::Surface::attribute_buffer", "Stored attribute_buffer_size from validated SurfaceData attribute bytes.");
+			append_surface_buffer(surface, surface_index, surface->skin_buffer, surface->skin_buffer_size, "surface_skin_buffer", "RendererRD::MeshStorage::Mesh::Surface::skin_buffer", "Stored skin_buffer_size from validated SurfaceData skin bytes.");
+			append_surface_buffer(surface, surface_index, surface->index_buffer, surface->index_buffer_size, "surface_index_buffer", "RendererRD::MeshStorage::Mesh::Surface::index_buffer", "Stored index_buffer_size from validated SurfaceData index bytes.");
+			append_surface_buffer(surface, surface_index, surface->blend_shape_buffer, surface->blend_shape_buffer_size, "surface_blend_shape_buffer", "RendererRD::MeshStorage::Mesh::Surface::blend_shape_buffer", "Stored blend_shape_buffer_size from the packed blend-shape payload.");
+
+			for (uint32_t lod_index = 0; lod_index < surface->lod_count; lod_index++) {
+				const Mesh::Surface::LOD &lod = surface->lods[lod_index];
+				Dictionary row = make_row(mesh_rid, lod.index_buffer, "surface_lod_index_buffer", "gpu_buffer_link", "RendererRD::MeshStorage::Mesh::Surface::LOD::index_buffer", "Stored LOD index_buffer_size from validated SurfaceData LOD index bytes.", "Owned by the RS mesh surface LOD until surface removal, mesh clear, or mesh free; RD destruction may be deferred.", mesh_key);
+				row["requested_storage_bytes"] = uint64_t(lod.index_buffer_size);
+				row["surface_index"] = surface_index;
+				row["lod_index"] = lod_index;
+				row["lod_edge_length"] = lod.edge_length;
+				row["index_count"] = lod.index_count;
+				row["mesh_path"] = mesh->path;
+				row["rd_resource_available"] = lod.index_buffer.is_valid();
+				links.push_back(row);
+			}
+
+			append_cpu_row(mesh_rid, "surface_bone_aabb_cache", uint64_t(surface->bone_aabbs.size()) * sizeof(AABB), "RendererRD::MeshStorage::Mesh::Surface::bone_aabbs", "bone_aabbs.size() * sizeof(AABB); requested vector payload only.", "Retained with the RS mesh surface and used for skeleton-dependent AABB calculation.", mesh_key);
+			surface->version_lock.lock();
+			const uint32_t surface_version_count = surface->version_count;
+			surface->version_lock.unlock();
+			append_cpu_row(mesh_rid, "surface_vertex_array_version_cache", uint64_t(surface_version_count) * sizeof(Mesh::Surface::Version), "RendererRD::MeshStorage::Mesh::Surface::versions", "version_count * sizeof(Mesh::Surface::Version); count read under Mesh::Surface::version_lock; requested array payload only.", "Allocated on demand for distinct vertex-input layouts and retained until the surface is cleared.", mesh_key);
+			append_cpu_row(mesh_rid, "surface_lod_descriptor_storage", uint64_t(surface->lod_count) * sizeof(Mesh::Surface::LOD), "RendererRD::MeshStorage::Mesh::Surface::lods", "lod_count * sizeof(LOD); requested array payload only.", "Retained with the surface for LOD selection and RD index-array lookup.", mesh_key);
+		}
+
+		append_cpu_row(mesh_rid, "mesh_material_cache", uint64_t(mesh->material_cache.size()) * sizeof(RID), "RendererRD::MeshStorage::Mesh::material_cache", "material_cache.size() * sizeof(RID); requested vector payload only.", "Created lazily and retained until the mesh material or surface topology changes.", mesh_key);
+	}
+
+	for (const RID &mesh_instance_rid : mesh_instance_owner.get_owned_list()) {
+		MeshInstance *mesh_instance = mesh_instance_owner.get_or_null(mesh_instance_rid);
+		if (mesh_instance == nullptr) {
+			append_inventory_error(mesh_instance_rid, "mesh_instance_owner_lookup_failed", "RendererRD::MeshStorage::mesh_instance_owner", "mesh_instance/" + rid_string(mesh_instance_rid), "mesh_instance_owner.get_owned_list() returned a RID which mesh_instance_owner.get_or_null() could not resolve.");
+			continue;
+		}
+		const RID *mesh_rid_ptr = mesh_rids.getptr(mesh_instance->mesh);
+		const RID mesh_rid = mesh_rid_ptr != nullptr ? *mesh_rid_ptr : RID();
+		const String instance_key = "mesh_instance/" + rid_string(mesh_instance_rid);
+		const bool source_mesh_available = mesh_instance->mesh != nullptr && mesh_rid_ptr != nullptr;
+		if (mesh_instance->mesh != nullptr && !source_mesh_available) {
+			append_inventory_error(mesh_instance_rid, "mesh_instance_source_mesh_lookup_failed", "RendererRD::MeshStorage::MeshInstance::mesh", instance_key, "MeshInstance::mesh does not correspond to a mesh_owner entry captured by this snapshot.");
+		}
+
+		for (uint32_t surface_index = 0; surface_index < mesh_instance->surfaces.size(); surface_index++) {
+			const MeshInstance::Surface &surface = mesh_instance->surfaces[surface_index];
+			const bool source_surface_available = source_mesh_available && surface_index < mesh_instance->mesh->surface_count && mesh_instance->mesh->surfaces[surface_index] != nullptr;
+			const uint64_t requested_bytes = source_surface_available ? mesh_instance->mesh->surfaces[surface_index]->vertex_buffer_size : 0;
+			for (uint32_t buffer_index = 0; buffer_index < 2; buffer_index++) {
+				if (surface.vertex_buffer[buffer_index].is_null()) {
+					continue;
+				}
+				Dictionary row = make_row(mesh_instance_rid, surface.vertex_buffer[buffer_index], "mesh_instance_deformed_vertex_buffer_slot_" + itos(buffer_index), "gpu_buffer_link", "RendererRD::MeshStorage::MeshInstance::Surface::vertex_buffer", "Source mesh surface vertex_buffer_size; slot 1 is allocated lazily when motion-vector history is required.", "Owned by the RS mesh instance surface until that surface or mesh instance is freed; RD destruction may be deferred.", instance_key);
+				row["requested_storage_size_available"] = source_surface_available;
+				if (source_surface_available) {
+					row["requested_storage_bytes"] = requested_bytes;
+				} else {
+					row["size_unavailable_reason"] = "Source mesh association or source surface metadata is unavailable.";
+				}
+				row["surface_index"] = surface_index;
+				row["buffer_slot"] = buffer_index;
+				row["is_current_slot"] = surface.current_buffer == buffer_index;
+				row["is_previous_slot"] = surface.previous_buffer == buffer_index;
+				row["mesh_rs_rid"] = rid_string(mesh_rid);
+				links.push_back(row);
+			}
+			if (source_surface_available) {
+				Mesh::Surface *source_surface = mesh_instance->mesh->surfaces[surface_index];
+				source_surface->version_lock.lock();
+				const uint32_t instance_surface_version_count = surface.version_count;
+				source_surface->version_lock.unlock();
+				append_cpu_row(mesh_instance_rid, "mesh_instance_vertex_array_version_cache", uint64_t(instance_surface_version_count) * sizeof(Mesh::Surface::Version), "RendererRD::MeshStorage::MeshInstance::Surface::versions", "version_count * sizeof(Mesh::Surface::Version); the member is declared Mesh::Surface::Version * and the count is read under its source Mesh::Surface::version_lock; requested array payload only.", "Allocated on demand for deformed vertex-input layouts and retained until the instance surface is removed.", instance_key);
+			} else {
+				Dictionary row = make_row(mesh_instance_rid, RID(), "mesh_instance_vertex_array_version_cache", "cpu_requested_storage", "RendererRD::MeshStorage::MeshInstance::Surface::versions", "Requested storage size is unavailable because the source Mesh::Surface and its version_lock are unavailable.", "Allocated on demand for deformed vertex-input layouts and retained until the instance surface is removed.", instance_key);
+				row["requested_storage_size_available"] = false;
+				row["size_unavailable_reason"] = "Source mesh association or source surface metadata is unavailable; version_count cannot be read without its source surface lock.";
+				row["surface_index"] = surface_index;
+				links.push_back(row);
+			}
+		}
+
+		if (mesh_instance->blend_weights_buffer.is_valid()) {
+			Dictionary row = make_row(mesh_instance_rid, mesh_instance->blend_weights_buffer, "mesh_instance_blend_weights_buffer", "gpu_buffer_link", "RendererRD::MeshStorage::MeshInstance::blend_weights_buffer", "blend_weights.size() * sizeof(float).", "Owned by the mesh instance while it has surfaces and blend shapes; RD destruction may be deferred.", instance_key);
+			row["requested_storage_bytes"] = uint64_t(mesh_instance->blend_weights.size()) * sizeof(float);
+			row["mesh_rs_rid"] = rid_string(mesh_rid);
+			links.push_back(row);
+		}
+		append_cpu_row(mesh_instance_rid, "mesh_instance_blend_weights", uint64_t(mesh_instance->blend_weights.size()) * sizeof(float), "RendererRD::MeshStorage::MeshInstance::blend_weights", "blend_weights.size() * sizeof(float); requested LocalVector payload only.", "Retained by the mesh instance while blend shapes are present.", instance_key);
+	}
+
+	for (const RID &multimesh_rid : multimesh_owner.get_owned_list()) {
+		MultiMesh *multimesh = multimesh_owner.get_or_null(multimesh_rid);
+		if (multimesh == nullptr) {
+			append_inventory_error(multimesh_rid, "multimesh_owner_lookup_failed", "RendererRD::MeshStorage::multimesh_owner", "multimesh/" + rid_string(multimesh_rid), "multimesh_owner.get_owned_list() returned a RID which multimesh_owner.get_or_null() could not resolve.");
+			continue;
+		}
+		const String multimesh_key = "multimesh/" + rid_string(multimesh_rid);
+		const uint64_t single_payload_bytes = uint64_t(MAX(multimesh->instances, 0)) * uint64_t(multimesh->stride_cache) * sizeof(float);
+		const uint64_t gpu_payload_bytes = single_payload_bytes * (multimesh->motion_vectors_enabled ? 2 : 1);
+
+		Dictionary data_row = make_row(multimesh_rid, multimesh->buffer, "multimesh_instance_data_buffer", "gpu_buffer_link", "RendererRD::MeshStorage::MultiMesh::buffer", "instances * stride_floats * sizeof(float), doubled in one buffer when motion-vector history is enabled.", "Owned until MultiMesh reallocation or free; motion-vector history shares this physical buffer at current/previous offsets; RD destruction may be deferred.", multimesh_key);
+		data_row["requested_storage_bytes"] = gpu_payload_bytes;
+		data_row["single_payload_bytes"] = single_payload_bytes;
+		data_row["instance_count"] = multimesh->instances;
+		data_row["stride_floats"] = multimesh->stride_cache;
+		data_row["transform_format"] = int(multimesh->xform_format);
+		data_row["uses_colors"] = multimesh->uses_colors;
+		data_row["uses_custom_data"] = multimesh->uses_custom_data;
+		data_row["motion_vectors_enabled"] = multimesh->motion_vectors_enabled;
+		data_row["current_offset_instances"] = multimesh->motion_vectors_current_offset;
+		data_row["previous_offset_instances"] = multimesh->motion_vectors_previous_offset;
+		data_row["mesh_rs_rid"] = rid_string(multimesh->mesh);
+		data_row["rd_resource_available"] = multimesh->buffer.is_valid();
+		if (multimesh->buffer.is_null() && multimesh->instances > 0 && multimesh->stride_cache == 0) {
+			data_row["absence_reason"] = "valid_zero_payload_transform_none";
+		}
+		links.push_back(data_row);
+
+		uint32_t mesh_surface_count = 0;
+		bool mesh_surface_count_available = !multimesh->mesh.is_valid();
+		if (multimesh->mesh.is_valid()) {
+			Mesh *mesh = mesh_owner.get_or_null(multimesh->mesh);
+			if (mesh != nullptr) {
+				mesh_surface_count = mesh->surface_count;
+				mesh_surface_count_available = true;
+			} else {
+				append_inventory_error(multimesh_rid, "multimesh_source_mesh_lookup_failed", "RendererRD::MeshStorage::MultiMesh::mesh", multimesh_key, "MultiMesh::mesh is valid but mesh_owner.get_or_null() could not resolve it.");
+			}
+		}
+		if (multimesh->indirect || multimesh->command_buffer.is_valid()) {
+			Dictionary command_row = make_row(multimesh_rid, multimesh->command_buffer, "multimesh_indirect_draw_command_buffer", "gpu_buffer_link", "RendererRD::MeshStorage::MultiMesh::command_buffer", "sizeof(uint32_t) * INDIRECT_MULTIMESH_COMMAND_STRIDE(5) * source mesh surface count.", "Owned while indirect drawing is enabled and a mesh with surfaces is attached; rebuilt on allocation or mesh change; RD destruction may be deferred.", multimesh_key);
+			command_row["requested_storage_size_available"] = mesh_surface_count_available;
+			if (mesh_surface_count_available) {
+				command_row["requested_storage_bytes"] = uint64_t(sizeof(uint32_t)) * INDIRECT_MULTIMESH_COMMAND_STRIDE * mesh_surface_count;
+			} else {
+				command_row["size_unavailable_reason"] = "Source mesh surface count is unavailable.";
+			}
+			if (mesh_surface_count_available) {
+				command_row["mesh_surface_count"] = mesh_surface_count;
+			}
+			command_row["mesh_rs_rid"] = rid_string(multimesh->mesh);
+			command_row["rd_resource_available"] = multimesh->command_buffer.is_valid();
+			links.push_back(command_row);
+		}
+
+		append_cpu_row(multimesh_rid, "multimesh_local_data_cache", uint64_t(multimesh->data_cache.size()) * sizeof(float), "RendererRD::MeshStorage::MultiMesh::data_cache", "data_cache.size() * sizeof(float); one full payload, doubled when GPU motion-vector history is enabled.", "Created lazily by individual instance get/set paths and retained until MultiMesh reallocation or free.", multimesh_key);
+		const uint64_t dirty_region_capacity = Math::division_round_up(uint64_t(MAX(multimesh->instances, 0)), uint64_t(MULTIMESH_DIRTY_REGION_SIZE));
+		if (multimesh->data_cache_dirty_regions != nullptr) {
+			Dictionary row = make_row(multimesh_rid, RID(), "multimesh_dirty_region_flags", "cpu_requested_storage", "RendererRD::MeshStorage::MultiMesh::data_cache_dirty_regions", "ceil(instances / MULTIMESH_DIRTY_REGION_SIZE(512)) * sizeof(bool); requested allocation payload only.", "Allocated by _multimesh_make_local and retained with the local data cache until MultiMesh reallocation or free.", multimesh_key);
+			row["requested_storage_bytes"] = dirty_region_capacity * sizeof(bool);
+			row["allocated_region_capacity"] = dirty_region_capacity;
+			row["active_dirty_region_count"] = multimesh->data_cache_dirty_region_count;
+			links.push_back(row);
+		}
+		if (multimesh->previous_data_cache_dirty_regions != nullptr) {
+			Dictionary row = make_row(multimesh_rid, RID(), "multimesh_previous_dirty_region_flags", "cpu_requested_storage", "RendererRD::MeshStorage::MultiMesh::previous_data_cache_dirty_regions", "ceil(instances / MULTIMESH_DIRTY_REGION_SIZE(512)) * sizeof(bool); requested allocation payload only.", "Allocated by _multimesh_make_local and retained for previous motion-vector payload dirtiness until MultiMesh reallocation or free.", multimesh_key);
+			row["requested_storage_bytes"] = dirty_region_capacity * sizeof(bool);
+			row["allocated_region_capacity"] = dirty_region_capacity;
+			row["active_dirty_region_count"] = multimesh->previous_data_cache_dirty_region_count;
+			links.push_back(row);
+		}
+		append_cpu_row(multimesh_rid, "multimesh_interpolation_previous", uint64_t(multimesh->interpolator._data_prev.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_prev", "_data_prev.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key);
+		append_cpu_row(multimesh_rid, "multimesh_interpolation_current", uint64_t(multimesh->interpolator._data_curr.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_curr", "_data_curr.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key);
+		append_cpu_row(multimesh_rid, "multimesh_interpolation_output", uint64_t(multimesh->interpolator._data_interpolated.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_interpolated", "_data_interpolated.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key);
+	}
+
+	return links;
+}
+
 bool MeshStorage::mesh_needs_instance(RID p_mesh, bool p_has_skeleton) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
 	ERR_FAIL_NULL_V(mesh, false);
@@ -1746,8 +1987,6 @@ void MeshStorage::_multimesh_set_mesh(RID p_multimesh, RID p_mesh) {
 
 	multimesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
 }
-
-#define MULTIMESH_DIRTY_REGION_SIZE 512
 
 void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 	if (multimesh->data_cache.size() > 0) {
