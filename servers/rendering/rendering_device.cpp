@@ -8049,7 +8049,7 @@ Dictionary RenderingDevice::get_memory_diagnostics() {
 	ERR_RENDER_THREAD_GUARD_V(Dictionary());
 	// Explicit CPU-side snapshot only: no GPU readback, fence wait, or resource retirement.
 	Dictionary result;
-	result["schema_version"] = 1;
+	result["schema_version"] = 2;
 	result["snapshot_non_atomic"] = true;
 	result["frames_drawn"] = frames_drawn;
 	result["driver"] = driver->get_memory_diagnostics();
@@ -8109,6 +8109,138 @@ Dictionary RenderingDevice::get_memory_diagnostics() {
 		_THREAD_SAFE_METHOD_
 		result["rd_buffer_accounted_bytes_including_pending"] = buffer_memory;
 		result["rd_texture_allocation_bytes_including_pending"] = texture_memory;
+		// Enumerate only on this explicit diagnostic call. Views describe their owner;
+		// only base textures and independently allocated shared fallbacks own bytes.
+		struct TextureAllocationRow {
+			RID rid;
+			const Texture *texture = nullptr;
+			const char *kind = nullptr;
+			uint64_t bytes = 0;
+
+			bool operator<(const TextureAllocationRow &p_other) const {
+				if (bytes != p_other.bytes) {
+					return bytes > p_other.bytes;
+				}
+				if (rid != p_other.rid) {
+					return rid.get_id() < p_other.rid.get_id();
+				}
+				return String(kind) < String(p_other.kind);
+			}
+		};
+		LocalVector<TextureAllocationRow> texture_allocations;
+		HashMap<String, Dictionary> texture_groups;
+		auto texture_shape = [](const Texture &p_texture) {
+			Dictionary row;
+			row["format_enum"] = int(p_texture.format);
+			row["type_enum"] = int(p_texture.type);
+			row["width"] = p_texture.width;
+			row["height"] = p_texture.height;
+			row["depth"] = p_texture.depth;
+			row["layers"] = p_texture.layers;
+			row["mipmaps"] = p_texture.mipmaps;
+			row["samples_enum"] = int(p_texture.samples);
+			row["usage_flags"] = p_texture.usage_flags;
+			return row;
+		};
+		auto record_texture = [&](RID p_rid, const Texture &p_texture, const char *p_kind, uint64_t p_bytes, bool p_owns_allocation) {
+			String key = String(p_kind) + ":" + itos(p_texture.format) + ":" + itos(p_texture.type) + ":" +
+					itos(p_texture.width) + ":" + itos(p_texture.height) + ":" + itos(p_texture.depth) + ":" +
+					itos(p_texture.layers) + ":" + itos(p_texture.mipmaps) + ":" + itos(p_texture.samples) + ":" + itos(p_texture.usage_flags);
+			if (!texture_groups.has(key)) {
+				Dictionary row = texture_shape(p_texture);
+				row["kind"] = p_kind;
+				row["shape_source"] = "logical_texture_metadata";
+				row["count"] = uint64_t(0);
+				row["allocation_bytes"] = uint64_t(0);
+				texture_groups.insert(key, row);
+			}
+			Dictionary &group = texture_groups[key];
+			group["count"] = uint64_t(group["count"]) + 1;
+			group["allocation_bytes"] = uint64_t(group["allocation_bytes"]) + p_bytes;
+			if (p_owns_allocation) {
+				texture_allocations.push_back({ p_rid, &p_texture, p_kind, p_bytes });
+			}
+		};
+		uint64_t active_texture_bytes = 0;
+		uint64_t active_fallback_texture_bytes = 0;
+		uint64_t active_fallback_buffer_bytes = 0;
+		uint32_t active_base_count = 0;
+		uint32_t active_view_count = 0;
+		uint32_t active_fallback_texture_count = 0;
+		uint32_t active_fallback_buffer_count = 0;
+		LocalVector<RID> owned_textures = texture_owner.get_owned_list();
+		for (RID rid : owned_textures) {
+			const Texture *texture = texture_owner.get_or_null(rid);
+			ERR_FAIL_NULL_V(texture, Dictionary());
+			if (texture->owner.is_null()) {
+				uint64_t bytes = driver->texture_get_allocation_size(texture->driver_id);
+				active_texture_bytes += bytes;
+				active_base_count++;
+				record_texture(rid, *texture, "base_texture", bytes, true);
+			} else {
+				active_view_count++;
+				record_texture(rid, *texture, "shared_view", 0, false);
+			}
+			if (texture->shared_fallback != nullptr) {
+				if (texture->shared_fallback->texture) {
+					uint64_t bytes = driver->texture_get_allocation_size(texture->shared_fallback->texture);
+					active_fallback_texture_bytes += bytes;
+					active_fallback_texture_count++;
+					record_texture(rid, *texture, "shared_fallback_texture", bytes, true);
+				}
+				if (texture->shared_fallback->buffer) {
+					uint64_t bytes = driver->buffer_get_allocation_size(texture->shared_fallback->buffer);
+					active_fallback_buffer_bytes += bytes;
+					active_fallback_buffer_count++;
+					record_texture(rid, *texture, "shared_fallback_buffer", bytes, true);
+				}
+			}
+		}
+		Dictionary textures;
+		textures["owned_rid_count"] = owned_textures.size();
+		textures["base_texture_count"] = active_base_count;
+		textures["shared_view_count"] = active_view_count;
+		textures["base_texture_allocation_bytes"] = active_texture_bytes;
+		textures["shared_fallback_texture_count"] = active_fallback_texture_count;
+		textures["shared_fallback_texture_allocation_bytes"] = active_fallback_texture_bytes;
+		textures["shared_fallback_buffer_count"] = active_fallback_buffer_count;
+		textures["shared_fallback_buffer_allocation_bytes"] = active_fallback_buffer_bytes;
+		textures["texture_allocation_bytes"] = active_texture_bytes + active_fallback_texture_bytes;
+		textures["allocation_row_count"] = texture_allocations.size();
+		textures["allocation_bytes_including_fallback_buffers"] = active_texture_bytes + active_fallback_texture_bytes + active_fallback_buffer_bytes;
+		Array shape_groups;
+		for (const KeyValue<String, Dictionary> &group : texture_groups) {
+			shape_groups.push_back(group.value);
+		}
+		textures["shape_groups"] = shape_groups;
+		textures["shape_group_count"] = texture_groups.size();
+		textures["accounting_note"] = "Driver allocation sizes, not resident VRAM or CPU RAM. Shared views contribute zero parent bytes. Fallback allocations are separate; their shape is the logical view, not a guaranteed physical fallback format/extent. Totals and groups cover all resources; largest rows are capped.";
+		texture_allocations.sort();
+		Array largest_textures;
+		uint64_t largest_bytes = 0;
+		for (uint32_t i = 0; i < MIN(texture_allocations.size(), 128u); i++) {
+			const TextureAllocationRow &allocation = texture_allocations[i];
+			Dictionary row = texture_shape(*allocation.texture);
+			row["rid"] = allocation.rid.get_id();
+			row["owner_rid"] = allocation.texture->owner.get_id();
+			row["kind"] = allocation.kind;
+			row["allocation_bytes"] = allocation.bytes;
+			row["shape_source"] = "logical_texture_metadata";
+#ifdef DEV_ENABLED
+			if (const String *name = resource_names.getptr(allocation.rid)) {
+				row["name"] = *name;
+			}
+#endif
+			largest_textures.push_back(row);
+			largest_bytes += allocation.bytes;
+		}
+		textures["largest_resources"] = largest_textures;
+		textures["largest_resource_limit"] = 128;
+		textures["largest_resource_allocation_bytes"] = largest_bytes;
+		textures["omitted_allocation_row_count"] = texture_allocations.size() - largest_textures.size();
+		textures["omitted_allocation_bytes"] = active_texture_bytes + active_fallback_texture_bytes + active_fallback_buffer_bytes - largest_bytes;
+		result["active_texture_census"] = textures;
+		uint64_t pending_texture_bytes = 0;
 		Array pending_frames;
 		for (uint32_t i = 0; i < frames.size(); i++) {
 			const Frame &pending = frames[i];
@@ -8144,6 +8276,7 @@ Dictionary RenderingDevice::get_memory_diagnostics() {
 			}
 			row["buffer_allocation_bytes"] = buffer_bytes;
 			row["texture_allocation_bytes"] = texture_bytes;
+			pending_texture_bytes += texture_bytes;
 			row["texture_fallback_buffer_count"] = fallback_buffer_count;
 			row["texture_fallback_buffer_allocation_bytes"] = fallback_buffer_bytes;
 			row["texture_fallback_texture_count"] = fallback_texture_count;
@@ -8155,6 +8288,8 @@ Dictionary RenderingDevice::get_memory_diagnostics() {
 			pending_frames.push_back(row);
 		}
 		result["pending_frames"] = pending_frames;
+		result["rd_texture_census_bytes_including_pending"] = active_texture_bytes + active_fallback_texture_bytes + pending_texture_bytes;
+		result["rd_texture_census_minus_accounted_bytes"] = int64_t(active_texture_bytes + active_fallback_texture_bytes + pending_texture_bytes) - int64_t(texture_memory);
 	}
 	return result;
 }
