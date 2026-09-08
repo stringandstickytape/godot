@@ -33,6 +33,7 @@
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
+#include "core/templates/safe_refcount.h"
 #include "drivers/d3d12/d3d12_hooks.h"
 #include "drivers/d3d12/rendering_context_driver_d3d12.h"
 
@@ -47,6 +48,8 @@
 #endif
 
 using Microsoft::WRL::ComPtr;
+
+static SafeNumeric<uint64_t> _d3d12_resource_identity_counter{ 0 };
 
 // Mesa may define this.
 #ifdef UNUSED
@@ -959,6 +962,7 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 		buf_info = VersatileResource::allocate<BufferInfo>(resources_allocator);
 	}
 	buf_info->resource = buffer.Get();
+	buf_info->identity_generation = _d3d12_resource_identity_counter.increment();
 	buf_info->owner_info.resource = buffer;
 	buf_info->owner_info.allocation = allocation;
 	buf_info->owner_info.states.subresource_states.push_back(initial_state);
@@ -989,6 +993,156 @@ void RenderingDeviceDriverD3D12::buffer_free(BufferID p_buffer) {
 uint64_t RenderingDeviceDriverD3D12::buffer_get_allocation_size(BufferID p_buffer) {
 	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
 	return buf_info->owner_info.allocation ? buf_info->owner_info.allocation->GetSize() : 0;
+}
+
+static String _d3d12_capture_local_pointer_identity(const char *p_kind, const void *p_pointer) {
+	if (p_pointer == nullptr) {
+		return String();
+	}
+	return String(p_kind) + ":0x" + String::num_uint64((uint64_t)p_pointer, 16);
+}
+
+static String _d3d12_process_resource_identity(const char *p_kind, const void *p_pointer, uint64_t p_generation) {
+	if (p_pointer == nullptr || p_generation == 0) {
+		return String();
+	}
+	return String(p_kind) + ":" + String::num_uint64(p_generation) + ":0x" + String::num_uint64((uint64_t)p_pointer, 16);
+}
+
+static String _d3d12_heap_type_name(D3D12_HEAP_TYPE p_type) {
+	switch (p_type) {
+		case D3D12_HEAP_TYPE_DEFAULT:
+			return "default";
+		case D3D12_HEAP_TYPE_UPLOAD:
+			return "upload";
+		case D3D12_HEAP_TYPE_READBACK:
+			return "readback";
+		case D3D12_HEAP_TYPE_CUSTOM:
+			return "custom";
+		case D3D12_HEAP_TYPE_GPU_UPLOAD:
+			return "gpu_upload";
+		default:
+			return "unknown";
+	}
+}
+
+static String _d3d12_resource_dimension_name(D3D12_RESOURCE_DIMENSION p_dimension) {
+	switch (p_dimension) {
+		case D3D12_RESOURCE_DIMENSION_BUFFER:
+			return "buffer";
+		case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+			return "texture_1d";
+		case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+			return "texture_2d";
+		case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
+			return "texture_3d";
+		case D3D12_RESOURCE_DIMENSION_UNKNOWN:
+		default:
+			return "unknown";
+	}
+}
+
+static bool _d3d12_heap_is_cpu_visible(const D3D12_HEAP_PROPERTIES &p_properties) {
+	switch (p_properties.Type) {
+		case D3D12_HEAP_TYPE_UPLOAD:
+		case D3D12_HEAP_TYPE_READBACK:
+		case D3D12_HEAP_TYPE_GPU_UPLOAD:
+			return true;
+		case D3D12_HEAP_TYPE_CUSTOM:
+			return p_properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE || p_properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+		case D3D12_HEAP_TYPE_DEFAULT:
+		default:
+			return false;
+	}
+}
+
+static Dictionary _d3d12_memory_identity_dictionary(const void *p_driver_record, ID3D12Resource *p_resource, D3D12MA::Allocation *p_allocation, uint64_t p_generation, bool p_account_allocation) {
+	Dictionary result;
+	result["backend"] = "d3d12";
+	result["identity_scope"] = "process-resource-generation";
+	result["identity_stable_across_captures"] = true;
+	result["identity_note"] = "Resource and allocation identities are stable across captures only while this process and resource generation remain alive.";
+	result["resource_generation"] = p_generation;
+	result["driver_id"] = _d3d12_capture_local_pointer_identity("driver-record", p_driver_record);
+	result["driver_identity_scope"] = "capture-local-pointer";
+	result["resource_id"] = _d3d12_process_resource_identity("id3d12resource", p_resource, p_generation);
+	result["native_resource_available"] = p_resource != nullptr;
+
+	result["allocation_available"] = p_allocation != nullptr;
+	result["allocation_id"] = _d3d12_process_resource_identity("d3d12ma-allocation", p_allocation, p_generation);
+	result["allocation_accounted_by_this_record"] = p_account_allocation && p_allocation != nullptr;
+	result["accounted_allocation_bytes"] = p_account_allocation && p_allocation != nullptr ? p_allocation->GetSize() : 0;
+	result["backing_allocation_size_available"] = p_allocation != nullptr;
+	result["allocation_bytes"] = p_allocation != nullptr ? p_allocation->GetSize() : 0;
+	result["allocation_offset_available"] = p_allocation != nullptr;
+	result["allocation_offset_bytes"] = p_allocation != nullptr ? p_allocation->GetOffset() : 0;
+	result["heap_offset_available"] = p_allocation != nullptr;
+	result["heap_offset_bytes"] = p_allocation != nullptr ? p_allocation->GetOffset() : 0;
+
+	ID3D12Heap *heap = p_allocation != nullptr ? p_allocation->GetHeap() : nullptr;
+	result["allocation_kind"] = p_allocation == nullptr ? "external_or_untracked" : (heap == nullptr ? "committed_implicit_heap" : "placed_or_explicit_heap");
+	result["allocation_size_note"] = p_allocation != nullptr && heap == nullptr ? "D3D12MA reports committed allocation size; the API documents that this may be approximate." : "D3D12MA allocation region size.";
+	result["heap_pointer_available"] = heap != nullptr;
+	result["heap_id"] = _d3d12_capture_local_pointer_identity("id3d12heap", heap);
+	result["heap_identity_scope"] = "capture-local-pointer";
+
+	D3D12_HEAP_PROPERTIES heap_properties = {};
+	D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+	uint64_t heap_size = 0;
+	bool heap_properties_available = false;
+	bool heap_size_available = false;
+	if (heap != nullptr) {
+		D3D12_HEAP_DESC heap_desc = {};
+#if defined(_MSC_VER) || !defined(_WIN32)
+		heap_desc = heap->GetDesc();
+#else
+		heap->GetDesc(&heap_desc);
+#endif
+		heap_properties = heap_desc.Properties;
+		heap_flags = heap_desc.Flags;
+		heap_size = heap_desc.SizeInBytes;
+		heap_properties_available = true;
+		heap_size_available = true;
+	} else if (p_resource != nullptr && SUCCEEDED(p_resource->GetHeapProperties(&heap_properties, &heap_flags))) {
+		// Committed resources have an implicit heap and no ID3D12Heap pointer.
+		heap_properties_available = true;
+	}
+
+	result["heap_properties_available"] = heap_properties_available;
+	result["heap_size_available"] = heap_size_available;
+	result["heap_size_bytes"] = heap_size;
+	result["heap_type"] = heap_properties_available ? _d3d12_heap_type_name(heap_properties.Type) : String("unknown");
+	result["heap_type_value"] = heap_properties_available ? (int64_t)heap_properties.Type : -1;
+	result["heap_flags"] = heap_properties_available ? (uint64_t)heap_flags : 0;
+	result["cpu_visibility_available"] = heap_properties_available;
+	result["cpu_visible"] = heap_properties_available && _d3d12_heap_is_cpu_visible(heap_properties);
+	result["cpu_page_property"] = heap_properties_available ? (int64_t)heap_properties.CPUPageProperty : -1;
+	result["memory_pool_preference"] = heap_properties_available ? (int64_t)heap_properties.MemoryPoolPreference : -1;
+	return result;
+}
+
+Dictionary RenderingDeviceDriverD3D12::buffer_get_memory_identity(BufferID p_buffer) {
+	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
+	Dictionary result = _d3d12_memory_identity_dictionary(buf_info, buf_info->resource, buf_info->owner_info.allocation.Get(), buf_info->identity_generation, true);
+	result["resource_kind"] = "buffer";
+	result["owns_native_resource"] = buf_info->owner_info.resource.Get() != nullptr;
+	result["is_view"] = false;
+	result["logical_size_bytes"] = buf_info->size;
+	result["dynamic_persistent"] = buf_info->is_dynamic();
+	result["texel_format"] = (int64_t)buf_info->texel_format;
+
+#if defined(_MSC_VER) || !defined(_WIN32)
+	const D3D12_RESOURCE_DESC desc = buf_info->resource->GetDesc();
+#else
+	D3D12_RESOURCE_DESC desc = {};
+	buf_info->resource->GetDesc(&desc);
+#endif
+	result["resource_dimension"] = _d3d12_resource_dimension_name(desc.Dimension);
+	result["resource_width_bytes"] = desc.Width;
+	result["resource_alignment_bytes"] = desc.Alignment;
+	result["resource_layout"] = (int64_t)desc.Layout;
+	result["resource_flags"] = (uint64_t)desc.Flags;
+	return result;
 }
 
 uint8_t *RenderingDeviceDriverD3D12::buffer_map(BufferID p_buffer) {
@@ -1476,6 +1630,7 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	tex_info->resource = texture;
+	tex_info->identity_generation = _d3d12_resource_identity_counter.increment();
 	tex_info->owner_info.resource = main_texture;
 	tex_info->owner_info.allocation = allocation;
 	tex_info->owner_info.states.subresource_states.resize(p_format.mipmaps * p_format.array_layers);
@@ -1571,6 +1726,7 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create_from_extension(uint64_
 
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	tex_info->resource = texture;
+	tex_info->identity_generation = _d3d12_resource_identity_counter.increment();
 	tex_info->owner_info.resource = nullptr; // Not allocated by us.
 	tex_info->owner_info.allocation = nullptr; // Not allocated by us.
 	tex_info->owner_info.states.subresource_states.resize(resource_desc.MipLevels * p_array_layers);
@@ -1726,6 +1882,7 @@ RDD::TextureID RenderingDeviceDriverD3D12::_texture_create_shared_from_slice(Tex
 
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
 	tex_info->resource = resource;
+	tex_info->identity_generation = owner_tex_info->identity_generation;
 	tex_info->states_ptr = owner_tex_info->states_ptr;
 	tex_info->format = p_view.format;
 	tex_info->desc = new_tex_resource_desc;
@@ -1755,6 +1912,44 @@ void RenderingDeviceDriverD3D12::texture_free(TextureID p_texture) {
 uint64_t RenderingDeviceDriverD3D12::texture_get_allocation_size(TextureID p_texture) {
 	const TextureInfo *tex_info = (const TextureInfo *)p_texture.id;
 	return tex_info->owner_info.allocation ? tex_info->owner_info.allocation->GetSize() : 0;
+}
+
+Dictionary RenderingDeviceDriverD3D12::texture_get_memory_identity(TextureID p_texture) {
+	const TextureInfo *tex_info = (const TextureInfo *)p_texture.id;
+	const TextureInfo *backing_info = tex_info->main_texture != nullptr ? tex_info->main_texture : tex_info;
+	D3D12MA::Allocation *backing_allocation = backing_info->owner_info.allocation.Get();
+	const bool is_view = tex_info->main_texture != nullptr;
+	Dictionary result = _d3d12_memory_identity_dictionary(tex_info, tex_info->resource, backing_allocation, backing_info->identity_generation, !is_view);
+	result["resource_kind"] = "texture";
+	result["is_view"] = is_view;
+	result["owns_native_resource"] = tex_info->owner_info.resource.Get() != nullptr;
+	result["backing_driver_id"] = _d3d12_capture_local_pointer_identity("driver-record", backing_info);
+	result["backing_resource_id"] = _d3d12_process_resource_identity("id3d12resource", backing_info->resource, backing_info->identity_generation);
+	result["view_shares_backing_bytes"] = is_view;
+	result["view_format"] = (int64_t)tex_info->format;
+	result["view_base_layer"] = tex_info->base_layer;
+	result["view_layer_count"] = tex_info->layers;
+	result["view_base_mipmap"] = tex_info->base_mip;
+	result["view_mipmap_count"] = tex_info->mipmaps;
+
+#if defined(_MSC_VER) || !defined(_WIN32)
+	const D3D12_RESOURCE_DESC desc = tex_info->resource->GetDesc();
+#else
+	D3D12_RESOURCE_DESC desc = {};
+	tex_info->resource->GetDesc(&desc);
+#endif
+	result["resource_dimension"] = _d3d12_resource_dimension_name(desc.Dimension);
+	result["resource_width"] = desc.Width;
+	result["resource_height"] = desc.Height;
+	result["resource_depth_or_array_layers"] = desc.DepthOrArraySize;
+	result["resource_mipmap_count"] = desc.MipLevels;
+	result["resource_format_dxgi"] = (int64_t)desc.Format;
+	result["resource_sample_count"] = desc.SampleDesc.Count;
+	result["resource_sample_quality"] = desc.SampleDesc.Quality;
+	result["resource_alignment_bytes"] = desc.Alignment;
+	result["resource_layout"] = (int64_t)desc.Layout;
+	result["resource_flags"] = (uint64_t)desc.Flags;
+	return result;
 }
 
 void RenderingDeviceDriverD3D12::texture_get_copyable_layout(TextureID p_texture, const TextureSubresource &p_subresource, TextureCopyableLayout *r_layout) {

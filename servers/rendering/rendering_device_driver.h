@@ -197,6 +197,8 @@ public:
 	virtual bool buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) = 0;
 	virtual void buffer_free(BufferID p_buffer) = 0;
 	virtual uint64_t buffer_get_allocation_size(BufferID p_buffer) = 0;
+	// Optional explicit diagnostics. Identity strings are backend-defined and may be capture-local.
+	virtual Dictionary buffer_get_memory_identity(BufferID p_buffer) { return Dictionary(); }
 	virtual uint8_t *buffer_map(BufferID p_buffer) = 0;
 	virtual void buffer_unmap(BufferID p_buffer) = 0;
 	virtual uint8_t *buffer_persistent_map_advance(BufferID p_buffer, uint64_t p_frames_drawn) = 0;
@@ -285,6 +287,8 @@ public:
 	virtual TextureID texture_create_shared_from_slice(TextureID p_original_texture, const TextureView &p_view, TextureSliceType p_slice_type, uint32_t p_layer, uint32_t p_layers, uint32_t p_mipmap, uint32_t p_mipmaps) = 0;
 	virtual void texture_free(TextureID p_texture) = 0;
 	virtual uint64_t texture_get_allocation_size(TextureID p_texture) = 0;
+	// Optional explicit diagnostics. Views must identify shared backing without accounting its bytes twice.
+	virtual Dictionary texture_get_memory_identity(TextureID p_texture) { return Dictionary(); }
 	// Returns a texture layout for buffer <-> texture copies. If you are copying multiple texture subresources to/from the same buffer,
 	// you are responsible for correctly aligning the start offset for every buffer region. See API_TRAIT_TEXTURE_TRANSFER_ALIGNMENT.
 	virtual void texture_get_copyable_layout(TextureID p_texture, const TextureSubresource &p_subresource, TextureCopyableLayout *r_layout) = 0;

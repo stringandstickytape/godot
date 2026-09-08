@@ -205,6 +205,8 @@ private:
 	/******************/
 
 	struct ResourceInfo {
+		uint64_t identity_generation = 0;
+
 		struct States {
 			// As many subresources as mipmaps * layers; planes (for depth-stencil) are tracked together.
 			TightLocalVector<D3D12_RESOURCE_STATES> subresource_states; // Used only if not a view.
@@ -272,6 +274,7 @@ public:
 	virtual bool buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) override final;
 	virtual void buffer_free(BufferID p_buffer) override final;
 	virtual uint64_t buffer_get_allocation_size(BufferID p_buffer) override final;
+	virtual Dictionary buffer_get_memory_identity(BufferID p_buffer) override final;
 	virtual uint8_t *buffer_map(BufferID p_buffer) override final;
 	virtual void buffer_unmap(BufferID p_buffer) override final;
 	virtual uint8_t *buffer_persistent_map_advance(BufferID p_buffer, uint64_t p_frames_drawn) override final;
@@ -323,6 +326,7 @@ public:
 	virtual TextureID texture_create_shared_from_slice(TextureID p_original_texture, const TextureView &p_view, TextureSliceType p_slice_type, uint32_t p_layer, uint32_t p_layers, uint32_t p_mipmap, uint32_t p_mipmaps) override final;
 	virtual void texture_free(TextureID p_texture) override final;
 	virtual uint64_t texture_get_allocation_size(TextureID p_texture) override final;
+	virtual Dictionary texture_get_memory_identity(TextureID p_texture) override final;
 	virtual void texture_get_copyable_layout(TextureID p_texture, const TextureSubresource &p_subresource, TextureCopyableLayout *r_layout) override final;
 	virtual Vector<uint8_t> texture_get_data(TextureID p_texture, uint32_t p_layer) override final;
 	virtual BitField<TextureUsageBits> texture_get_usages_supported_by_format(DataFormat p_format, bool p_cpu_readable) override final;

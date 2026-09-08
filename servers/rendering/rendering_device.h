@@ -1884,9 +1884,8 @@ public:
 	template <typename T>
 	void _free_rids(T &p_owner, const char *p_type);
 
-#ifdef DEV_ENABLED
 	HashMap<RID, String> resource_names;
-#endif
+	bool memory_inventory_names_enabled = false;
 
 public:
 	Error initialize(RenderingContextDriver *p_context, DisplayServerEnums::WindowID p_main_window = DisplayServerEnums::INVALID_WINDOW_ID);
@@ -1933,6 +1932,7 @@ public:
 
 	uint64_t get_memory_usage(MemoryType p_type) const;
 	Dictionary get_memory_diagnostics();
+	Dictionary get_memory_resource_inventory();
 
 	RenderingDevice *create_local_device();
 

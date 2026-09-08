@@ -7612,9 +7612,9 @@ void RenderingDevice::_free_internal(RID p_id) {
 	String resource_name;
 	if (resource_names.has(p_id)) {
 		resource_name = resource_names[p_id];
-		resource_names.erase(p_id);
 	}
 #endif
+	resource_names.erase(p_id);
 
 	// Push everything so it's disposed of next time this frame index is processed (means, it's safe to do it).
 	if (texture_owner.owns(p_id)) {
@@ -7804,6 +7804,10 @@ void RenderingDevice::set_resource_name(RID p_id, const String &p_name) {
 	}
 #ifdef DEV_ENABLED
 	resource_names[p_id] = p_name;
+#else
+	if (memory_inventory_names_enabled) {
+		resource_names[p_id] = p_name;
+	}
 #endif
 }
 
@@ -9472,6 +9476,7 @@ void RenderingDevice::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
 	ClassDB::bind_method(D_METHOD("_get_native_memory_snapshot"), &RenderingDevice::get_memory_diagnostics);
+	ClassDB::bind_method(D_METHOD("_get_memory_resource_inventory"), &RenderingDevice::get_memory_resource_inventory);
 
 	ClassDB::bind_method(D_METHOD("get_driver_resource", "resource", "rid", "index"), &RenderingDevice::get_driver_resource);
 
@@ -10124,6 +10129,7 @@ RenderingDevice::~RenderingDevice() {
 }
 
 RenderingDevice::RenderingDevice() {
+	memory_inventory_names_enabled = OS::get_singleton()->get_environment("ANTHROPOLIS_MEMORY_OWNERSHIP") == "1";
 	if (singleton == nullptr) {
 		singleton = this;
 	}
