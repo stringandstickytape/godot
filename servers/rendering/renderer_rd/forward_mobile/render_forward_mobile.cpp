@@ -2454,6 +2454,7 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 		SceneShaderForwardMobile::ShaderSpecialization pipeline_specialization = p_params->base_specialization;
 		pipeline_specialization.multimesh = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH);
 		pipeline_specialization.multimesh_format_2d = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D);
+		pipeline_specialization.multimesh_format_none = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_NONE);
 		pipeline_specialization.multimesh_has_color = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_HAS_COLOR);
 		pipeline_specialization.multimesh_has_custom_data = bool(inst->flags_cache & INSTANCE_DATA_FLAG_MULTIMESH_HAS_CUSTOM_DATA);
 
@@ -3154,8 +3155,11 @@ void RenderForwardMobile::_geometry_instance_update(RenderGeometryInstance *p_ge
 	if (ginstance->data->base_type == RSE::INSTANCE_MULTIMESH) {
 		ginstance->base_flags |= INSTANCE_DATA_FLAG_MULTIMESH;
 
-		if (mesh_storage->multimesh_get_transform_format(ginstance->data->base) == RSE::MULTIMESH_TRANSFORM_2D) {
+		RSE::MultimeshTransformFormat transform_format = mesh_storage->multimesh_get_transform_format(ginstance->data->base);
+		if (transform_format == RSE::MULTIMESH_TRANSFORM_2D) {
 			ginstance->base_flags |= INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_2D;
+		} else if (transform_format == RSE::MULTIMESH_TRANSFORM_NONE) {
+			ginstance->base_flags |= INSTANCE_DATA_FLAG_MULTIMESH_FORMAT_NONE;
 		}
 		if (mesh_storage->multimesh_uses_colors(ginstance->data->base)) {
 			ginstance->base_flags |= INSTANCE_DATA_FLAG_MULTIMESH_HAS_COLOR;

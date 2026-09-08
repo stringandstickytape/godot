@@ -1590,6 +1590,7 @@ void MeshStorage::_multimesh_free(RID p_rid) {
 void MeshStorage::_multimesh_allocate_data(RID p_multimesh, int p_instances, RSE::MultimeshTransformFormat p_transform_format, bool p_use_colors, bool p_use_custom_data, bool p_use_indirect) {
 	MultiMesh *multimesh = multimesh_owner.get_or_null(p_multimesh);
 	ERR_FAIL_NULL(multimesh);
+	ERR_FAIL_COND_MSG(p_transform_format == RSE::MULTIMESH_TRANSFORM_NONE, "Transform-free MultiMeshes are not supported by the Compatibility renderer.");
 
 	if (multimesh->instances == p_instances && multimesh->xform_format == p_transform_format && multimesh->uses_colors == p_use_colors && multimesh->uses_custom_data == p_use_custom_data) {
 		return;

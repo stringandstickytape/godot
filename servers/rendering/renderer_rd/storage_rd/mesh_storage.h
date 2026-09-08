@@ -276,6 +276,7 @@ private:
 	_FORCE_INLINE_ void _multimesh_mark_dirty(MultiMesh *multimesh, int p_index, bool p_aabb);
 	_FORCE_INLINE_ void _multimesh_mark_all_dirty(MultiMesh *multimesh, bool p_data, bool p_aabb);
 	_FORCE_INLINE_ void _multimesh_re_create_aabb(MultiMesh *multimesh, const float *p_data, int p_instances);
+	bool _multimesh_re_create_command_buffer(MultiMesh *multimesh);
 
 	/* Skeleton */
 
@@ -733,14 +734,18 @@ public:
 			return RID();
 		}
 		if (!multimesh->uniform_set_3d.is_valid()) {
-			if (!multimesh->buffer.is_valid()) {
+			RID instance_buffer = multimesh->buffer;
+			if (!instance_buffer.is_valid() && multimesh->xform_format == RSE::MULTIMESH_TRANSFORM_NONE) {
+				instance_buffer = default_rd_storage_buffer;
+			}
+			if (!instance_buffer.is_valid()) {
 				return RID();
 			}
 			Vector<RD::Uniform> uniforms;
 			RD::Uniform u;
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 			u.binding = 0;
-			u.append_id(multimesh->buffer);
+			u.append_id(instance_buffer);
 			uniforms.push_back(u);
 			multimesh->uniform_set_3d = RD::get_singleton()->uniform_set_create(uniforms, p_shader, p_set);
 		}

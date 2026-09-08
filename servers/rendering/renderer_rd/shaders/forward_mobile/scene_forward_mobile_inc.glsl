@@ -137,6 +137,10 @@ bool sc_multimesh_has_custom_data() {
 	return ((sc_packed_0() >> 15) & 1U) != 0;
 }
 
+bool sc_multimesh_format_none() {
+	return ((sc_packed_0() >> 19) & 1U) != 0;
+}
+
 bool sc_scene_use_ambient_cubemap() {
 	return ((sc_packed_0() >> 16) & 1U) != 0;
 }

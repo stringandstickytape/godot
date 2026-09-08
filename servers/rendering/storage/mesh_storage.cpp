@@ -46,14 +46,30 @@ void RendererMeshStorage::multimesh_free(RID p_rid) {
 }
 
 void RendererMeshStorage::multimesh_allocate_data(RID p_multimesh, int p_instances, RSE::MultimeshTransformFormat p_transform_format, bool p_use_colors, bool p_use_custom_data, bool p_use_indirect) {
+	ERR_FAIL_COND(p_transform_format < RSE::MULTIMESH_TRANSFORM_2D || p_transform_format > RSE::MULTIMESH_TRANSFORM_NONE);
 	MultiMeshInterpolator *mmi = _multimesh_get_interpolator(p_multimesh);
 	if (mmi) {
+		if (p_transform_format == RSE::MULTIMESH_TRANSFORM_NONE) {
+			// A transform-free MultiMesh cannot participate in transform interpolation.
+			// Reallocation changes the representation, so discard any history and
+			// remove stale list entries left by the previous format.
+			if (mmi->on_interpolate_update_list || mmi->on_transform_update_list) {
+				_interpolation_data.notify_free_multimesh(p_multimesh);
+			}
+			mmi->interpolated = false;
+			mmi->on_interpolate_update_list = false;
+			mmi->on_transform_update_list = false;
+			mmi->_data_curr.clear();
+			mmi->_data_prev.clear();
+			mmi->_data_interpolated.clear();
+		}
+
 		mmi->_transform_format = p_transform_format;
 		mmi->_use_colors = p_use_colors;
 		mmi->_use_custom_data = p_use_custom_data;
 		mmi->_num_instances = p_instances;
 
-		mmi->_vf_size_xform = p_transform_format == RSE::MULTIMESH_TRANSFORM_2D ? 8 : 12;
+		mmi->_vf_size_xform = p_transform_format == RSE::MULTIMESH_TRANSFORM_2D ? 8 : (p_transform_format == RSE::MULTIMESH_TRANSFORM_3D ? 12 : 0);
 		mmi->_vf_size_color = p_use_colors ? 4 : 0;
 		mmi->_vf_size_data = p_use_custom_data ? 4 : 0;
 
@@ -271,6 +287,7 @@ Vector<float> RendererMeshStorage::multimesh_get_buffer(RID p_multimesh) const {
 void RendererMeshStorage::multimesh_set_buffer_interpolated(RID p_multimesh, const Vector<float> &p_buffer, const Vector<float> &p_buffer_prev) {
 	MultiMeshInterpolator *mmi = _multimesh_get_interpolator(p_multimesh);
 	if (mmi) {
+		ERR_FAIL_COND_MSG(mmi->_transform_format == RSE::MULTIMESH_TRANSFORM_NONE, "Physics interpolation is not supported by transform-free MultiMeshes.");
 		int expected_size = mmi->_num_instances * mmi->_stride;
 		ERR_FAIL_COND_MSG(p_buffer.size() != expected_size, "Buffer for current frame should have " + itos(expected_size) + " elements, got " + itos(p_buffer.size()) + " instead.");
 		ERR_FAIL_COND_MSG(p_buffer_prev.size() != expected_size, "Buffer for previous frame should have " + itos(expected_size) + " elements, got " + itos(p_buffer_prev.size()) + " instead.");
@@ -292,6 +309,7 @@ void RendererMeshStorage::multimesh_set_buffer_interpolated(RID p_multimesh, con
 void RendererMeshStorage::multimesh_set_physics_interpolated(RID p_multimesh, bool p_interpolated) {
 	MultiMeshInterpolator *mmi = _multimesh_get_interpolator(p_multimesh);
 	if (mmi) {
+		ERR_FAIL_COND_MSG(p_interpolated && mmi->_transform_format == RSE::MULTIMESH_TRANSFORM_NONE, "Physics interpolation is not supported by transform-free MultiMeshes.");
 		if (p_interpolated == mmi->interpolated) {
 			return;
 		}
@@ -360,6 +378,7 @@ AABB RendererMeshStorage::multimesh_get_aabb(RID p_multimesh) {
 }
 
 void RendererMeshStorage::_multimesh_add_to_interpolation_lists(RID p_multimesh, MultiMeshInterpolator &r_mmi) {
+	DEV_ASSERT(r_mmi._transform_format != RSE::MULTIMESH_TRANSFORM_NONE);
 	if (!r_mmi.on_interpolate_update_list) {
 		r_mmi.on_interpolate_update_list = true;
 		_interpolation_data.multimesh_interpolate_update_list.push_back(p_multimesh);
@@ -449,6 +468,7 @@ void RendererMeshStorage::update_interpolation_frame(bool p_process) {
 			MultiMeshInterpolator *mmi = _multimesh_get_interpolator(rid);
 			if (mmi) {
 				// Make sure arrays are the correct size.
+				DEV_ASSERT(mmi->_stride > 0);
 				DEV_ASSERT(mmi->_data_prev.size() == mmi->_data_curr.size());
 
 				if (mmi->_data_interpolated.size() < mmi->_data_curr.size()) {

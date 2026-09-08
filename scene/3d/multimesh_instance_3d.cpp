@@ -44,7 +44,7 @@ RID MultiMeshInstance3D::_navmesh_source_geometry_parser;
 
 void MultiMeshInstance3D::_refresh_interpolated() {
 	if (is_inside_tree() && multimesh.is_valid()) {
-		bool interpolated = is_physics_interpolated_and_enabled();
+		bool interpolated = multimesh->get_transform_format() != MultiMesh::TRANSFORM_NONE && is_physics_interpolated_and_enabled();
 		multimesh->set_physics_interpolated(interpolated);
 	}
 }
@@ -81,7 +81,7 @@ Ref<MultiMesh> MultiMeshInstance3D::get_multimesh() const {
 }
 
 Array MultiMeshInstance3D::get_meshes() const {
-	if (multimesh.is_null() || multimesh->get_mesh().is_null() || multimesh->get_transform_format() != MultiMesh::TransformFormat::TRANSFORM_3D) {
+	if (multimesh.is_null() || multimesh->get_mesh().is_null() || multimesh->get_transform_format() == MultiMesh::TransformFormat::TRANSFORM_2D) {
 		return Array();
 	}
 
@@ -94,7 +94,7 @@ Array MultiMeshInstance3D::get_meshes() const {
 
 	Array results;
 	for (int i = 0; i < count; i++) {
-		results.push_back(multimesh->get_instance_transform(i));
+		results.push_back(multimesh->get_transform_format() == MultiMesh::TRANSFORM_NONE ? Transform3D() : multimesh->get_instance_transform(i));
 		results.push_back(mesh);
 	}
 	return results;
@@ -132,12 +132,16 @@ void MultiMeshInstance3D::navmesh_parse_source_geometry(const Ref<NavigationMesh
 		if (multimesh.is_valid()) {
 			Ref<Mesh> mesh = multimesh->get_mesh();
 			if (mesh.is_valid()) {
+				if (multimesh->get_transform_format() == MultiMesh::TRANSFORM_2D) {
+					return;
+				}
 				int n = multimesh->get_visible_instance_count();
 				if (n == -1) {
 					n = multimesh->get_instance_count();
 				}
 				for (int i = 0; i < n; i++) {
-					p_source_geometry_data->add_mesh(mesh, multimesh_instance->get_global_transform() * multimesh->get_instance_transform(i));
+					Transform3D instance_transform = multimesh->get_transform_format() == MultiMesh::TRANSFORM_NONE ? Transform3D() : multimesh->get_instance_transform(i);
+					p_source_geometry_data->add_mesh(mesh, multimesh_instance->get_global_transform() * instance_transform);
 				}
 			}
 		}

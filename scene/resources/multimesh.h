@@ -40,7 +40,8 @@ class MultiMesh : public Resource {
 public:
 	enum TransformFormat {
 		TRANSFORM_2D = RSE::MULTIMESH_TRANSFORM_2D,
-		TRANSFORM_3D = RSE::MULTIMESH_TRANSFORM_3D
+		TRANSFORM_3D = RSE::MULTIMESH_TRANSFORM_3D,
+		TRANSFORM_NONE = RSE::MULTIMESH_TRANSFORM_NONE,
 	};
 
 	enum PhysicsInterpolationQuality {

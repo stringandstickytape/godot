@@ -165,4 +165,68 @@ TEST_CASE("[Renderer][MultiMesh] Interpolation vectors are allocated lazily") {
 	storage.multimesh_free(reset_before_cache);
 }
 
+TEST_CASE("[Renderer][MultiMesh] Transform-free data cannot enter interpolation") {
+	DummySingletonRestorer singleton_restorer{ RendererDummy::MeshStorage::get_singleton() };
+	MeshStorage storage;
+
+	RID multimesh = storage.multimesh_allocate();
+	REQUIRE(multimesh.is_valid());
+	storage.multimesh_initialize(multimesh);
+	storage.multimesh_allocate_data(multimesh, 4, RSE::MULTIMESH_TRANSFORM_NONE);
+
+	const RendererMeshStorage::MultiMeshInterpolator &transform_free = storage.get_interpolator();
+	CHECK(transform_free._transform_format == RSE::MULTIMESH_TRANSFORM_NONE);
+	CHECK(transform_free._vf_size_xform == 0);
+	CHECK(transform_free._stride == 0);
+	CHECK_FALSE(transform_free.interpolated);
+	CHECK_FALSE(transform_free.on_interpolate_update_list);
+	CHECK_FALSE(transform_free.on_transform_update_list);
+	CHECK(transform_free._data_curr.is_empty());
+	CHECK(transform_free._data_prev.is_empty());
+	CHECK(transform_free._data_interpolated.is_empty());
+
+	Vector<float> empty;
+	{
+		ErrorDetector error_detector;
+		ERR_PRINT_OFF
+		storage.multimesh_set_buffer_interpolated(multimesh, empty, empty);
+		ERR_PRINT_ON
+		CHECK(error_detector.has_error);
+	}
+	CHECK_FALSE(storage.get_interpolator().on_interpolate_update_list);
+	CHECK_FALSE(storage.get_interpolator().on_transform_update_list);
+
+	{
+		ErrorDetector error_detector;
+		ERR_PRINT_OFF
+		storage.multimesh_set_physics_interpolated(multimesh, true);
+		ERR_PRINT_ON
+		CHECK(error_detector.has_error);
+	}
+	CHECK_FALSE(storage.get_interpolator().interpolated);
+
+	storage.multimesh_allocate_data(multimesh, 4, RSE::MULTIMESH_TRANSFORM_NONE, true, true);
+	CHECK(storage.get_interpolator()._vf_size_xform == 0);
+	CHECK(storage.get_interpolator()._vf_size_color == 4);
+	CHECK(storage.get_interpolator()._vf_size_data == 4);
+	CHECK(storage.get_interpolator()._stride == 8);
+	CHECK(storage.get_interpolator()._data_curr.is_empty());
+
+	storage.multimesh_allocate_data(multimesh, 2, RSE::MULTIMESH_TRANSFORM_3D);
+	Vector<float> current = make_buffer(24, 10.0f);
+	Vector<float> previous = make_buffer(24, 20.0f);
+	storage.multimesh_set_buffer_interpolated(multimesh, current, previous);
+	REQUIRE(storage.get_interpolator().on_interpolate_update_list);
+	REQUIRE(storage.get_interpolator().on_transform_update_list);
+
+	storage.multimesh_allocate_data(multimesh, 8, RSE::MULTIMESH_TRANSFORM_NONE);
+	CHECK_FALSE(storage.get_interpolator().on_interpolate_update_list);
+	CHECK_FALSE(storage.get_interpolator().on_transform_update_list);
+	CHECK(storage.get_interpolator()._data_curr.is_empty());
+	CHECK(storage.get_interpolator()._data_prev.is_empty());
+	CHECK(storage.get_interpolator()._data_interpolated.is_empty());
+
+	storage.multimesh_free(multimesh);
+}
+
 } // namespace TestMultiMeshInterpolation

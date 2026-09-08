@@ -2710,7 +2710,7 @@
 			<param index="4" name="custom_data_format" type="bool" default="false" />
 			<param index="5" name="use_indirect" type="bool" default="false" />
 			<description>
-				Sets up the multimesh using the specified data. The number of instances is set by [param instances]. The format of the instance transforms is set by [param transform_format], which should be set according to whether the multimesh is meant to be rendered in 2D or 3D. If [param color_format] is [code]true[/code], each instance will have a color associated with it. If [param custom_data_format] is [code]true[/code], each instance will have a custom data vector associated with it. If [param use_indirect] is [code]true[/code], an indirect command buffer will be created for this multimesh, allowing the instance count to be modified directly on the GPU. See also [method multimesh_get_command_buffer_rd_rid].
+				Sets up the multimesh using the specified data. The number of instances is set by [param instances]. The format of the instance transforms is set by [param transform_format]. [constant MULTIMESH_TRANSFORM_NONE] omits per-instance transforms and uses identity transforms in RenderingDevice-based 3D renderers. If [param color_format] is [code]true[/code], each instance will have a color associated with it. If [param custom_data_format] is [code]true[/code], each instance will have a custom data vector associated with it. If [param use_indirect] is [code]true[/code], an indirect command buffer will be created for this multimesh, allowing the instance count to be modified directly on the GPU. See also [method multimesh_get_command_buffer_rd_rid].
 			</description>
 		</method>
 		<method name="multimesh_create">
@@ -2741,7 +2741,7 @@
 			<return type="RID" />
 			<param index="0" name="multimesh" type="RID" />
 			<description>
-				Returns the [RenderingDevice] [RID] handle of the [MultiMesh], which can be used as any other buffer on the Rendering Device.
+				Returns the [RenderingDevice] [RID] handle of the [MultiMesh], which can be used as any other buffer on the Rendering Device. Returns an invalid [RID] for a [constant MULTIMESH_TRANSFORM_NONE] MultiMesh that has neither color nor custom data, because it has no per-instance payload.
 			</description>
 		</method>
 		<method name="multimesh_get_command_buffer_rd_rid" qualifiers="const">
@@ -2898,6 +2898,10 @@
 				  - Position + Vertex color: 16 floats (12 floats for Transform3D, 4 floats for Color)
 				  - Position + Custom data: 16 floats (12 floats for Transform3D, 4 floats of custom data)
 				  - Position + Vertex color + Custom data: 20 floats (12 floats for Transform3D, 4 floats for Color, 4 floats of custom data)
+				No transform:
+				  - No color or custom data: 0 floats
+				  - Vertex color or custom data: 4 floats
+				  - Vertex color + Custom data: 8 floats
 				[/codeblock]
 				Instance transforms are in row-major order. Specifically:
 				- For [Transform2D] the float-order is: [code](x.x, y.x, padding_float, origin.x, x.y, y.y, padding_float, origin.y)[/code].
@@ -2912,6 +2916,7 @@
 			<description>
 				Alternative version of [method multimesh_set_buffer] for use with physics interpolation.
 				Takes both an array of current data and an array of data for the previous physics tick.
+				This method is not supported with [constant MULTIMESH_TRANSFORM_NONE].
 			</description>
 		</method>
 		<method name="multimesh_set_custom_aabb">
@@ -2935,7 +2940,7 @@
 			<param index="0" name="multimesh" type="RID" />
 			<param index="1" name="interpolated" type="bool" />
 			<description>
-				Turns on and off physics interpolation for this MultiMesh resource.
+				Turns on and off physics interpolation for this MultiMesh resource. Physics interpolation cannot be enabled with [constant MULTIMESH_TRANSFORM_NONE].
 			</description>
 		</method>
 		<method name="multimesh_set_physics_interpolation_quality">
@@ -5001,6 +5006,9 @@
 		</constant>
 		<constant name="MULTIMESH_TRANSFORM_3D" value="1" enum="MultimeshTransformFormat">
 			Use [Transform3D] to store MultiMesh transform.
+		</constant>
+		<constant name="MULTIMESH_TRANSFORM_NONE" value="2" enum="MultimeshTransformFormat">
+			Do not store per-instance transforms. RenderingDevice-based 3D renderers use an identity transform for each instance. This format is not supported by the Compatibility renderer or physics interpolation.
 		</constant>
 		<constant name="MULTIMESH_INTERP_QUALITY_FAST" value="0" enum="MultimeshPhysicsInterpolationQuality">
 			MultiMesh physics interpolation favors speed over quality.

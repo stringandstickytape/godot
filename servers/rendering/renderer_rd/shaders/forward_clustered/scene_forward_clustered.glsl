@@ -214,7 +214,7 @@ vec3 double_add_vec3(vec3 base_a, vec3 prec_a, vec3 base_b, vec3 prec_b, out vec
 #endif
 
 uint multimesh_stride() {
-	uint stride = sc_multimesh_format_2d() ? 2 : 3;
+	uint stride = sc_multimesh_format_none() ? 0 : (sc_multimesh_format_2d() ? 2 : 3);
 	stride += sc_multimesh_has_color() ? 1 : 0;
 	stride += sc_multimesh_has_custom_data() ? 1 : 0;
 	return stride;
@@ -313,7 +313,9 @@ void vertex_shader(vec3 vertex_input,
 		uint stride = multimesh_stride();
 		uint offset = stride * (INSTANCE_INDEX + multimesh_offset);
 
-		if (sc_multimesh_format_2d()) {
+		if (sc_multimesh_format_none()) {
+			matrix = mat4(1.0);
+		} else if (sc_multimesh_format_2d()) {
 			matrix = mat4(transforms.data[offset + 0], transforms.data[offset + 1], vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));
 			offset += 2;
 		} else {
