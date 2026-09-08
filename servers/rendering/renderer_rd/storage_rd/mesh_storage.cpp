@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "mesh_storage.h"
+#include "memory_link_helpers.h"
 
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
@@ -998,12 +999,15 @@ Array MeshStorage::get_memory_resource_links() const {
 		row["requested_storage_size_available"] = false;
 		links.push_back(row);
 	};
-	auto append_cpu_row = [&](RID p_rs_rid, const String &p_role, uint64_t p_bytes, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key) {
-		if (p_bytes == 0) {
+	auto append_cpu_row = [&](RID p_rs_rid, const String &p_role, uint64_t p_bytes, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key, const Dictionary &p_backing = Dictionary()) {
+		if (p_bytes == 0 && (p_backing.is_empty() || !bool(p_backing["has_backing"]))) {
 			return;
 		}
 		Dictionary row = make_row(p_rs_rid, RID(), p_role, "cpu_requested_storage", p_source, p_sizing, p_retention, p_parent_key);
 		row["requested_storage_bytes"] = p_bytes;
+		if (!p_backing.is_empty()) {
+			row["cpu_backing"] = p_backing;
+		}
 		links.push_back(row);
 	};
 
@@ -1061,15 +1065,16 @@ Array MeshStorage::get_memory_resource_links() const {
 				links.push_back(row);
 			}
 
-			append_cpu_row(mesh_rid, "surface_bone_aabb_cache", uint64_t(surface->bone_aabbs.size()) * sizeof(AABB), "RendererRD::MeshStorage::Mesh::Surface::bone_aabbs", "bone_aabbs.size() * sizeof(AABB); requested vector payload only.", "Retained with the RS mesh surface and used for skeleton-dependent AABB calculation.", mesh_key);
+			append_cpu_row(mesh_rid, "surface_bone_aabb_cache", uint64_t(surface->bone_aabbs.size()) * sizeof(AABB), "RendererRD::MeshStorage::Mesh::Surface::bone_aabbs", "bone_aabbs.size() * sizeof(AABB); requested vector payload only.", "Retained with the RS mesh surface and used for skeleton-dependent AABB calculation.", mesh_key, MemoryLinks::cow(surface->bone_aabbs));
 			surface->version_lock.lock();
 			const uint32_t surface_version_count = surface->version_count;
+			const Dictionary surface_versions_backing = MemoryLinks::backing(surface->versions, surface->versions, uint64_t(surface_version_count) * sizeof(Mesh::Surface::Version), uint64_t(surface_version_count) * sizeof(Mesh::Surface::Version), false);
 			surface->version_lock.unlock();
-			append_cpu_row(mesh_rid, "surface_vertex_array_version_cache", uint64_t(surface_version_count) * sizeof(Mesh::Surface::Version), "RendererRD::MeshStorage::Mesh::Surface::versions", "version_count * sizeof(Mesh::Surface::Version); count read under Mesh::Surface::version_lock; requested array payload only.", "Allocated on demand for distinct vertex-input layouts and retained until the surface is cleared.", mesh_key);
-			append_cpu_row(mesh_rid, "surface_lod_descriptor_storage", uint64_t(surface->lod_count) * sizeof(Mesh::Surface::LOD), "RendererRD::MeshStorage::Mesh::Surface::lods", "lod_count * sizeof(LOD); requested array payload only.", "Retained with the surface for LOD selection and RD index-array lookup.", mesh_key);
+			append_cpu_row(mesh_rid, "surface_vertex_array_version_cache", uint64_t(surface_version_count) * sizeof(Mesh::Surface::Version), "RendererRD::MeshStorage::Mesh::Surface::versions", "version_count * sizeof(Mesh::Surface::Version); count read under Mesh::Surface::version_lock; requested array payload only.", "Allocated on demand for distinct vertex-input layouts and retained until the surface is cleared.", mesh_key, surface_versions_backing);
+			append_cpu_row(mesh_rid, "surface_lod_descriptor_storage", uint64_t(surface->lod_count) * sizeof(Mesh::Surface::LOD), "RendererRD::MeshStorage::Mesh::Surface::lods", "lod_count * sizeof(LOD); requested array payload only.", "Retained with the surface for LOD selection and RD index-array lookup.", mesh_key, MemoryLinks::backing(surface->lods, surface->lods, uint64_t(surface->lod_count) * sizeof(Mesh::Surface::LOD), uint64_t(surface->lod_count) * sizeof(Mesh::Surface::LOD), false));
 		}
 
-		append_cpu_row(mesh_rid, "mesh_material_cache", uint64_t(mesh->material_cache.size()) * sizeof(RID), "RendererRD::MeshStorage::Mesh::material_cache", "material_cache.size() * sizeof(RID); requested vector payload only.", "Created lazily and retained until the mesh material or surface topology changes.", mesh_key);
+		append_cpu_row(mesh_rid, "mesh_material_cache", uint64_t(mesh->material_cache.size()) * sizeof(RID), "RendererRD::MeshStorage::Mesh::material_cache", "material_cache.size() * sizeof(RID); requested vector payload only.", "Created lazily and retained until the mesh material or surface topology changes.", mesh_key, MemoryLinks::cow(mesh->material_cache));
 	}
 
 	for (const RID &mesh_instance_rid : mesh_instance_owner.get_owned_list()) {
@@ -1112,8 +1117,9 @@ Array MeshStorage::get_memory_resource_links() const {
 				Mesh::Surface *source_surface = mesh_instance->mesh->surfaces[surface_index];
 				source_surface->version_lock.lock();
 				const uint32_t instance_surface_version_count = surface.version_count;
+				const Dictionary instance_versions_backing = MemoryLinks::backing(surface.versions, surface.versions, uint64_t(instance_surface_version_count) * sizeof(Mesh::Surface::Version), uint64_t(instance_surface_version_count) * sizeof(Mesh::Surface::Version), false);
 				source_surface->version_lock.unlock();
-				append_cpu_row(mesh_instance_rid, "mesh_instance_vertex_array_version_cache", uint64_t(instance_surface_version_count) * sizeof(Mesh::Surface::Version), "RendererRD::MeshStorage::MeshInstance::Surface::versions", "version_count * sizeof(Mesh::Surface::Version); the member is declared Mesh::Surface::Version * and the count is read under its source Mesh::Surface::version_lock; requested array payload only.", "Allocated on demand for deformed vertex-input layouts and retained until the instance surface is removed.", instance_key);
+				append_cpu_row(mesh_instance_rid, "mesh_instance_vertex_array_version_cache", uint64_t(instance_surface_version_count) * sizeof(Mesh::Surface::Version), "RendererRD::MeshStorage::MeshInstance::Surface::versions", "version_count * sizeof(Mesh::Surface::Version); the member is declared Mesh::Surface::Version * and the count is read under its source Mesh::Surface::version_lock; requested array payload only.", "Allocated on demand for deformed vertex-input layouts and retained until the instance surface is removed.", instance_key, instance_versions_backing);
 			} else {
 				Dictionary row = make_row(mesh_instance_rid, RID(), "mesh_instance_vertex_array_version_cache", "cpu_requested_storage", "RendererRD::MeshStorage::MeshInstance::Surface::versions", "Requested storage size is unavailable because the source Mesh::Surface and its version_lock are unavailable.", "Allocated on demand for deformed vertex-input layouts and retained until the instance surface is removed.", instance_key);
 				row["requested_storage_size_available"] = false;
@@ -1129,7 +1135,7 @@ Array MeshStorage::get_memory_resource_links() const {
 			row["mesh_rs_rid"] = rid_string(mesh_rid);
 			links.push_back(row);
 		}
-		append_cpu_row(mesh_instance_rid, "mesh_instance_blend_weights", uint64_t(mesh_instance->blend_weights.size()) * sizeof(float), "RendererRD::MeshStorage::MeshInstance::blend_weights", "blend_weights.size() * sizeof(float); requested LocalVector payload only.", "Retained by the mesh instance while blend shapes are present.", instance_key);
+		append_cpu_row(mesh_instance_rid, "mesh_instance_blend_weights", uint64_t(mesh_instance->blend_weights.size()) * sizeof(float), "RendererRD::MeshStorage::MeshInstance::blend_weights", "blend_weights.size() * sizeof(float); requested LocalVector payload only.", "Retained by the mesh instance while blend shapes are present.", instance_key, MemoryLinks::local(mesh_instance->blend_weights));
 	}
 
 	for (const RID &multimesh_rid : multimesh_owner.get_owned_list()) {
@@ -1187,13 +1193,14 @@ Array MeshStorage::get_memory_resource_links() const {
 			links.push_back(command_row);
 		}
 
-		append_cpu_row(multimesh_rid, "multimesh_local_data_cache", uint64_t(multimesh->data_cache.size()) * sizeof(float), "RendererRD::MeshStorage::MultiMesh::data_cache", "data_cache.size() * sizeof(float); one full payload, doubled when GPU motion-vector history is enabled.", "Created lazily by individual instance get/set paths and retained until MultiMesh reallocation or free.", multimesh_key);
+		append_cpu_row(multimesh_rid, "multimesh_local_data_cache", uint64_t(multimesh->data_cache.size()) * sizeof(float), "RendererRD::MeshStorage::MultiMesh::data_cache", "data_cache.size() * sizeof(float); one full payload, doubled when GPU motion-vector history is enabled.", "Created lazily by individual instance get/set paths and retained until MultiMesh reallocation or free.", multimesh_key, MemoryLinks::cow(multimesh->data_cache));
 		const uint64_t dirty_region_capacity = Math::division_round_up(uint64_t(MAX(multimesh->instances, 0)), uint64_t(MULTIMESH_DIRTY_REGION_SIZE));
 		if (multimesh->data_cache_dirty_regions != nullptr) {
 			Dictionary row = make_row(multimesh_rid, RID(), "multimesh_dirty_region_flags", "cpu_requested_storage", "RendererRD::MeshStorage::MultiMesh::data_cache_dirty_regions", "ceil(instances / MULTIMESH_DIRTY_REGION_SIZE(512)) * sizeof(bool); requested allocation payload only.", "Allocated by _multimesh_make_local and retained with the local data cache until MultiMesh reallocation or free.", multimesh_key);
 			row["requested_storage_bytes"] = dirty_region_capacity * sizeof(bool);
 			row["allocated_region_capacity"] = dirty_region_capacity;
 			row["active_dirty_region_count"] = multimesh->data_cache_dirty_region_count;
+			row["cpu_backing"] = MemoryLinks::backing(multimesh->data_cache_dirty_regions, multimesh->data_cache_dirty_regions, dirty_region_capacity * sizeof(bool), dirty_region_capacity * sizeof(bool), false);
 			links.push_back(row);
 		}
 		if (multimesh->previous_data_cache_dirty_regions != nullptr) {
@@ -1201,11 +1208,12 @@ Array MeshStorage::get_memory_resource_links() const {
 			row["requested_storage_bytes"] = dirty_region_capacity * sizeof(bool);
 			row["allocated_region_capacity"] = dirty_region_capacity;
 			row["active_dirty_region_count"] = multimesh->previous_data_cache_dirty_region_count;
+			row["cpu_backing"] = MemoryLinks::backing(multimesh->previous_data_cache_dirty_regions, multimesh->previous_data_cache_dirty_regions, dirty_region_capacity * sizeof(bool), dirty_region_capacity * sizeof(bool), false);
 			links.push_back(row);
 		}
-		append_cpu_row(multimesh_rid, "multimesh_interpolation_previous", uint64_t(multimesh->interpolator._data_prev.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_prev", "_data_prev.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key);
-		append_cpu_row(multimesh_rid, "multimesh_interpolation_current", uint64_t(multimesh->interpolator._data_curr.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_curr", "_data_curr.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key);
-		append_cpu_row(multimesh_rid, "multimesh_interpolation_output", uint64_t(multimesh->interpolator._data_interpolated.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_interpolated", "_data_interpolated.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key);
+		append_cpu_row(multimesh_rid, "multimesh_interpolation_previous", uint64_t(multimesh->interpolator._data_prev.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_prev", "_data_prev.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key, MemoryLinks::cow(multimesh->interpolator._data_prev));
+		append_cpu_row(multimesh_rid, "multimesh_interpolation_current", uint64_t(multimesh->interpolator._data_curr.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_curr", "_data_curr.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key, MemoryLinks::cow(multimesh->interpolator._data_curr));
+		append_cpu_row(multimesh_rid, "multimesh_interpolation_output", uint64_t(multimesh->interpolator._data_interpolated.size()) * sizeof(float), "RendererMeshStorage::MultiMeshInterpolator::_data_interpolated", "_data_interpolated.size() * sizeof(float); requested vector payload only.", "Allocated when interpolation/history activates and retained until representation reallocation or MultiMesh free.", multimesh_key, MemoryLinks::cow(multimesh->interpolator._data_interpolated));
 	}
 
 	return links;

@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "texture_storage.h"
+#include "memory_link_helpers.h"
 
 #include "core/config/engine.h"
 #include "servers/rendering/renderer_rd/effects/copy_effects.h"
@@ -2179,13 +2180,16 @@ Array TextureStorage::get_memory_resource_links() const {
 		row["requested_storage_size_available"] = false;
 		links.push_back(row);
 	};
-	auto append_cpu_row = [&](RID p_rs_rid, const String &p_role, uint64_t p_bytes, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key, const String &p_path) {
-		if (p_bytes == 0) {
+	auto append_cpu_row = [&](RID p_rs_rid, const String &p_role, uint64_t p_bytes, const String &p_source, const String &p_sizing, const String &p_retention, const String &p_parent_key, const String &p_path, const Dictionary &p_backing = Dictionary()) {
+		if (p_bytes == 0 && (p_backing.is_empty() || !bool(p_backing["has_backing"]))) {
 			return;
 		}
 		Dictionary row = make_row(p_rs_rid, RID(), p_role, "cpu_requested_storage", p_source, p_sizing, p_retention, p_parent_key);
 		row["requested_storage_bytes"] = p_bytes;
 		row["path"] = p_path;
+		if (!p_backing.is_empty()) {
+			row["cpu_backing"] = p_backing;
+		}
 		links.push_back(row);
 	};
 
@@ -2277,10 +2281,15 @@ Array TextureStorage::get_memory_resource_links() const {
 			links.push_back(row);
 		}
 
-		append_cpu_row(texture_rid, "texture_image_cache_2d", texture->image_cache_2d.is_valid() ? texture->image_cache_2d->get_data_size() : 0, "RendererRD::TextureStorage::Texture::image_cache_2d", "Image::get_data_size(); requested image payload only.", "Created lazily by texture readback and retained until texture update, replacement, render-target transition, or free.", texture_key, texture->path);
-		append_cpu_row(texture_rid, "texture_cached_slice_rid_vector", uint64_t(texture->cached_rd_slices.size()) * sizeof(RID), "RendererRD::TextureStorage::Texture::cached_rd_slices", "cached_rd_slices.size() * sizeof(RID); requested vector payload only.", "Retained with cached mip/slice views until texture replacement or free.", texture_key, texture->path);
-		append_cpu_row(texture_rid, "texture_proxy_child_rid_vector", uint64_t(texture->proxies.size()) * sizeof(RID), "RendererRD::TextureStorage::Texture::proxies", "proxies.size() * sizeof(RID); requested vector payload only.", "Retained by the proxy target while RS proxy textures refer to it.", texture_key, texture->path);
-		append_cpu_row(texture_rid, "texture_3d_buffer_slice_metadata", uint64_t(texture->buffer_slices_3d.size()) * sizeof(Texture::BufferSlice3D), "RendererRD::TextureStorage::Texture::buffer_slices_3d", "buffer_slices_3d.size() * sizeof(BufferSlice3D); requested vector payload only.", "Retained with 3D texture upload layout metadata until texture replacement or free.", texture_key, texture->path);
+		Dictionary image_backing;
+		if (texture->image_cache_2d.is_valid()) {
+			const Image &cached_image = **texture->image_cache_2d;
+			image_backing = MemoryLinks::backing(cached_image.get_data_memory_allocation_base(), cached_image.get_data_memory_pointer(), cached_image.get_data_size(), cached_image.get_data_memory_capacity(), true, cached_image.get_data_memory_refcount());
+		}
+		append_cpu_row(texture_rid, "texture_image_cache_2d", texture->image_cache_2d.is_valid() ? texture->image_cache_2d->get_data_size() : 0, "RendererRD::TextureStorage::Texture::image_cache_2d", "Image::get_data_size(); requested image payload only.", "Created lazily by texture readback and retained until texture update, replacement, render-target transition, or free.", texture_key, texture->path, image_backing);
+		append_cpu_row(texture_rid, "texture_cached_slice_rid_vector", uint64_t(texture->cached_rd_slices.size()) * sizeof(RID), "RendererRD::TextureStorage::Texture::cached_rd_slices", "cached_rd_slices.size() * sizeof(RID); requested vector payload only.", "Retained with cached mip/slice views until texture replacement or free.", texture_key, texture->path, MemoryLinks::cow(texture->cached_rd_slices));
+		append_cpu_row(texture_rid, "texture_proxy_child_rid_vector", uint64_t(texture->proxies.size()) * sizeof(RID), "RendererRD::TextureStorage::Texture::proxies", "proxies.size() * sizeof(RID); requested vector payload only.", "Retained by the proxy target while RS proxy textures refer to it.", texture_key, texture->path, MemoryLinks::cow(texture->proxies));
+		append_cpu_row(texture_rid, "texture_3d_buffer_slice_metadata", uint64_t(texture->buffer_slices_3d.size()) * sizeof(Texture::BufferSlice3D), "RendererRD::TextureStorage::Texture::buffer_slices_3d", "buffer_slices_3d.size() * sizeof(BufferSlice3D); requested vector payload only.", "Retained with 3D texture upload layout metadata until texture replacement or free.", texture_key, texture->path, MemoryLinks::cow(texture->buffer_slices_3d));
 	}
 
 	return links;

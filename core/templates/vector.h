@@ -91,6 +91,8 @@ public:
 	_FORCE_INLINE_ const T *ptr() const { return _cowdata.ptr(); }
 	_FORCE_INLINE_ Size size() const { return _cowdata.size(); }
 	_FORCE_INLINE_ USize capacity() const { return _cowdata.capacity(); }
+	_FORCE_INLINE_ const void *get_memory_allocation_base() const { return _cowdata.get_memory_allocation_base(); }
+	_FORCE_INLINE_ USize get_memory_refcount() const { return _cowdata.refcount(); }
 
 	_FORCE_INLINE_ operator Span<T>() const { return _cowdata.span(); }
 	_FORCE_INLINE_ Span<T> span() const { return _cowdata.span(); }

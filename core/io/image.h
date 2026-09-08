@@ -365,6 +365,11 @@ public:
 	bool is_empty() const;
 
 	Vector<uint8_t> get_data() const;
+	// Unbound diagnostic access; no COW copy or GPU readback.
+	const void *get_data_memory_allocation_base() const { return data.get_memory_allocation_base(); }
+	const uint8_t *get_data_memory_pointer() const { return data.ptr(); }
+	uint64_t get_data_memory_capacity() const { return data.capacity(); }
+	uint64_t get_data_memory_refcount() const { return data.get_memory_refcount(); }
 
 	Error load(const String &p_path);
 	static Ref<Image> load_from_file(const String &p_path);

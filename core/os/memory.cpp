@@ -30,6 +30,7 @@
 
 #include "memory.h"
 
+#include "core/os/memory_tracker.h"
 #include "core/profiling/profiling.h"
 #include "core/templates/safe_refcount.h"
 
@@ -39,10 +40,46 @@
 
 #include <cstdlib>
 
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
+
 #ifdef DEBUG_ENABLED
 static SafeNumeric<uint64_t> _current_mem_usage;
 static SafeNumeric<uint64_t> _max_mem_usage;
 #endif
+
+static size_t _allocator_usable_size(void *p_raw_base, bool &r_available) {
+#ifdef _MSC_VER
+	r_available = p_raw_base != nullptr;
+	return p_raw_base != nullptr ? _msize(p_raw_base) : 0;
+#else
+	r_available = false;
+	return 0;
+#endif
+}
+
+static _FORCE_INLINE_ void *_realloc_with_optional_tracking(void *p_old_user_base, void *p_old_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_prepad) {
+	if (likely(!MemoryTracker::is_enabled())) {
+		return realloc(p_old_raw_base, p_raw_requested_bytes);
+	}
+	MemoryTracker::ReallocationTransaction transaction;
+	MemoryTracker::begin_reallocation(p_old_user_base, transaction);
+	void *new_raw_base = realloc(p_old_raw_base, p_raw_requested_bytes);
+	if (new_raw_base == nullptr) {
+		if (p_requested_bytes == 0) {
+			MemoryTracker::finish_reallocation_free(transaction);
+		} else {
+			MemoryTracker::finish_reallocation_failure(transaction);
+		}
+		return nullptr;
+	}
+	bool usable_available = false;
+	const size_t usable_bytes = _allocator_usable_size(new_raw_base, usable_available);
+	void *new_user_base = p_prepad ? static_cast<void *>(static_cast<uint8_t *>(new_raw_base) + Memory::DATA_OFFSET) : new_raw_base;
+	MemoryTracker::finish_reallocation(transaction, new_user_base, new_raw_base, p_requested_bytes, p_raw_requested_bytes, p_prepad, usable_bytes, usable_available);
+	return new_raw_base;
+}
 
 void *operator new(size_t p_size, DefaultAllocator p_allocator) {
 	return Memory::alloc_static(p_size);
@@ -63,6 +100,11 @@ void *Memory::alloc_aligned_static(size_t p_bytes, size_t p_alignment) {
 
 	p2 = (void *)(((uintptr_t)p1 + sizeof(uint32_t) + p_alignment - 1) & ~((p_alignment)-1));
 	*((uint32_t *)p2 - 1) = (uint32_t)((uintptr_t)p2 - (uintptr_t)p1);
+	if (unlikely(MemoryTracker::is_enabled())) {
+		bool usable_available = false;
+		const size_t usable_bytes = _allocator_usable_size(p1, usable_available);
+		MemoryTracker::record_allocation(p2, p1, p_bytes, p_bytes + p_alignment - 1 + sizeof(uint32_t), true, false, false, p_alignment, usable_bytes, usable_available);
+	}
 	return p2;
 }
 
@@ -82,6 +124,9 @@ void *Memory::realloc_aligned_static(void *p_memory, size_t p_bytes, size_t p_pr
 void Memory::free_aligned_static(void *p_memory) {
 	uint32_t offset = *((uint32_t *)p_memory - 1);
 	void *p = (void *)((uint8_t *)p_memory - offset);
+	if (unlikely(MemoryTracker::is_enabled())) {
+		MemoryTracker::record_free(p_memory);
+	}
 	GodotProfileFree(p);
 	free(p);
 }
@@ -114,8 +159,19 @@ void *Memory::alloc_static(size_t p_bytes, bool p_pad_align) {
 		uint64_t new_mem_usage = _current_mem_usage.add(p_bytes);
 		_max_mem_usage.exchange_if_greater(new_mem_usage);
 #endif
-		return s8 + DATA_OFFSET;
+		void *user_mem = s8 + DATA_OFFSET;
+		if (unlikely(MemoryTracker::is_enabled())) {
+			bool usable_available = false;
+			const size_t usable_bytes = _allocator_usable_size(mem, usable_available);
+			MemoryTracker::record_allocation(user_mem, mem, p_bytes, p_bytes + DATA_OFFSET, false, true, p_ensure_zero, 0, usable_bytes, usable_available);
+		}
+		return user_mem;
 	} else {
+		if (unlikely(MemoryTracker::is_enabled())) {
+			bool usable_available = false;
+			const size_t usable_bytes = _allocator_usable_size(mem, usable_available);
+			MemoryTracker::record_allocation(mem, mem, p_bytes, p_bytes, false, false, p_ensure_zero, 0, usable_bytes, usable_available);
+		}
 		return mem;
 	}
 }
@@ -138,6 +194,7 @@ void *Memory::realloc_static(void *p_memory, size_t p_bytes, bool p_pad_align) {
 
 	if (prepad) {
 		mem -= DATA_OFFSET;
+		uint8_t *old_user_mem = mem + DATA_OFFSET;
 		uint64_t *s = (uint64_t *)(mem + SIZE_OFFSET);
 
 #ifdef DEBUG_ENABLED
@@ -150,6 +207,9 @@ void *Memory::realloc_static(void *p_memory, size_t p_bytes, bool p_pad_align) {
 #endif
 
 		if (p_bytes == 0) {
+			if (unlikely(MemoryTracker::is_enabled())) {
+				MemoryTracker::record_free(old_user_mem);
+			}
 			GodotProfileFree(mem);
 			free(mem);
 			return nullptr;
@@ -157,21 +217,27 @@ void *Memory::realloc_static(void *p_memory, size_t p_bytes, bool p_pad_align) {
 			*s = p_bytes;
 
 			GodotProfileFree(mem);
-			mem = (uint8_t *)realloc(mem, p_bytes + DATA_OFFSET);
-			ERR_FAIL_NULL_V(mem, nullptr);
-			GodotProfileAlloc(mem, p_bytes + DATA_OFFSET);
-
+			uint8_t *new_mem = (uint8_t *)_realloc_with_optional_tracking(old_user_mem, mem, p_bytes, p_bytes + DATA_OFFSET, true);
+			if (new_mem == nullptr) {
+				ERR_FAIL_NULL_V(new_mem, nullptr);
+			}
+			mem = new_mem;
 			s = (uint64_t *)(mem + SIZE_OFFSET);
-
 			*s = p_bytes;
 
-			return mem + DATA_OFFSET;
+			void *new_user_mem = mem + DATA_OFFSET;
+			GodotProfileAlloc(mem, p_bytes + DATA_OFFSET);
+			return new_user_mem;
 		}
 	} else {
+		void *old_user_mem = mem;
 		GodotProfileFree(mem);
-		mem = (uint8_t *)realloc(mem, p_bytes);
+		uint8_t *new_mem = (uint8_t *)_realloc_with_optional_tracking(old_user_mem, mem, p_bytes, p_bytes, false);
 
-		ERR_FAIL_COND_V(mem == nullptr && p_bytes > 0, nullptr);
+		if (new_mem == nullptr && p_bytes > 0) {
+			ERR_FAIL_COND_V(new_mem == nullptr, nullptr);
+		}
+		mem = new_mem;
 		GodotProfileAlloc(mem, p_bytes);
 
 		return mem;
@@ -197,9 +263,15 @@ void Memory::free_static(void *p_ptr, bool p_pad_align) {
 		_current_mem_usage.sub(*s);
 #endif
 
+		if (unlikely(MemoryTracker::is_enabled())) {
+			MemoryTracker::record_free(p_ptr);
+		}
 		GodotProfileFree(mem);
 		free(mem);
 	} else {
+		if (unlikely(MemoryTracker::is_enabled())) {
+			MemoryTracker::record_free(p_ptr);
+		}
 		GodotProfileFree(mem);
 		free(mem);
 	}

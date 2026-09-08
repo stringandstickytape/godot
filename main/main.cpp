@@ -52,6 +52,7 @@
 #include "core/object/message_queue.h"
 #include "core/object/script_language.h"
 #include "core/os/os.h"
+#include "core/os/memory_tracker.h"
 #include "core/os/process_id.h"
 #include "core/os/time.h"
 #include "core/profiling/profiling.h"
@@ -144,6 +145,8 @@
 #endif
 
 #include "modules/modules_enabled.gen.h" // For mono.
+
+#include <cstdlib>
 
 #if defined(MODULE_MONO_ENABLED) && defined(TOOLS_ENABLED)
 #include "modules/mono/editor/bindings_generator.h"
@@ -1036,6 +1039,17 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	GodotProfileZone("setup");
 	Thread::make_main_thread();
 	set_current_thread_safe_for_nodes(true);
+#ifdef _MSC_VER
+	char native_allocation_tracking[2] = {};
+	size_t native_allocation_tracking_length = 0;
+	const bool enable_native_tracking = getenv_s(&native_allocation_tracking_length, native_allocation_tracking, sizeof(native_allocation_tracking), "ANTHROPOLIS_NATIVE_ALLOCATION_TRACKING") == 0 && native_allocation_tracking_length == 2 && native_allocation_tracking[0] == '1';
+#else
+	const char *native_allocation_tracking = std::getenv("ANTHROPOLIS_NATIVE_ALLOCATION_TRACKING");
+	const bool enable_native_tracking = native_allocation_tracking != nullptr && native_allocation_tracking[0] == '1' && native_allocation_tracking[1] == '\0';
+#endif
+	if (enable_native_tracking) {
+		MemoryTracker::enable();
+	}
 
 	OS::get_singleton()->initialize();
 

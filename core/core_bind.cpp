@@ -43,10 +43,14 @@
 #include "core/object/class_db.h"
 #include "core/os/keyboard.h"
 #include "core/os/main_loop.h"
+#include "core/os/memory_tracker.h"
 #include "core/os/os.h"
 #include "core/os/process_id.h"
 #include "core/os/thread_safe.h"
 #include "core/variant/typed_array.h"
+
+#include <cerrno>
+#include <cstdio>
 
 namespace CoreBind {
 
@@ -609,6 +613,234 @@ Dictionary OS::get_memory_info() const {
 	return ::OS::get_singleton()->get_memory_info();
 }
 
+Dictionary OS::_get_memory_allocation_inventory() const {
+	MemoryTracker::Statistics stats;
+	MemoryTracker::get_statistics(stats);
+
+	Dictionary result;
+	result["schema_version"] = 1;
+	result["enabled"] = stats.enabled;
+	result["enable_requested"] = stats.enable_requested;
+	result["enable_failed"] = stats.enable_failed;
+	result["enable_environment"] = "ANTHROPOLIS_NATIVE_ALLOCATION_TRACKING=1";
+	result["identity_scope"] = "process-memory-allocation-generation";
+	result["identity_note"] = "Allocation IDs are stable for one ordinary Memory::realloc_static lifetime, including pointer moves, and are never valid across processes.";
+	result["summary_only"] = true;
+	result["records_streaming_method"] = "OS._write_memory_allocation_inventory(absolute_path)";
+	result["stream_format"] = "anthropolis-native-memory-allocation-jsonl-v1";
+	result["inventory_complete_for_enabled_memory_api_window"] = stats.inventory_complete;
+	result["process_allocation_coverage_complete"] = false;
+	result["pre_enable_allocations_unknown"] = true;
+	result["inventory_capped"] = false;
+	result["summary_atomic"] = true;
+	result["tracker_storage_process_lifetime"] = true;
+
+	Dictionary coverage;
+	Array tracked_routes;
+	tracked_routes.push_back("Memory::alloc_static/calloc");
+	tracked_routes.push_back("Memory::realloc_static");
+	tracked_routes.push_back("Memory::free_static");
+	tracked_routes.push_back("Memory::alloc_aligned_static");
+	tracked_routes.push_back("Memory::free_aligned_static");
+	tracked_routes.push_back("Godot containers and subsystems using those APIs, including registered Jolt allocators");
+	coverage["tracked"] = tracked_routes;
+	Array uncovered_routes;
+	uncovered_routes.push_back("Allocations completed before tracker enable");
+	uncovered_routes.push_back("CoreCLR managed, loader, JIT, and GC heaps");
+	uncovered_routes.push_back("D3D12MA default _aligned_malloc CPU bookkeeping");
+	uncovered_routes.push_back("D3D12 resources, heaps, driver allocations, and GPU residency");
+	uncovered_routes.push_back("D3D12 SPIR-V to DXIL per-thread HeapAlloc allocations");
+	uncovered_routes.push_back("PCRE JIT executable VirtualAlloc pages");
+	uncovered_routes.push_back("Direct third-party, OS, COM, and DLL allocator calls");
+	coverage["uncovered"] = uncovered_routes;
+	coverage["pooled_allocation_note"] = "PagedAllocator and other pools appear as their physical backing allocations; individual interior objects are not separate Memory allocations.";
+	result["coverage"] = coverage;
+
+	Dictionary statistics;
+	statistics["tracker_start_unix_usec"] = stats.tracker_start_unix_usec;
+	statistics["snapshot_sequence"] = stats.snapshot_sequence;
+	statistics["active_allocation_count"] = stats.active_allocation_count;
+	statistics["active_requested_bytes"] = stats.active_requested_bytes;
+	statistics["active_raw_requested_bytes"] = stats.active_raw_requested_bytes;
+	statistics["active_allocator_usable_bytes"] = stats.active_allocator_usable_bytes;
+	statistics["peak_active_allocation_count"] = stats.peak_active_allocation_count;
+	statistics["peak_active_requested_bytes"] = stats.peak_active_requested_bytes;
+	statistics["peak_active_raw_requested_bytes"] = stats.peak_active_raw_requested_bytes;
+	statistics["peak_active_allocator_usable_bytes"] = stats.peak_active_allocator_usable_bytes;
+	statistics["allocation_count"] = stats.allocation_count;
+	statistics["reallocation_count"] = stats.reallocation_count;
+	statistics["failed_reallocation_count"] = stats.failed_reallocation_count;
+	statistics["failed_reallocation_without_record_count"] = stats.failed_reallocation_without_record_count;
+	statistics["free_count"] = stats.free_count;
+	statistics["free_without_record_count"] = stats.free_without_record_count;
+	statistics["adopted_reallocation_count"] = stats.adopted_reallocation_count;
+	statistics["duplicate_active_address_count"] = stats.duplicate_active_address_count;
+	statistics["dropped_record_count"] = stats.dropped_record_count;
+	statistics["snapshot_failure_count"] = stats.snapshot_failure_count;
+	statistics["instrumentation_failure_count"] = stats.instrumentation_failure_count;
+	statistics["table_slot_count"] = stats.table_slot_count;
+	statistics["table_tombstone_count"] = stats.table_tombstone_count;
+	statistics["tracker_storage_current_requested_bytes"] = stats.tracker_storage_current_bytes;
+	statistics["tracker_storage_peak_requested_bytes"] = stats.tracker_storage_peak_bytes;
+	statistics["allocator_usable_bytes_supported"] = stats.allocator_usable_bytes_supported;
+	result["statistics"] = statistics;
+	return result;
+}
+
+static FILE *_open_memory_inventory_exclusive(const String &p_absolute_path) {
+#ifdef WINDOWS_ENABLED
+	Char16String path_utf16 = p_absolute_path.utf16();
+	FILE *file = nullptr;
+	const errno_t open_error = _wfopen_s(&file, reinterpret_cast<const wchar_t *>(path_utf16.get_data()), L"wbx");
+	if (open_error != 0) {
+		errno = open_error;
+	}
+	return file;
+#else
+	CharString path_utf8 = p_absolute_path.utf8();
+	return fopen(path_utf8.get_data(), "wbx");
+#endif
+}
+
+static bool _store_memory_inventory_line(FILE *p_file, const char *p_line, int p_length, uint64_t &r_output_bytes) {
+	if (p_length < 0 || fwrite(p_line, 1, static_cast<size_t>(p_length), p_file) != static_cast<size_t>(p_length)) {
+		return false;
+	}
+	r_output_bytes += static_cast<uint64_t>(p_length);
+	return true;
+}
+
+Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path) const {
+	if (!p_absolute_path.is_absolute_path()) {
+		Dictionary result;
+		result["capture_succeeded"] = false;
+		result["output_path"] = p_absolute_path;
+		result["output_bytes"] = uint64_t(0);
+		result["allocation_count"] = uint64_t(0);
+		result["snapshot_sequence"] = uint64_t(0);
+		result["success"] = false;
+		result["error"] = "The allocation inventory destination must be an absolute path.";
+		return result;
+	}
+	MemoryTracker::Snapshot snapshot;
+	if (!MemoryTracker::capture_snapshot(snapshot)) {
+		Dictionary result;
+		result["capture_succeeded"] = false;
+		result["output_path"] = p_absolute_path;
+		result["output_bytes"] = uint64_t(0);
+		result["error"] = "The tracker could not create the uncapped POD snapshot.";
+		result["allocation_count"] = snapshot.statistics.active_allocation_count;
+		result["snapshot_sequence"] = snapshot.statistics.snapshot_sequence;
+		result["success"] = false;
+		return result;
+	}
+	if (!snapshot.statistics.enabled) {
+		const uint64_t snapshot_sequence = snapshot.statistics.snapshot_sequence;
+		MemoryTracker::release_snapshot(snapshot);
+		Dictionary result;
+		result["capture_succeeded"] = false;
+		result["output_path"] = p_absolute_path;
+		result["output_bytes"] = uint64_t(0);
+		result["allocation_count"] = uint64_t(0);
+		result["snapshot_sequence"] = snapshot_sequence;
+		result["success"] = false;
+		result["error"] = "Native allocation tracking is disabled. Start the process with ANTHROPOLIS_NATIVE_ALLOCATION_TRACKING=1.";
+		return result;
+	}
+
+	errno = 0;
+	FILE *file = _open_memory_inventory_exclusive(p_absolute_path);
+	if (file == nullptr) {
+		const int open_errno = errno;
+		const uint64_t allocation_count = snapshot.record_count;
+		const uint64_t snapshot_sequence = snapshot.statistics.snapshot_sequence;
+		MemoryTracker::release_snapshot(snapshot);
+		Dictionary result;
+		result["capture_succeeded"] = false;
+		result["output_path"] = p_absolute_path;
+		result["output_bytes"] = uint64_t(0);
+		result["allocation_count"] = allocation_count;
+		result["snapshot_sequence"] = snapshot_sequence;
+		result["success"] = false;
+		result["error"] = vformat("Could not exclusively create the new allocation inventory file (errno %d). The destination may already exist.", open_errno);
+		return result;
+	}
+
+	constexpr int LINE_CAPACITY = 8192;
+	char line[LINE_CAPACITY];
+	const MemoryTracker::Statistics stats = snapshot.statistics;
+	const uint64_t allocation_count = snapshot.record_count;
+	const uint64_t process_id = static_cast<uint64_t>(::OS::get_singleton()->get_process_id());
+	uint64_t output_bytes = 0;
+	int line_length = snprintf(line, LINE_CAPACITY,
+			"{\"record_type\":\"metadata\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"snapshot_copy_atomic\":true,\"cross_inventory_join_non_atomic\":true,\"inventory_capped\":false,\"tracker_inventory_complete\":%s,\"enabled\":%s,\"enable_requested\":%s,\"enable_failed\":%s,\"pre_enable_allocations_unknown\":true,\"process_allocation_coverage_complete\":false,\"active_requested_bytes\":%llu,\"active_raw_requested_bytes\":%llu,\"active_allocator_usable_bytes\":%llu,\"allocation_count\":%llu,\"reallocation_count\":%llu,\"failed_reallocation_count\":%llu,\"failed_reallocation_without_record_count\":%llu,\"free_count\":%llu,\"free_without_record_count\":%llu,\"adopted_reallocation_count\":%llu,\"duplicate_active_address_count\":%llu,\"dropped_record_count\":%llu,\"snapshot_failure_count\":%llu,\"instrumentation_failure_count\":%llu,\"tracker_storage_current_requested_bytes\":%llu,\"tracker_storage_peak_requested_bytes\":%llu,\"snapshot_copy_bytes\":%llu,\"allocator_usable_bytes_supported\":%s}\n",
+			static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), stats.inventory_complete ? "true" : "false", stats.enabled ? "true" : "false", stats.enable_requested ? "true" : "false", stats.enable_failed ? "true" : "false", static_cast<unsigned long long>(stats.active_requested_bytes), static_cast<unsigned long long>(stats.active_raw_requested_bytes), static_cast<unsigned long long>(stats.active_allocator_usable_bytes), static_cast<unsigned long long>(stats.allocation_count), static_cast<unsigned long long>(stats.reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_without_record_count), static_cast<unsigned long long>(stats.free_count), static_cast<unsigned long long>(stats.free_without_record_count), static_cast<unsigned long long>(stats.adopted_reallocation_count), static_cast<unsigned long long>(stats.duplicate_active_address_count), static_cast<unsigned long long>(stats.dropped_record_count), static_cast<unsigned long long>(stats.snapshot_failure_count), static_cast<unsigned long long>(stats.instrumentation_failure_count), static_cast<unsigned long long>(stats.tracker_storage_current_bytes), static_cast<unsigned long long>(stats.tracker_storage_peak_bytes), static_cast<unsigned long long>(stats.snapshot_copy_bytes), stats.allocator_usable_bytes_supported ? "true" : "false");
+	bool stream_ok = line_length >= 0 && line_length < LINE_CAPACITY && _store_memory_inventory_line(file, line, line_length, output_bytes);
+	uint64_t records_written = 0;
+	for (uint64_t i = 0; i < snapshot.record_count && stream_ok; i++) {
+		const MemoryTracker::AllocationRecord &record = snapshot.records[i];
+		const uint64_t memory_api_overhead = record.raw_requested_bytes >= record.requested_bytes ? record.raw_requested_bytes - record.requested_bytes : 0;
+		const uint64_t allocator_slack = record.allocator_usable_bytes_available && record.allocator_usable_bytes >= record.raw_requested_bytes ? record.allocator_usable_bytes - record.raw_requested_bytes : 0;
+		const uint64_t total_overhead = record.allocator_usable_bytes_available && record.allocator_usable_bytes >= record.requested_bytes ? record.allocator_usable_bytes - record.requested_bytes : 0;
+		line_length = snprintf(line, LINE_CAPACITY,
+				"{\"record_type\":\"allocation\",\"schema_version\":1,\"allocation_id\":\"memory-allocation:%llu\",\"identity_scope\":\"process-memory-allocation-generation\",\"user_base\":\"0x%llx\",\"raw_base\":\"0x%llx\",\"requested_bytes\":%llu,\"raw_requested_bytes\":%llu,\"memory_api_overhead_bytes\":%llu,\"allocator_usable_bytes_available\":%s,\"allocator_usable_bytes\":%llu,\"allocator_slack_bytes\":%llu,\"total_overhead_and_slack_bytes\":%llu,\"created_sequence\":%llu,\"last_resize_sequence\":%llu,\"origin\":\"%s\",\"aligned\":%s,\"prepad\":%s,\"initial_allocation_zeroed\":%s,\"alignment_bytes\":%llu}\n",
+				static_cast<unsigned long long>(record.allocation_id), static_cast<unsigned long long>(record.user_base), static_cast<unsigned long long>(record.raw_base), static_cast<unsigned long long>(record.requested_bytes), static_cast<unsigned long long>(record.raw_requested_bytes), static_cast<unsigned long long>(memory_api_overhead), record.allocator_usable_bytes_available ? "true" : "false", static_cast<unsigned long long>(record.allocator_usable_bytes), static_cast<unsigned long long>(allocator_slack), static_cast<unsigned long long>(total_overhead), static_cast<unsigned long long>(record.created_sequence), static_cast<unsigned long long>(record.last_resize_sequence), record.origin == MemoryTracker::AllocationOrigin::ALLOCATION ? "allocation" : "reallocation_of_pre_enable_allocation", record.aligned ? "true" : "false", record.prepad ? "true" : "false", record.zeroed ? "true" : "false", static_cast<unsigned long long>(record.alignment));
+		stream_ok = line_length >= 0 && line_length < LINE_CAPACITY && _store_memory_inventory_line(file, line, line_length, output_bytes);
+		if (stream_ok) {
+			records_written++;
+		}
+	}
+
+	if (stream_ok) {
+		line_length = snprintf(line, LINE_CAPACITY,
+				"{\"record_type\":\"receipt\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"records_written\":%llu,\"enabled\":true,\"stream_complete\":true,\"tracker_inventory_complete\":%s}\n",
+				static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), static_cast<unsigned long long>(records_written), stats.inventory_complete ? "true" : "false");
+		stream_ok = line_length >= 0 && line_length < LINE_CAPACITY && records_written == snapshot.record_count && _store_memory_inventory_line(file, line, line_length, output_bytes);
+	}
+	if (stream_ok) {
+		stream_ok = fflush(file) == 0;
+	}
+	if (fclose(file) != 0) {
+		stream_ok = false;
+	}
+	MemoryTracker::release_snapshot(snapshot);
+
+	Dictionary result;
+	result["capture_succeeded"] = stream_ok;
+	result["output_path"] = p_absolute_path;
+	result["output_bytes"] = output_bytes;
+	result["allocation_count"] = allocation_count;
+	result["snapshot_sequence"] = stats.snapshot_sequence;
+	result["success"] = stream_ok;
+	Dictionary tracker_statistics;
+	tracker_statistics["inventory_complete_for_enabled_memory_api_window"] = stats.inventory_complete;
+	tracker_statistics["instrumentation_failure_count"] = stats.instrumentation_failure_count;
+	tracker_statistics["dropped_record_count"] = stats.dropped_record_count;
+	tracker_statistics["duplicate_active_address_count"] = stats.duplicate_active_address_count;
+	tracker_statistics["snapshot_failure_count"] = stats.snapshot_failure_count;
+	tracker_statistics["snapshot_copy_bytes"] = stats.snapshot_copy_bytes;
+	tracker_statistics["tracker_storage_current_requested_bytes"] = stats.tracker_storage_current_bytes;
+	tracker_statistics["tracker_storage_peak_requested_bytes"] = stats.tracker_storage_peak_bytes;
+	result["tracker_statistics"] = tracker_statistics;
+	if (!stream_ok) {
+		result["error"] = "The allocation inventory stream failed or a fixed-format line exceeded its checked buffer. The partial file has no guaranteed valid final receipt and must be rejected.";
+	}
+	return result;
+}
+
+Dictionary OS::_memory_allocation_tracker_self_check() const {
+	const MemoryTracker::SelfCheckResult check = MemoryTracker::run_self_check();
+	Dictionary result;
+	result["passed"] = check.passed;
+	result["allocation_inserted"] = check.allocation_inserted;
+	result["reallocation_preserved_id"] = check.reallocation_preserved_id;
+	result["failed_reallocation_preserved_record"] = check.failed_reallocation_preserved_record;
+	result["free_removed_record"] = check.free_removed_record;
+	result["address_reuse_changed_id"] = check.address_reuse_changed_id;
+	result["isolated_from_live_tracker"] = true;
+	return result;
+}
+
 /** This method uses a signed argument for better error reporting as it's used from the scripting API. */
 void OS::delay_usec(int p_usec) const {
 	ERR_FAIL_COND_MSG(
@@ -829,6 +1061,9 @@ void OS::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_static_memory_usage"), &OS::get_static_memory_usage);
 	ClassDB::bind_method(D_METHOD("get_static_memory_peak_usage"), &OS::get_static_memory_peak_usage);
 	ClassDB::bind_method(D_METHOD("get_memory_info"), &OS::get_memory_info);
+	ClassDB::bind_method(D_METHOD("_get_memory_allocation_inventory"), &OS::_get_memory_allocation_inventory);
+	ClassDB::bind_method(D_METHOD("_write_memory_allocation_inventory", "absolute_path"), &OS::_write_memory_allocation_inventory);
+	ClassDB::bind_method(D_METHOD("_memory_allocation_tracker_self_check"), &OS::_memory_allocation_tracker_self_check);
 
 	ClassDB::bind_method(D_METHOD("move_to_trash", "path"), &OS::move_to_trash);
 	ClassDB::bind_method(D_METHOD("get_user_data_dir"), &OS::get_user_data_dir);
