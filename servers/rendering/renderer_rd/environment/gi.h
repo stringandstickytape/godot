@@ -710,6 +710,7 @@ public:
 	RSE::EnvironmentSDFGIFramesToUpdateLight sdfgi_frames_to_update_light = RSE::ENV_SDFGI_UPDATE_LIGHT_IN_4_FRAMES;
 
 	float sdfgi_solid_cell_ratio = 0.25;
+	bool sdfgi_rgba8_occlusion = false;
 	Vector3 sdfgi_debug_probe_pos;
 	Vector3 sdfgi_debug_probe_dir;
 	bool sdfgi_debug_probe_enabled = false;

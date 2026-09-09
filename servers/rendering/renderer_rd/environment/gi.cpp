@@ -32,6 +32,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/geometry_3d.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
@@ -469,11 +470,21 @@ void GI::SDFGI::create(RID p_env, const Vector3 &p_world_position, uint32_t p_re
 	}
 
 	RD::TextureFormat tf_occlusion = tf_sdf;
-	tf_occlusion.format = RD::DATA_FORMAT_R16_UINT;
-	tf_occlusion.shareable_formats.push_back(RD::DATA_FORMAT_R16_UINT);
-	tf_occlusion.shareable_formats.push_back(RD::DATA_FORMAT_R4G4B4A4_UNORM_PACK16);
+	if (gi->sdfgi_rgba8_occlusion) {
+		tf_occlusion.format = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+	} else {
+		tf_occlusion.format = RD::DATA_FORMAT_R16_UINT;
+		tf_occlusion.shareable_formats.push_back(RD::DATA_FORMAT_R16_UINT);
+		tf_occlusion.shareable_formats.push_back(RD::DATA_FORMAT_R4G4B4A4_UNORM_PACK16);
+	}
 	tf_occlusion.depth *= cascades.size(); //use depth for occlusion slices
 	tf_occlusion.width *= 2; //use width for the other half
+	const uint64_t occlusion_bytes_per_texel = gi->sdfgi_rgba8_occlusion ? 4 : 2;
+	const uint64_t nominal_occlusion_bytes = uint64_t(tf_occlusion.width) * tf_occlusion.height * tf_occlusion.depth * occlusion_bytes_per_texel;
+	print_line(vformat("SDFGI occlusion representation: mode=%s dimensions=%dx%dx%d nominal_base_bytes=%s sampled_view=%s",
+			gi->sdfgi_rgba8_occlusion ? "rgba8_unorm_direct" : "r16_uint_reinterpreted",
+			tf_occlusion.width, tf_occlusion.height, tf_occlusion.depth, String::num_uint64(nominal_occlusion_bytes),
+			gi->sdfgi_rgba8_occlusion ? "shared_same_format_b_a_r_g" : "requested_r4g4b4a4"));
 
 	RD::TextureFormat tf_light = tf_sdf;
 	tf_light.format = RD::DATA_FORMAT_R32_UINT;
@@ -540,8 +551,19 @@ void GI::SDFGI::create(RID p_env, const Vector3 &p_world_position, uint32_t p_re
 	occlusion_data = create_clear_texture(tf_occlusion, "SDFGI Occlusion Data");
 	{
 		RD::TextureView tv;
-		tv.format_override = RD::DATA_FORMAT_R4G4B4A4_UNORM_PACK16;
+		if (gi->sdfgi_rgba8_occlusion) {
+			tv.format_override = RD::DATA_FORMAT_R8G8B8A8_UNORM;
+			// D3D12 maps the existing R4G4B4A4 view through B4G4R4A4 and component mapping (1, 2, 3, 0),
+			// exposing each logical XYZW nibble group as ZWXY. Preserve that sampled contract while storage stays XYZW.
+			tv.swizzle_r = RD::TEXTURE_SWIZZLE_B;
+			tv.swizzle_g = RD::TEXTURE_SWIZZLE_A;
+			tv.swizzle_b = RD::TEXTURE_SWIZZLE_R;
+			tv.swizzle_a = RD::TEXTURE_SWIZZLE_G;
+		} else {
+			tv.format_override = RD::DATA_FORMAT_R4G4B4A4_UNORM_PACK16;
+		}
 		occlusion_texture = RD::get_singleton()->texture_create_shared(tv, occlusion_data);
+		CRASH_COND_MSG(gi->sdfgi_rgba8_occlusion && occlusion_texture.is_null(), "Failed to create the same-format sampled view for RGBA8 SDFGI occlusion data.");
 	}
 
 	for (SDFGI::Cascade &cascade : cascades) {
@@ -3630,6 +3652,15 @@ void GI::init(SkyRD *p_sky) {
 	/* SDGFI */
 
 	{
+		const bool rgba8_occlusion_requested = OS::get_singleton()->get_environment("ANTHROPOLIS_SDFGI_RGBA8_OCCLUSION") == "1";
+		if (rgba8_occlusion_requested) {
+			CRASH_COND_MSG(OS::get_singleton()->get_current_rendering_driver_name() != "d3d12", "ANTHROPOLIS_SDFGI_RGBA8_OCCLUSION is a D3D12-only diagnostic option.");
+			const BitField<RD::TextureUsageBits> required_usage = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+			CRASH_COND_MSG(!RD::get_singleton()->texture_is_format_supported_for_usage(RD::DATA_FORMAT_R8G8B8A8_UNORM, required_usage), "ANTHROPOLIS_SDFGI_RGBA8_OCCLUSION requires R8G8B8A8_UNORM sampling, storage, and copy support.");
+			CRASH_COND_MSG(!RD::get_singleton()->sampler_is_format_supported_for_filter(RD::DATA_FORMAT_R8G8B8A8_UNORM, RD::SAMPLER_FILTER_LINEAR), "ANTHROPOLIS_SDFGI_RGBA8_OCCLUSION requires linearly filtered R8G8B8A8_UNORM sampling.");
+			sdfgi_rgba8_occlusion = true;
+		}
+
 		Vector<String> preprocess_modes;
 		preprocess_modes.push_back("\n#define MODE_SCROLL\n");
 		preprocess_modes.push_back("\n#define MODE_SCROLL_OCCLUSION\n");
@@ -3641,6 +3672,9 @@ void GI::init(SkyRD *p_sky) {
 		preprocess_modes.push_back("\n#define MODE_OCCLUSION\n");
 		preprocess_modes.push_back("\n#define MODE_STORE\n");
 		String defines = "\n#define OCCLUSION_SIZE " + itos(SDFGI::CASCADE_SIZE / SDFGI::PROBE_DIVISOR) + "\n";
+		if (sdfgi_rgba8_occlusion) {
+			defines += "#define SDFGI_RGBA8_OCCLUSION\n";
+		}
 		sdfgi_shader.preprocess.initialize(preprocess_modes, defines);
 		sdfgi_shader.preprocess_shader = sdfgi_shader.preprocess.version_create();
 		for (int i = 0; i < SDFGIShader::PRE_PROCESS_MAX; i++) {

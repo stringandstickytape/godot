@@ -90,7 +90,11 @@ layout(r32ui, set = 0, binding = 5) uniform restrict readonly uimage3D src_light
 layout(r32ui, set = 0, binding = 6) uniform restrict readonly uimage3D src_facing;
 
 layout(r8, set = 0, binding = 7) uniform restrict writeonly image3D dst_sdf;
+#ifdef SDFGI_RGBA8_OCCLUSION
+layout(rgba8, set = 0, binding = 8) uniform restrict writeonly image3D dst_occlusion;
+#else
 layout(r16ui, set = 0, binding = 8) uniform restrict writeonly uimage3D dst_occlusion;
+#endif
 
 layout(set = 0, binding = 10, std430) restrict buffer DispatchData {
 	uint x;
@@ -151,7 +155,11 @@ src_process_voxels;
 #ifdef MODE_SCROLL_OCCLUSION
 
 layout(r8, set = 0, binding = 1) uniform restrict image3D dst_occlusion[8];
+#ifdef SDFGI_RGBA8_OCCLUSION
+layout(rgba8, set = 0, binding = 2) uniform restrict readonly image3D src_occlusion;
+#else
 layout(r16ui, set = 0, binding = 2) uniform restrict readonly uimage3D src_occlusion;
+#endif
 
 #endif
 
@@ -211,6 +219,16 @@ void main() {
 	ivec3 write_pos = pos + max(ivec3(0), params.scroll);
 
 	read_pos.z += params.cascade * params.grid_size;
+#ifdef SDFGI_RGBA8_OCCLUSION
+	uvec4 occlusion_low = uvec4(round(clamp(imageLoad(src_occlusion, read_pos), vec4(0.0), vec4(1.0)) * 15.0));
+	read_pos.x += params.grid_size;
+	uvec4 occlusion_high = uvec4(round(clamp(imageLoad(src_occlusion, read_pos), vec4(0.0), vec4(1.0)) * 15.0));
+
+	for (uint i = 0; i < 4; i++) {
+		imageStore(dst_occlusion[i], write_pos, vec4(float(occlusion_low[i]) / 15.0));
+		imageStore(dst_occlusion[i + 4], write_pos, vec4(float(occlusion_high[i]) / 15.0));
+	}
+#else
 	uint occlusion = imageLoad(src_occlusion, read_pos).r;
 	read_pos.x += params.grid_size;
 	occlusion |= imageLoad(src_occlusion, read_pos).r << 16;
@@ -221,6 +239,7 @@ void main() {
 		float o = float((occlusion >> occlusion_shift[i]) & 0xF) / 15.0;
 		imageStore(dst_occlusion[i], write_pos, vec4(o));
 	}
+#endif
 
 #endif
 
@@ -969,6 +988,26 @@ void main() {
 
 	// STORE OCCLUSION
 
+#ifdef SDFGI_RGBA8_OCCLUSION
+	uvec4 occlusion_low = uvec4(0);
+	uvec4 occlusion_high = uvec4(0);
+	for (int i = 0; i < 8; i++) {
+		float occ = imageLoad(src_occlusion[i], pos).r;
+		uint quantized_occlusion = uint(clamp(occ * 15.0, 0.0, 15.0));
+		if (i < 4) {
+			occlusion_low[i] = quantized_occlusion;
+		} else {
+			occlusion_high[i - 4] = quantized_occlusion;
+		}
+	}
+	{
+		ivec3 occ_pos = pos;
+		occ_pos.z += params.cascade * params.grid_size;
+		imageStore(dst_occlusion, occ_pos, vec4(occlusion_low) / 15.0);
+		occ_pos.x += params.grid_size;
+		imageStore(dst_occlusion, occ_pos, vec4(occlusion_high) / 15.0);
+	}
+#else
 	uint occlusion = 0;
 	const uint occlusion_shift[8] = uint[](12, 8, 4, 0, 28, 24, 20, 16);
 	for (int i = 0; i < 8; i++) {
@@ -982,6 +1021,7 @@ void main() {
 		occ_pos.x += params.grid_size;
 		imageStore(dst_occlusion, occ_pos, uvec4(occlusion >> 16));
 	}
+#endif
 
 	// STORE POSITIONS
 
