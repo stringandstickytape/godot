@@ -5970,6 +5970,10 @@ public:
 #endif
     // Shortcut for "Allocation Callbacks", because this function is called so often.
     const ALLOCATION_CALLBACKS& GetAllocs() const { return m_AllocationCallbacks; }
+    bool HasPhysicalMemoryCallbacks() const { return m_PhysicalMemoryCallbacks.pCreated != NULL; }
+    void NotifyPhysicalMemoryCreated(PHYSICAL_MEMORY_OBJECT_TYPE objectType, ID3D12Pageable* object,
+        const D3D12_HEAP_PROPERTIES* heapProperties, D3D12_HEAP_FLAGS heapFlags, UINT64 size) const;
+    void NotifyPhysicalMemoryDestroyed(PHYSICAL_MEMORY_OBJECT_TYPE objectType, ID3D12Pageable* object) const;
     const D3D12_FEATURE_DATA_D3D12_OPTIONS& GetD3D12Options() const { return m_D3D12Options; }
     BOOL IsUMA() const { return m_D3D12Architecture.UMA; }
     BOOL IsCacheCoherentUMA() const { return m_D3D12Architecture.CacheCoherentUMA; }
@@ -6088,6 +6092,7 @@ private:
 #endif
     UINT64 m_PreferredBlockSize;
     ALLOCATION_CALLBACKS m_AllocationCallbacks;
+    PHYSICAL_MEMORY_CALLBACKS m_PhysicalMemoryCallbacks = {};
     D3D12MA_ATOMIC_UINT32 m_CurrentFrameIndex;
     DXGI_ADAPTER_DESC m_AdapterDesc;
     D3D12_FEATURE_DATA_D3D12_OPTIONS m_D3D12Options;
@@ -6185,6 +6190,8 @@ AllocatorPimpl::AllocatorPimpl(const ALLOCATION_CALLBACKS& allocationCallbacks, 
     m_AllocationObjectAllocator(m_AllocationCallbacks, m_UseMutex)
 {
     // desc.pAllocationCallbacks intentionally ignored here, preprocessed by CreateAllocator.
+    if (desc.pPhysicalMemoryCallbacks != NULL)
+        m_PhysicalMemoryCallbacks = *desc.pPhysicalMemoryCallbacks;
     ZeroMemory(&m_D3D12Options, sizeof(m_D3D12Options));
     ZeroMemory(&m_D3D12Architecture, sizeof(m_D3D12Architecture));
 
@@ -6200,6 +6207,26 @@ AllocatorPimpl::AllocatorPimpl(const ALLOCATION_CALLBACKS& allocationCallbacks, 
 
     m_Device->AddRef();
     m_Adapter->AddRef();
+}
+
+void AllocatorPimpl::NotifyPhysicalMemoryCreated(PHYSICAL_MEMORY_OBJECT_TYPE objectType, ID3D12Pageable* object,
+    const D3D12_HEAP_PROPERTIES* heapProperties, D3D12_HEAP_FLAGS heapFlags, UINT64 size) const
+{
+    if (m_PhysicalMemoryCallbacks.pCreated != NULL)
+    {
+        m_PhysicalMemoryCallbacks.pCreated(
+            static_cast<UINT>(objectType), object, heapProperties, heapFlags, size,
+            m_PhysicalMemoryCallbacks.pPrivateData);
+    }
+}
+
+void AllocatorPimpl::NotifyPhysicalMemoryDestroyed(PHYSICAL_MEMORY_OBJECT_TYPE objectType, ID3D12Pageable* object) const
+{
+    if (m_PhysicalMemoryCallbacks.pDestroyed != NULL)
+    {
+        m_PhysicalMemoryCallbacks.pDestroyed(
+            static_cast<UINT>(objectType), object, m_PhysicalMemoryCallbacks.pPrivateData);
+    }
 }
 
 HRESULT AllocatorPimpl::Init(const ALLOCATOR_DESC& desc)
@@ -6719,6 +6746,10 @@ void AllocatorPimpl::FreeHeapMemory(Allocation* allocation)
 
     CommittedAllocationList* const allocList = allocation->m_Committed.list;
     allocList->Unregister(allocation);
+    if (allocation->m_Heap.heap != NULL)
+    {
+        NotifyPhysicalMemoryDestroyed(PHYSICAL_MEMORY_OBJECT_TYPE_DEDICATED_HEAP, allocation->m_Heap.heap);
+    }
     SAFE_RELEASE(allocation->m_Heap.heap);
 
     const UINT memSegmentGroup = allocList->GetMemorySegmentGroup(this);
@@ -7452,6 +7483,12 @@ HRESULT AllocatorPimpl::AllocateCommittedResource(
             const UINT memSegmentGroup = HeapPropertiesToMemorySegmentGroup(committedAllocParams.m_HeapProperties);
             m_Budget.AddBlock(memSegmentGroup, resourceSize);
             m_Budget.AddAllocation(memSegmentGroup, resourceSize);
+            NotifyPhysicalMemoryCreated(
+                PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE,
+                res,
+                &committedAllocParams.m_HeapProperties,
+                committedAllocParams.m_HeapFlags & ~RESOURCE_CLASS_HEAP_FLAGS,
+                resourceSize);
         }
         else
         {
@@ -7507,6 +7544,12 @@ HRESULT AllocatorPimpl::AllocateHeap(
         const UINT memSegmentGroup = HeapPropertiesToMemorySegmentGroup(committedAllocParams.m_HeapProperties);
         m_Budget.AddBlock(memSegmentGroup, allocInfo.SizeInBytes);
         m_Budget.AddAllocation(memSegmentGroup, allocInfo.SizeInBytes);
+        NotifyPhysicalMemoryCreated(
+            PHYSICAL_MEMORY_OBJECT_TYPE_DEDICATED_HEAP,
+            heap,
+            &committedAllocParams.m_HeapProperties,
+            committedAllocParams.m_HeapFlags,
+            allocInfo.SizeInBytes);
     }
     return hr;
 }
@@ -7950,6 +7993,7 @@ MemoryBlock::~MemoryBlock()
 {
     if (m_Heap)
     {
+        m_Allocator->NotifyPhysicalMemoryDestroyed(PHYSICAL_MEMORY_OBJECT_TYPE_BLOCK_HEAP, m_Heap);
         m_Heap->Release();
         m_Allocator->m_Budget.RemoveBlock(
             m_Allocator->HeapPropertiesToMemorySegmentGroup(m_HeapProps), m_Size);
@@ -7984,6 +8028,12 @@ HRESULT MemoryBlock::Init(ID3D12ProtectedResourceSession* pProtectedSession, boo
     {
         m_Allocator->m_Budget.AddBlock(
             m_Allocator->HeapPropertiesToMemorySegmentGroup(m_HeapProps), m_Size);
+        m_Allocator->NotifyPhysicalMemoryCreated(
+            PHYSICAL_MEMORY_OBJECT_TYPE_BLOCK_HEAP,
+            m_Heap,
+            &m_HeapProps,
+            m_HeapFlags,
+            m_Size);
     }
     return hr;
 }
@@ -9378,7 +9428,9 @@ void PoolPimpl::FreeName()
 HRESULT CreateAllocator(const ALLOCATOR_DESC* pDesc, Allocator** ppAllocator)
 {
     if (!pDesc || !ppAllocator || !pDesc->pDevice || !pDesc->pAdapter ||
-        !(pDesc->PreferredBlockSize == 0 || (pDesc->PreferredBlockSize >= 16 && pDesc->PreferredBlockSize < 0x10000000000ull)))
+        !(pDesc->PreferredBlockSize == 0 || (pDesc->PreferredBlockSize >= 16 && pDesc->PreferredBlockSize < 0x10000000000ull)) ||
+        (pDesc->pPhysicalMemoryCallbacks != NULL &&
+            (pDesc->pPhysicalMemoryCallbacks->pCreated == NULL || pDesc->pPhysicalMemoryCallbacks->pDestroyed == NULL)))
     {
         D3D12MA_ASSERT(0 && "Invalid arguments passed to CreateAllocator.");
         return E_INVALIDARG;
@@ -9495,11 +9547,28 @@ void Allocation::SetResource(ID3D12Resource* pResource)
 {
     if (pResource != m_Resource)
     {
+        const bool committed = m_PackedData.GetType() == TYPE_COMMITTED;
+        if (committed && m_Resource != NULL)
+            m_Allocator->NotifyPhysicalMemoryDestroyed(PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE, m_Resource);
         if (m_Resource)
             m_Resource->Release();
         m_Resource = pResource;
         if (m_Resource)
+        {
             m_Resource->AddRef();
+            if (committed && m_Allocator->HasPhysicalMemoryCallbacks())
+            {
+                D3D12_HEAP_PROPERTIES heapProperties = {};
+                D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
+                const HRESULT heapPropertiesResult = m_Resource->GetHeapProperties(&heapProperties, &heapFlags);
+                m_Allocator->NotifyPhysicalMemoryCreated(
+                    PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE,
+                    m_Resource,
+                    SUCCEEDED(heapPropertiesResult) ? &heapProperties : NULL,
+                    heapFlags,
+                    m_Size);
+            }
+        }
     }
 }
 
@@ -9533,6 +9602,10 @@ void Allocation::SetName(LPCWSTR Name)
 
 void Allocation::ReleaseThis()
 {
+    if (m_Resource != NULL && m_PackedData.GetType() == TYPE_COMMITTED)
+    {
+        m_Allocator->NotifyPhysicalMemoryDestroyed(PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE, m_Resource);
+    }
     SAFE_RELEASE(m_Resource);
 
     switch (m_PackedData.GetType())

@@ -198,7 +198,83 @@ private:
 	/**** MEMORY ****/
 	/****************/
 
+	struct PhysicalMemoryRecord {
+		void *object = nullptr;
+		uint64_t generation = 0;
+		uint64_t size_bytes = 0;
+		uint64_t creation_sequence = 0;
+		UINT object_type = 0;
+		D3D12_HEAP_PROPERTIES heap_properties = {};
+		D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+		bool heap_properties_available = false;
+	};
+
+	struct PhysicalMemoryTrackerSnapshot {
+		PhysicalMemoryRecord *records = nullptr;
+		uint64_t record_count = 0;
+		uint64_t active_object_count = 0;
+		uint64_t record_capacity = 0;
+		uint64_t active_bytes = 0;
+		uint64_t peak_active_count = 0;
+		uint64_t peak_active_bytes = 0;
+		uint64_t total_creation_count = 0;
+		uint64_t total_destruction_count = 0;
+		uint64_t duplicate_creation_count = 0;
+		uint64_t unmatched_destruction_count = 0;
+		uint64_t destruction_type_mismatch_count = 0;
+		uint64_t invalid_creation_count = 0;
+		uint64_t record_allocation_failure_count = 0;
+		uint64_t creation_metadata_failure_count = 0;
+		uint64_t initialization_failure_count = 0;
+		uint64_t snapshot_copy_failure_count = 0;
+		uint64_t tracker_start_unix_usec = 0;
+		uint64_t snapshot_copy_bytes = 0;
+		uint32_t process_id = 0;
+		bool enabled = false;
+		bool complete = true;
+		bool copy_succeeded = true;
+	};
+
+	struct PhysicalMemoryTracker {
+		BinaryMutex mutex;
+		PhysicalMemoryRecord *records = nullptr;
+		uint64_t record_count = 0;
+		uint64_t record_capacity = 0;
+		uint64_t active_bytes = 0;
+		uint64_t peak_active_count = 0;
+		uint64_t peak_active_bytes = 0;
+		uint64_t total_creation_count = 0;
+		uint64_t total_destruction_count = 0;
+		uint64_t duplicate_creation_count = 0;
+		uint64_t unmatched_destruction_count = 0;
+		uint64_t destruction_type_mismatch_count = 0;
+		uint64_t invalid_creation_count = 0;
+		uint64_t record_allocation_failure_count = 0;
+		uint64_t creation_metadata_failure_count = 0;
+		uint64_t initialization_failure_count = 0;
+		uint64_t snapshot_copy_failure_count = 0;
+		uint64_t tracker_start_unix_usec = 0;
+		uint32_t process_id = 0;
+		bool initialized = false;
+		bool enabled = false;
+		bool complete = true;
+
+		~PhysicalMemoryTracker();
+		void initialize_from_environment();
+		void record_created(UINT p_object_type, ID3D12Pageable *p_object, const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, uint64_t p_size_bytes);
+		void record_destroyed(UINT p_object_type, ID3D12Pageable *p_object);
+		bool find_record(ID3D12Pageable *p_object, PhysicalMemoryRecord &r_record);
+		PhysicalMemoryTrackerSnapshot snapshot();
+		static void free_snapshot(PhysicalMemoryTrackerSnapshot &r_snapshot);
+	};
+
+	PhysicalMemoryTracker physical_memory_tracker;
 	Microsoft::WRL::ComPtr<D3D12MA::Allocator> allocator;
+
+	static void _physical_memory_created(UINT p_object_type, ID3D12Pageable *p_object, const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, UINT64 p_size, void *p_private_data);
+	static void _physical_memory_destroyed(UINT p_object_type, ID3D12Pageable *p_object, void *p_private_data);
+	void _add_physical_memory_identity(Dictionary &r_result, ID3D12Resource *p_resource, D3D12MA::Allocation *p_allocation);
+	Dictionary _get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes);
 
 	/******************/
 	/**** RESOURCE ****/

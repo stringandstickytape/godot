@@ -254,6 +254,51 @@ struct ALLOCATION_CALLBACKS
     void* pPrivateData;
 };
 
+/// Type of a physical D3D12 memory object created by the allocator.
+enum PHYSICAL_MEMORY_OBJECT_TYPE
+{
+    /// Resource created by `ID3D12Device::CreateCommittedResource*`, with an implicit heap.
+    PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE = 0,
+    /// Heap dedicated to a single raw memory allocation.
+    PHYSICAL_MEMORY_OBJECT_TYPE_DEDICATED_HEAP = 1,
+    /// Heap block shared by placed allocations.
+    PHYSICAL_MEMORY_OBJECT_TYPE_BLOCK_HEAP = 2,
+};
+
+/**
+\brief Called after a physical D3D12 memory object has been created and registered successfully.
+
+The callback is diagnostic only. It is invoked from allocator code while allocator-internal
+locks may be held and must not call back into D3D12MA. `pHeapProperties` is null only if an
+advanced Allocation::SetResource() replacement cannot report its heap properties.
+*/
+using PHYSICAL_MEMORY_CREATED_FUNC_PTR = void (*)(
+    UINT ObjectType,
+    ID3D12Pageable* pObject,
+    const D3D12_HEAP_PROPERTIES* pHeapProperties,
+    D3D12_HEAP_FLAGS HeapFlags,
+    UINT64 Size,
+    void* pPrivateData);
+
+/**
+\brief Called immediately before the allocator releases a physical D3D12 memory object.
+
+The callback is diagnostic only. It is invoked from allocator code while allocator-internal
+locks may be held and must not call back into D3D12MA.
+*/
+using PHYSICAL_MEMORY_DESTROYED_FUNC_PTR = void (*)(
+    UINT ObjectType,
+    ID3D12Pageable* pObject,
+    void* pPrivateData);
+
+/// Optional callbacks for observing physical D3D12 memory object lifetimes.
+struct PHYSICAL_MEMORY_CALLBACKS
+{
+    PHYSICAL_MEMORY_CREATED_FUNC_PTR pCreated;
+    PHYSICAL_MEMORY_DESTROYED_FUNC_PTR pDestroyed;
+    void* pPrivateData;
+};
+
 
 /// \brief Bit flags to be used with ALLOCATION_DESC::Flags.
 enum ALLOCATION_FLAGS
@@ -1159,6 +1204,13 @@ struct ALLOCATOR_DESC
     Allocator is doing `AddRef`/`Release` on this object.
     */
     IDXGIAdapter* pAdapter;
+
+    /** \brief Optional callbacks for physical D3D12 memory object lifetimes.
+
+    These are distinct from `pAllocationCallbacks`, which allocate CPU-side bookkeeping memory.
+    The callback structure is copied when the allocator is created.
+    */
+    const PHYSICAL_MEMORY_CALLBACKS* pPhysicalMemoryCallbacks;
 };
 
 /**

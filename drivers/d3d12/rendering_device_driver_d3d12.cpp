@@ -41,6 +41,8 @@
 #include <drivers/d3d12/godot_nir.h>
 #include <dxgi1_6.h>
 
+#include <cstdlib>
+
 #if !defined(_MSC_VER)
 #include <thirdparty/directx_headers/include/dxguids/dxguids.h>
 
@@ -50,6 +52,207 @@
 using Microsoft::WRL::ComPtr;
 
 static SafeNumeric<uint64_t> _d3d12_resource_identity_counter{ 0 };
+static SafeNumeric<uint64_t> _d3d12_physical_memory_identity_counter{ 0 };
+
+RenderingDeviceDriverD3D12::PhysicalMemoryTracker::~PhysicalMemoryTracker() {
+	std::free(records);
+}
+
+void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::initialize_from_environment() {
+	MutexLock lock(mutex);
+	if (initialized) {
+		return;
+	}
+
+	initialized = true;
+	wchar_t value[2] = {};
+	const DWORD value_length = GetEnvironmentVariableW(L"ANTHROPOLIS_D3D12_PHYSICAL_MEMORY_TRACKING", value, 2);
+	enabled = value_length == 1 && value[0] == L'1';
+	if (!enabled) {
+		return;
+	}
+
+	process_id = GetCurrentProcessId();
+	FILETIME file_time = {};
+	GetSystemTimePreciseAsFileTime(&file_time);
+	ULARGE_INTEGER file_time_value = {};
+	file_time_value.LowPart = file_time.dwLowDateTime;
+	file_time_value.HighPart = file_time.dwHighDateTime;
+	constexpr uint64_t WINDOWS_TO_UNIX_EPOCH_100NS = 116444736000000000ULL;
+	if (file_time_value.QuadPart >= WINDOWS_TO_UNIX_EPOCH_100NS) {
+		tracker_start_unix_usec = (file_time_value.QuadPart - WINDOWS_TO_UNIX_EPOCH_100NS) / 10ULL;
+	} else {
+		initialization_failure_count++;
+		complete = false;
+	}
+}
+
+void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::record_created(UINT p_object_type, ID3D12Pageable *p_object,
+		const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, uint64_t p_size_bytes) {
+	if (!enabled) {
+		return;
+	}
+
+	MutexLock lock(mutex);
+	if (p_object == nullptr || p_size_bytes == 0) {
+		invalid_creation_count++;
+		complete = false;
+		return;
+	}
+	if (p_object_type != D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE &&
+			p_object_type != D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_DEDICATED_HEAP &&
+			p_object_type != D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_BLOCK_HEAP) {
+		invalid_creation_count++;
+		complete = false;
+	}
+
+	for (uint64_t i = 0; i < record_count; i++) {
+		if (records[i].object == p_object) {
+			duplicate_creation_count++;
+			complete = false;
+			return;
+		}
+	}
+
+	if (record_count == record_capacity) {
+		const uint64_t new_capacity = record_capacity == 0 ? 64 : record_capacity * 2;
+		if (new_capacity < record_capacity || new_capacity > SIZE_MAX / sizeof(PhysicalMemoryRecord)) {
+			record_allocation_failure_count++;
+			complete = false;
+			return;
+		}
+		void *new_records = std::realloc(records, static_cast<size_t>(new_capacity * sizeof(PhysicalMemoryRecord)));
+		if (new_records == nullptr) {
+			record_allocation_failure_count++;
+			complete = false;
+			return;
+		}
+		records = static_cast<PhysicalMemoryRecord *>(new_records);
+		record_capacity = new_capacity;
+	}
+
+	PhysicalMemoryRecord &record = records[record_count++];
+	record = {};
+	record.object = p_object;
+	record.generation = _d3d12_physical_memory_identity_counter.increment();
+	record.size_bytes = p_size_bytes;
+	record.creation_sequence = ++total_creation_count;
+	record.object_type = p_object_type;
+	record.heap_properties_available = p_heap_properties != nullptr;
+	if (p_heap_properties != nullptr) {
+		record.heap_properties = *p_heap_properties;
+	} else {
+		creation_metadata_failure_count++;
+		complete = false;
+	}
+	record.heap_flags = p_heap_flags;
+	active_bytes += p_size_bytes;
+	peak_active_count = MAX(peak_active_count, record_count);
+	peak_active_bytes = MAX(peak_active_bytes, active_bytes);
+}
+
+void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::record_destroyed(UINT p_object_type, ID3D12Pageable *p_object) {
+	if (!enabled) {
+		return;
+	}
+
+	MutexLock lock(mutex);
+	for (uint64_t i = 0; i < record_count; i++) {
+		if (records[i].object != p_object) {
+			continue;
+		}
+		if (records[i].object_type != p_object_type) {
+			destruction_type_mismatch_count++;
+			complete = false;
+		}
+		active_bytes -= records[i].size_bytes;
+		records[i] = records[record_count - 1];
+		record_count--;
+		total_destruction_count++;
+		return;
+	}
+
+	unmatched_destruction_count++;
+	complete = false;
+}
+
+bool RenderingDeviceDriverD3D12::PhysicalMemoryTracker::find_record(ID3D12Pageable *p_object, PhysicalMemoryRecord &r_record) {
+	if (!enabled || p_object == nullptr) {
+		return false;
+	}
+
+	MutexLock lock(mutex);
+	for (uint64_t i = 0; i < record_count; i++) {
+		if (records[i].object == p_object) {
+			r_record = records[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+RenderingDeviceDriverD3D12::PhysicalMemoryTrackerSnapshot RenderingDeviceDriverD3D12::PhysicalMemoryTracker::snapshot() {
+	PhysicalMemoryTrackerSnapshot result;
+	MutexLock lock(mutex);
+
+	if (record_count > 0) {
+		result.snapshot_copy_bytes = record_count * sizeof(PhysicalMemoryRecord);
+		result.records = static_cast<PhysicalMemoryRecord *>(std::malloc(static_cast<size_t>(result.snapshot_copy_bytes)));
+		if (result.records != nullptr) {
+			memcpy(result.records, records, static_cast<size_t>(result.snapshot_copy_bytes));
+		} else {
+			snapshot_copy_failure_count++;
+			complete = false;
+			result.copy_succeeded = false;
+			result.snapshot_copy_bytes = 0;
+		}
+	}
+
+	result.record_count = result.copy_succeeded ? record_count : 0;
+	result.active_object_count = record_count;
+	result.record_capacity = record_capacity;
+	result.active_bytes = active_bytes;
+	result.peak_active_count = peak_active_count;
+	result.peak_active_bytes = peak_active_bytes;
+	result.total_creation_count = total_creation_count;
+	result.total_destruction_count = total_destruction_count;
+	result.duplicate_creation_count = duplicate_creation_count;
+	result.unmatched_destruction_count = unmatched_destruction_count;
+	result.destruction_type_mismatch_count = destruction_type_mismatch_count;
+	result.invalid_creation_count = invalid_creation_count;
+	result.record_allocation_failure_count = record_allocation_failure_count;
+	result.creation_metadata_failure_count = creation_metadata_failure_count;
+	result.initialization_failure_count = initialization_failure_count;
+	result.snapshot_copy_failure_count = snapshot_copy_failure_count;
+	result.tracker_start_unix_usec = tracker_start_unix_usec;
+	result.process_id = process_id;
+	result.enabled = enabled;
+	result.complete = complete && result.copy_succeeded;
+	return result;
+}
+
+void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::free_snapshot(PhysicalMemoryTrackerSnapshot &r_snapshot) {
+	std::free(r_snapshot.records);
+	r_snapshot.records = nullptr;
+	r_snapshot.record_count = 0;
+}
+
+void RenderingDeviceDriverD3D12::_physical_memory_created(UINT p_object_type, ID3D12Pageable *p_object,
+		const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, UINT64 p_size, void *p_private_data) {
+	PhysicalMemoryTracker *tracker = static_cast<PhysicalMemoryTracker *>(p_private_data);
+	if (tracker == nullptr) {
+		return;
+	}
+	tracker->record_created(p_object_type, p_object, p_heap_properties, p_heap_flags, p_size);
+}
+
+void RenderingDeviceDriverD3D12::_physical_memory_destroyed(UINT p_object_type, ID3D12Pageable *p_object, void *p_private_data) {
+	PhysicalMemoryTracker *tracker = static_cast<PhysicalMemoryTracker *>(p_private_data);
+	if (tracker == nullptr) {
+		return;
+	}
+	tracker->record_destroyed(p_object_type, p_object);
+}
 
 // Mesa may define this.
 #ifdef UNUSED
@@ -1121,6 +1324,71 @@ static Dictionary _d3d12_memory_identity_dictionary(const void *p_driver_record,
 	return result;
 }
 
+static String _d3d12_physical_memory_identity(uint64_t p_generation) {
+	return p_generation == 0 ? String() : "d3d12-device-memory:" + String::num_uint64(p_generation);
+}
+
+static String _d3d12_physical_memory_object_type_name(UINT p_object_type) {
+	switch (p_object_type) {
+		case D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE:
+			return "committed_implicit_heap";
+		case D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_DEDICATED_HEAP:
+			return "dedicated_heap";
+		case D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_BLOCK_HEAP:
+			return "pooled_heap";
+		default:
+			return "unknown";
+	}
+}
+
+void RenderingDeviceDriverD3D12::_add_physical_memory_identity(Dictionary &r_result, ID3D12Resource *p_resource, D3D12MA::Allocation *p_allocation) {
+	r_result["physical_memory_tracking_enabled"] = physical_memory_tracker.enabled;
+	r_result["physical_memory_identity_scope"] = "process-d3d12-device-memory-generation";
+	r_result["physical_memory_tracker_start_unix_usec"] = physical_memory_tracker.tracker_start_unix_usec;
+	r_result["physical_memory_process_id"] = physical_memory_tracker.process_id;
+	r_result["physical_memory_accounted_by_this_record"] = false;
+	r_result["physical_memory_id"] = String();
+	r_result["physical_memory_kind"] = "unknown";
+	r_result["physical_memory_bytes"] = 0;
+	r_result["physical_memory_resource_pointer_match_available"] = false;
+	r_result["physical_memory_resource_pointer_matches_allocation"] = false;
+	if (!physical_memory_tracker.enabled) {
+		r_result["physical_memory_join_available"] = false;
+		r_result["physical_memory_join_reason"] = "tracking_disabled";
+		return;
+	}
+	if (p_allocation == nullptr) {
+		r_result["physical_memory_join_available"] = false;
+		r_result["physical_memory_join_reason"] = "external_or_untracked_allocation";
+		return;
+	}
+
+	ID3D12Heap *heap = p_allocation->GetHeap();
+	ID3D12Resource *allocation_resource = p_allocation->GetResource();
+	r_result["physical_memory_resource_pointer_match_available"] = allocation_resource != nullptr;
+	r_result["physical_memory_resource_pointer_matches_allocation"] = allocation_resource == p_resource;
+	ID3D12Pageable *physical_object = heap != nullptr ? static_cast<ID3D12Pageable *>(heap) : static_cast<ID3D12Pageable *>(allocation_resource);
+	if (physical_object == nullptr) {
+		r_result["physical_memory_join_available"] = false;
+		r_result["physical_memory_join_reason"] = "allocation_has_no_active_physical_object";
+		return;
+	}
+	PhysicalMemoryRecord record;
+	if (!physical_memory_tracker.find_record(physical_object, record)) {
+		r_result["physical_memory_join_available"] = false;
+		r_result["physical_memory_join_reason"] = "active_physical_record_missing";
+		return;
+	}
+
+	r_result["physical_memory_join_available"] = true;
+	r_result["physical_memory_join_reason"] = record.object_type == D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE ? "d3d12ma_committed_resource" :
+			record.object_type == D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_DEDICATED_HEAP ? "d3d12ma_dedicated_heap" :
+			record.object_type == D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_BLOCK_HEAP ? "d3d12ma_pooled_heap" : "d3d12ma_unknown_physical_object";
+	r_result["physical_memory_id"] = _d3d12_physical_memory_identity(record.generation);
+	r_result["physical_memory_kind"] = _d3d12_physical_memory_object_type_name(record.object_type);
+	r_result["physical_memory_bytes"] = record.size_bytes;
+}
+
 Dictionary RenderingDeviceDriverD3D12::buffer_get_memory_identity(BufferID p_buffer) {
 	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
 	Dictionary result = _d3d12_memory_identity_dictionary(buf_info, buf_info->resource, buf_info->owner_info.allocation.Get(), buf_info->identity_generation, true);
@@ -1142,6 +1410,7 @@ Dictionary RenderingDeviceDriverD3D12::buffer_get_memory_identity(BufferID p_buf
 	result["resource_alignment_bytes"] = desc.Alignment;
 	result["resource_layout"] = (int64_t)desc.Layout;
 	result["resource_flags"] = (uint64_t)desc.Flags;
+	_add_physical_memory_identity(result, buf_info->resource, buf_info->owner_info.allocation.Get());
 	return result;
 }
 
@@ -1949,6 +2218,7 @@ Dictionary RenderingDeviceDriverD3D12::texture_get_memory_identity(TextureID p_t
 	result["resource_alignment_bytes"] = desc.Alignment;
 	result["resource_layout"] = (int64_t)desc.Layout;
 	result["resource_flags"] = (uint64_t)desc.Flags;
+	_add_physical_memory_identity(result, backing_info->resource, backing_allocation);
 	return result;
 }
 
@@ -6013,6 +6283,128 @@ static Dictionary _d3d12ma_memory_segment_to_dictionary(const D3D12MA::DetailedS
 	return result;
 }
 
+Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes) {
+	PhysicalMemoryTrackerSnapshot snapshot = physical_memory_tracker.snapshot();
+	if (snapshot.records != nullptr && snapshot.record_count > 1) {
+		std::qsort(snapshot.records, static_cast<size_t>(snapshot.record_count), sizeof(PhysicalMemoryRecord), [](const void *p_left, const void *p_right) {
+			const PhysicalMemoryRecord *left = static_cast<const PhysicalMemoryRecord *>(p_left);
+			const PhysicalMemoryRecord *right = static_cast<const PhysicalMemoryRecord *>(p_right);
+			return left->generation < right->generation ? -1 : (left->generation > right->generation ? 1 : 0);
+		});
+	}
+
+	Array objects;
+	for (uint64_t i = 0; i < snapshot.record_count; i++) {
+		const PhysicalMemoryRecord &record = snapshot.records[i];
+		Dictionary object;
+		object["physical_memory_id"] = _d3d12_physical_memory_identity(record.generation);
+		object["identity_scope"] = "process-d3d12-device-memory-generation";
+		object["identity_stable_across_captures"] = true;
+		object["creation_sequence"] = record.creation_sequence;
+		object["object_kind"] = _d3d12_physical_memory_object_type_name(record.object_type);
+		object["object_type_value"] = record.object_type;
+		const char *native_kind = record.object_type == D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE ? "id3d12resource" : "id3d12heap";
+		object["native_object_id"] = _d3d12_capture_local_pointer_identity(native_kind, record.object);
+		object["native_object_identity_scope"] = "capture-local-pointer";
+		object["size_bytes"] = record.size_bytes;
+		object["size_accounted_by_this_record"] = true;
+		object["size_semantics"] = record.object_type == D3D12MA::PHYSICAL_MEMORY_OBJECT_TYPE_COMMITTED_RESOURCE ?
+				"D3D12MA GetResourceAllocationInfo size; the API documents committed-resource size may be approximate." :
+				"ID3D12Heap SizeInBytes.";
+		object["heap_properties_available"] = record.heap_properties_available;
+		object["heap_type"] = record.heap_properties_available ? _d3d12_heap_type_name(record.heap_properties.Type) : String("unknown");
+		object["heap_type_value"] = record.heap_properties_available ? (int64_t)record.heap_properties.Type : -1;
+		object["heap_flags"] = (uint64_t)record.heap_flags;
+		object["cpu_visibility_available"] = record.heap_properties_available;
+		object["cpu_visible"] = record.heap_properties_available && _d3d12_heap_is_cpu_visible(record.heap_properties);
+		object["cpu_page_property"] = record.heap_properties_available ? (int64_t)record.heap_properties.CPUPageProperty : -1;
+		object["memory_pool_preference"] = record.heap_properties_available ? (int64_t)record.heap_properties.MemoryPoolPreference : -1;
+		objects.push_back(object);
+	}
+
+	const uint64_t failure_count = snapshot.duplicate_creation_count +
+			snapshot.unmatched_destruction_count +
+			snapshot.destruction_type_mismatch_count +
+			snapshot.invalid_creation_count +
+			snapshot.record_allocation_failure_count +
+			snapshot.creation_metadata_failure_count +
+			snapshot.initialization_failure_count +
+			snapshot.snapshot_copy_failure_count;
+	Array incomplete_reasons;
+	if (!snapshot.enabled) {
+		incomplete_reasons.push_back("tracking_disabled");
+	}
+	if (snapshot.duplicate_creation_count > 0) {
+		incomplete_reasons.push_back("duplicate_native_object_creation");
+	}
+	if (snapshot.unmatched_destruction_count > 0) {
+		incomplete_reasons.push_back("unmatched_native_object_destruction");
+	}
+	if (snapshot.destruction_type_mismatch_count > 0) {
+		incomplete_reasons.push_back("native_object_destruction_type_mismatch");
+	}
+	if (snapshot.invalid_creation_count > 0) {
+		incomplete_reasons.push_back("invalid_physical_creation_event");
+	}
+	if (snapshot.record_allocation_failure_count > 0) {
+		incomplete_reasons.push_back("tracker_record_allocation_failed");
+	}
+	if (snapshot.creation_metadata_failure_count > 0) {
+		incomplete_reasons.push_back("physical_creation_metadata_unavailable");
+	}
+	if (snapshot.initialization_failure_count > 0) {
+		incomplete_reasons.push_back("tracker_epoch_initialization_failed");
+	}
+	if (snapshot.snapshot_copy_failure_count > 0) {
+		incomplete_reasons.push_back("tracker_snapshot_copy_failed");
+	}
+
+	Dictionary result;
+	result["schema_version"] = 1;
+	result["enabled"] = snapshot.enabled;
+	result["enable_environment_variable"] = "ANTHROPOLIS_D3D12_PHYSICAL_MEMORY_TRACKING";
+	result["tracking_start_scope"] = "before_d3d12ma_allocator_creation";
+	result["status"] = !snapshot.enabled ? "disabled" : (snapshot.complete ? "complete" : "incomplete");
+	result["physical_inventory_complete"] = snapshot.enabled && snapshot.complete;
+	result["physical_inventory_incomplete_reasons"] = incomplete_reasons;
+	result["identity_scope"] = "process-d3d12-device-memory-generation";
+	result["identity_note"] = "Physical IDs are stable across captures only while this process and physical object generation remain alive.";
+	result["va_observation_enabled"] = false;
+	result["mapped_resource_va_tracking_enabled"] = false;
+	result["tracker_start_unix_usec"] = snapshot.tracker_start_unix_usec;
+	result["process_id"] = snapshot.process_id;
+	result["records_uncapped"] = true;
+	result["active_object_count"] = snapshot.active_object_count;
+	result["exported_object_count"] = snapshot.record_count;
+	result["active_bytes"] = snapshot.active_bytes;
+	result["peak_active_object_count"] = snapshot.peak_active_count;
+	result["peak_active_bytes"] = snapshot.peak_active_bytes;
+	result["total_creation_count"] = snapshot.total_creation_count;
+	result["total_destruction_count"] = snapshot.total_destruction_count;
+	result["failure_count"] = failure_count;
+	result["duplicate_creation_count"] = snapshot.duplicate_creation_count;
+	result["unmatched_destruction_count"] = snapshot.unmatched_destruction_count;
+	result["destruction_type_mismatch_count"] = snapshot.destruction_type_mismatch_count;
+	result["invalid_creation_count"] = snapshot.invalid_creation_count;
+	result["record_allocation_failure_count"] = snapshot.record_allocation_failure_count;
+	result["creation_metadata_failure_count"] = snapshot.creation_metadata_failure_count;
+	result["initialization_failure_count"] = snapshot.initialization_failure_count;
+	result["snapshot_copy_failure_count"] = snapshot.snapshot_copy_failure_count;
+	result["record_capacity"] = snapshot.record_capacity;
+	result["record_storage_bytes"] = snapshot.record_capacity * sizeof(PhysicalMemoryRecord);
+	result["tracker_storage_bytes"] = sizeof(PhysicalMemoryTracker) + snapshot.record_capacity * sizeof(PhysicalMemoryRecord);
+	result["snapshot_copy_bytes"] = snapshot.snapshot_copy_bytes;
+	result["d3d12ma_block_count"] = p_d3d12ma_block_count;
+	result["d3d12ma_block_bytes"] = p_d3d12ma_block_bytes;
+	result["matches_d3d12ma_block_count"] = snapshot.enabled && snapshot.complete && snapshot.active_object_count == p_d3d12ma_block_count;
+	result["matches_d3d12ma_block_bytes"] = snapshot.enabled && snapshot.complete && snapshot.active_bytes == p_d3d12ma_block_bytes;
+	result["snapshot_non_atomic"] = true;
+	result["physical_memory_objects"] = objects;
+
+	PhysicalMemoryTracker::free_snapshot(snapshot);
+	return result;
+}
+
 Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics() {
 	D3D12MA::TotalStatistics statistics = {};
 	allocator->CalculateStatistics(&statistics);
@@ -6039,6 +6431,7 @@ Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics() {
 	result["total"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.Total);
 	result["heap_types"] = heap_types;
 	result["memory_segments"] = memory_segments;
+	result["physical_memory_tracking"] = _get_physical_memory_diagnostics(statistics.Total.Stats.BlockCount, statistics.Total.Stats.BlockBytes);
 	return result;
 }
 
@@ -6554,10 +6947,19 @@ Error RenderingDeviceDriverD3D12::_get_device_limits() {
 }
 
 Error RenderingDeviceDriverD3D12::_initialize_allocator() {
+	physical_memory_tracker.initialize_from_environment();
+	D3D12MA::PHYSICAL_MEMORY_CALLBACKS physical_memory_callbacks = {};
+	if (physical_memory_tracker.enabled) {
+		physical_memory_callbacks.pCreated = _physical_memory_created;
+		physical_memory_callbacks.pDestroyed = _physical_memory_destroyed;
+		physical_memory_callbacks.pPrivateData = &physical_memory_tracker;
+	}
+
 	D3D12MA::ALLOCATOR_DESC allocator_desc = {};
 	allocator_desc.pDevice = device.Get();
 	allocator_desc.pAdapter = adapter.Get();
 	allocator_desc.Flags = D3D12MA_RECOMMENDED_ALLOCATOR_FLAGS | D3D12MA::ALLOCATOR_FLAG_DONT_PREFER_SMALL_BUFFERS_COMMITTED;
+	allocator_desc.pPhysicalMemoryCallbacks = physical_memory_tracker.enabled ? &physical_memory_callbacks : nullptr;
 
 	HRESULT res = D3D12MA::CreateAllocator(&allocator_desc, &allocator);
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::CreateAllocator failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
