@@ -428,7 +428,7 @@ private:
 	static void _physical_memory_creation_end(UINT64 p_token, HRESULT p_native_result, ID3D12Pageable *p_object, void *p_private_data);
 	static void _physical_memory_creation_abandoned(UINT64 p_token, void *p_private_data);
 	void _add_physical_memory_identity(Dictionary &r_result, ID3D12Resource *p_resource, D3D12MA::Allocation *p_allocation);
-	Dictionary _get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes);
+	Dictionary _get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes, bool p_include_va_history);
 
 	/******************/
 	/**** RESOURCE ****/
@@ -1156,7 +1156,7 @@ public:
 	virtual uint64_t get_resource_native_handle(DriverResource p_type, ID p_driver_id) override final;
 	virtual uint64_t get_total_memory_used() override final;
 	virtual uint64_t get_lazily_memory_used() override final;
-	virtual Dictionary get_memory_diagnostics() override final;
+	virtual Dictionary get_memory_diagnostics(bool p_include_va_history = true) override final;
 	virtual uint64_t limit_get(Limit p_limit) override final;
 	virtual uint64_t api_trait_get(ApiTrait p_trait) override final;
 	virtual bool has_feature(Features p_feature) override final;

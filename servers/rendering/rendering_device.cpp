@@ -8057,7 +8057,7 @@ Dictionary RenderingDevice::get_memory_diagnostics() {
 	result["schema_version"] = 2;
 	result["snapshot_non_atomic"] = true;
 	result["frames_drawn"] = frames_drawn;
-	result["driver"] = driver->get_memory_diagnostics();
+	result["driver"] = driver->get_memory_diagnostics(false);
 
 	Array workers;
 	uint64_t worker_capacity = 0;

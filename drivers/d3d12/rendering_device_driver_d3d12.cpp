@@ -6780,7 +6780,7 @@ static Dictionary _d3d12ma_memory_segment_to_dictionary(const D3D12MA::DetailedS
 	return result;
 }
 
-Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes) {
+Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes, bool p_include_va_history) {
 	PhysicalMemoryTrackerSnapshot snapshot = physical_memory_tracker.snapshot();
 	if (snapshot.records != nullptr && snapshot.record_count > 1) {
 		std::qsort(snapshot.records, static_cast<size_t>(snapshot.record_count), sizeof(PhysicalMemoryRecord), [](const void *p_left, const void *p_right) {
@@ -6853,48 +6853,50 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 	};
 
 	Array va_observations;
-	for (uint64_t i = 0; i < snapshot.va_observation_count; i++) {
-		const PhysicalMemoryVaObservation &observation = snapshot.va_observations[i];
-		Dictionary row;
-		row["observation_index"] = i;
-		row["attempt_token"] = String::num_uint64(observation.attempt_token);
-		row["physical_memory_id"] = _d3d12_physical_memory_identity(observation.physical_generation);
-		row["physical_generation_available"] = observation.physical_generation != 0;
-		row["size_bytes"] = observation.size_bytes;
-		row["begin_unix_usec"] = observation.begin_unix_usec;
-		row["end_unix_usec"] = observation.end_unix_usec;
-		row["registration_sequence"] = observation.registration_sequence;
-		row["retirement_sequence"] = observation.retirement_sequence;
-		row["retirement_unix_usec"] = observation.retirement_unix_usec;
-		row["native_object_id"] = _d3d12_capture_local_pointer_identity("id3d12pageable", observation.object);
-		row["native_object_identity_scope"] = "capture-local-pointer";
-		row["object_kind"] = _d3d12_physical_memory_object_type_name(observation.object_type);
-		row["object_type_value"] = observation.object_type;
-		row["heap_properties_available"] = observation.heap_properties_available;
-		row["heap_type"] = observation.heap_properties_available ? _d3d12_heap_type_name(observation.heap_properties.Type) : String("unknown");
-		row["heap_type_value"] = observation.heap_properties_available ? int64_t(observation.heap_properties.Type) : -1;
-		row["heap_flags"] = uint64_t(observation.heap_flags);
-		row["creation_boundary_available"] = observation.creation_boundary_available;
-		row["below_explicit_threshold"] = observation.below_explicit_threshold;
-		row["native_create_result"] = observation.native_create_result;
-		row["native_create_succeeded"] = observation.native_create_succeeded;
-		row["allocator_registration_succeeded"] = observation.registered;
-		row["allocator_registration_abandoned"] = observation.abandoned;
-		row["physical_object_retired"] = observation.retired;
-		row["before_create_process_counters"] = counters_dictionary(observation.before_create_counters);
-		row["after_create_process_counters"] = counters_dictionary(observation.after_create_counters);
-		row["before_wc_bytes"] = observation.before_wc_bytes;
-		row["after_wc_bytes"] = observation.after_wc_bytes;
-		row["wc_delta_bytes"] = int64_t(observation.after_wc_bytes) - int64_t(observation.before_wc_bytes);
-		row["before_scan_usec"] = observation.before_scan_usec;
-		row["after_scan_usec"] = observation.after_scan_usec;
-		row["before_scan_complete"] = observation.before_scan_complete;
-		row["after_scan_complete"] = observation.after_scan_complete;
-		row["before_scan_win32_error"] = observation.before_scan_error;
-		row["after_scan_win32_error"] = observation.after_scan_error;
-		row["before_wc_intervals"] = interval_array(snapshot.va_intervals, observation.before_interval_offset, observation.before_interval_count);
-		row["after_wc_intervals"] = interval_array(snapshot.va_intervals, observation.after_interval_offset, observation.after_interval_count);
-		va_observations.push_back(row);
+	if (p_include_va_history) {
+		for (uint64_t i = 0; i < snapshot.va_observation_count; i++) {
+			const PhysicalMemoryVaObservation &observation = snapshot.va_observations[i];
+			Dictionary row;
+			row["observation_index"] = i;
+			row["attempt_token"] = String::num_uint64(observation.attempt_token);
+			row["physical_memory_id"] = _d3d12_physical_memory_identity(observation.physical_generation);
+			row["physical_generation_available"] = observation.physical_generation != 0;
+			row["size_bytes"] = observation.size_bytes;
+			row["begin_unix_usec"] = observation.begin_unix_usec;
+			row["end_unix_usec"] = observation.end_unix_usec;
+			row["registration_sequence"] = observation.registration_sequence;
+			row["retirement_sequence"] = observation.retirement_sequence;
+			row["retirement_unix_usec"] = observation.retirement_unix_usec;
+			row["native_object_id"] = _d3d12_capture_local_pointer_identity("id3d12pageable", observation.object);
+			row["native_object_identity_scope"] = "capture-local-pointer";
+			row["object_kind"] = _d3d12_physical_memory_object_type_name(observation.object_type);
+			row["object_type_value"] = observation.object_type;
+			row["heap_properties_available"] = observation.heap_properties_available;
+			row["heap_type"] = observation.heap_properties_available ? _d3d12_heap_type_name(observation.heap_properties.Type) : String("unknown");
+			row["heap_type_value"] = observation.heap_properties_available ? int64_t(observation.heap_properties.Type) : -1;
+			row["heap_flags"] = uint64_t(observation.heap_flags);
+			row["creation_boundary_available"] = observation.creation_boundary_available;
+			row["below_explicit_threshold"] = observation.below_explicit_threshold;
+			row["native_create_result"] = observation.native_create_result;
+			row["native_create_succeeded"] = observation.native_create_succeeded;
+			row["allocator_registration_succeeded"] = observation.registered;
+			row["allocator_registration_abandoned"] = observation.abandoned;
+			row["physical_object_retired"] = observation.retired;
+			row["before_create_process_counters"] = counters_dictionary(observation.before_create_counters);
+			row["after_create_process_counters"] = counters_dictionary(observation.after_create_counters);
+			row["before_wc_bytes"] = observation.before_wc_bytes;
+			row["after_wc_bytes"] = observation.after_wc_bytes;
+			row["wc_delta_bytes"] = int64_t(observation.after_wc_bytes) - int64_t(observation.before_wc_bytes);
+			row["before_scan_usec"] = observation.before_scan_usec;
+			row["after_scan_usec"] = observation.after_scan_usec;
+			row["before_scan_complete"] = observation.before_scan_complete;
+			row["after_scan_complete"] = observation.after_scan_complete;
+			row["before_scan_win32_error"] = observation.before_scan_error;
+			row["after_scan_win32_error"] = observation.after_scan_error;
+			row["before_wc_intervals"] = interval_array(snapshot.va_intervals, observation.before_interval_offset, observation.before_interval_count);
+			row["after_wc_intervals"] = interval_array(snapshot.va_intervals, observation.after_interval_offset, observation.after_interval_count);
+			va_observations.push_back(row);
+		}
 	}
 
 	Dictionary current_va_snapshot;
@@ -7004,6 +7006,9 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 	result["va_max_scan_usec"] = snapshot.va_max_scan_usec;
 	result["va_history_uncapped"] = true;
 	result["va_history_retention"] = "process_lifetime_including_retired_physical_objects";
+	result["va_history_included"] = p_include_va_history;
+	result["va_collected_observation_count"] = snapshot.va_observation_count;
+	result["va_exported_observation_count"] = p_include_va_history ? snapshot.va_observation_count : 0;
 	result["va_observation_count"] = snapshot.va_observation_count;
 	result["va_interval_record_count"] = snapshot.va_interval_count;
 	Dictionary skipped_count;
@@ -7056,7 +7061,7 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 	return result;
 }
 
-Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics() {
+Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics(bool p_include_va_history) {
 	D3D12MA::TotalStatistics statistics = {};
 	allocator->CalculateStatistics(&statistics);
 
@@ -7082,7 +7087,7 @@ Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics() {
 	result["total"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.Total);
 	result["heap_types"] = heap_types;
 	result["memory_segments"] = memory_segments;
-	result["physical_memory_tracking"] = _get_physical_memory_diagnostics(statistics.Total.Stats.BlockCount, statistics.Total.Stats.BlockBytes);
+	result["physical_memory_tracking"] = _get_physical_memory_diagnostics(statistics.Total.Stats.BlockCount, statistics.Total.Stats.BlockBytes, p_include_va_history);
 	return result;
 }
 
