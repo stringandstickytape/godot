@@ -38,6 +38,7 @@
 namespace MemoryTracker {
 
 std::atomic<bool> enabled{ false };
+std::atomic<bool> caller_pc_enabled{ false };
 
 namespace {
 
@@ -253,11 +254,13 @@ static void _erase_index(TrackerState &r_state, size_t p_index) {
 	r_state.statistics.table_tombstone_count = r_state.tombstone_count;
 }
 
-static AllocationRecord _make_record(TrackerState &r_state, void *p_user_base, void *p_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_aligned, bool p_prepad, bool p_zeroed, size_t p_alignment, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available, AllocationOrigin p_origin) {
+static AllocationRecord _make_record(TrackerState &r_state, void *p_user_base, void *p_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_aligned, bool p_prepad, bool p_zeroed, size_t p_alignment, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available, AllocationOrigin p_origin, uintptr_t p_origin_caller_pc, uintptr_t p_last_reallocation_caller_pc) {
 	AllocationRecord record;
 	record.allocation_id = r_state.next_allocation_id++;
 	record.user_base = reinterpret_cast<uintptr_t>(p_user_base);
 	record.raw_base = reinterpret_cast<uintptr_t>(p_raw_base);
+	record.origin_caller_pc = p_origin_caller_pc;
+	record.last_reallocation_caller_pc = p_last_reallocation_caller_pc;
 	record.requested_bytes = p_requested_bytes;
 	record.raw_requested_bytes = p_raw_requested_bytes;
 	record.allocator_usable_bytes = p_allocator_usable_bytes;
@@ -303,7 +306,7 @@ static bool _table_self_check(SelfCheckResult &r_result) {
 	if (!_rehash(state, 8)) {
 		return false;
 	}
-	AllocationRecord initial = _make_record(state, reinterpret_cast<void *>(uintptr_t(0x1000)), reinterpret_cast<void *>(uintptr_t(0x1000)), 16, 16, false, false, false, 0, 16, true, AllocationOrigin::ALLOCATION);
+	AllocationRecord initial = _make_record(state, reinterpret_cast<void *>(uintptr_t(0x1000)), reinterpret_cast<void *>(uintptr_t(0x1000)), 16, 16, false, false, false, 0, 16, true, AllocationOrigin::ALLOCATION, uintptr_t(0x1110), 0);
 	r_result.allocation_inserted = _insert_new_record(state, initial) && _find_index(state, initial.user_base) != SIZE_MAX;
 	if (!r_result.allocation_inserted) {
 		free(state.slots);
@@ -320,6 +323,7 @@ static bool _table_self_check(SelfCheckResult &r_result) {
 	resized.requested_bytes = 32;
 	resized.raw_requested_bytes = 32;
 	resized.allocator_usable_bytes = 32;
+	resized.last_reallocation_caller_pc = uintptr_t(0x2220);
 	resized.last_resize_sequence = ++state.sequence;
 	const bool resize_inserted = _insert_without_growth(state, resized);
 	if (resize_inserted) {
@@ -327,6 +331,8 @@ static bool _table_self_check(SelfCheckResult &r_result) {
 	}
 	index = _find_index(state, resized.user_base);
 	r_result.reallocation_preserved_id = resize_inserted && index != SIZE_MAX && state.slots[index].record.allocation_id == original_id;
+	r_result.reallocation_preserved_origin_caller_pc = resize_inserted && index != SIZE_MAX && state.slots[index].record.origin_caller_pc == uintptr_t(0x1110);
+	r_result.reallocation_updated_caller_pc = resize_inserted && index != SIZE_MAX && state.slots[index].record.last_reallocation_caller_pc == uintptr_t(0x2220);
 	if (!r_result.reallocation_preserved_id) {
 		free(state.slots);
 		return false;
@@ -335,16 +341,16 @@ static bool _table_self_check(SelfCheckResult &r_result) {
 	const AllocationRecord before_failure = state.slots[index].record;
 	state.statistics.failed_reallocation_count++;
 	const AllocationRecord after_failure = state.slots[index].record;
-	r_result.failed_reallocation_preserved_record = before_failure.allocation_id == after_failure.allocation_id && before_failure.user_base == after_failure.user_base && before_failure.raw_base == after_failure.raw_base && before_failure.requested_bytes == after_failure.requested_bytes && before_failure.raw_requested_bytes == after_failure.raw_requested_bytes && before_failure.allocator_usable_bytes == after_failure.allocator_usable_bytes && before_failure.created_sequence == after_failure.created_sequence && before_failure.last_resize_sequence == after_failure.last_resize_sequence;
+	r_result.failed_reallocation_preserved_record = before_failure.allocation_id == after_failure.allocation_id && before_failure.user_base == after_failure.user_base && before_failure.raw_base == after_failure.raw_base && before_failure.origin_caller_pc == after_failure.origin_caller_pc && before_failure.last_reallocation_caller_pc == after_failure.last_reallocation_caller_pc && before_failure.requested_bytes == after_failure.requested_bytes && before_failure.raw_requested_bytes == after_failure.raw_requested_bytes && before_failure.allocator_usable_bytes == after_failure.allocator_usable_bytes && before_failure.created_sequence == after_failure.created_sequence && before_failure.last_resize_sequence == after_failure.last_resize_sequence;
 
 	_subtract_live_totals(state, state.slots[index].record);
 	_erase_index(state, index);
 	r_result.free_removed_record = _find_index(state, resized.user_base) == SIZE_MAX;
 
-	AllocationRecord reused = _make_record(state, reinterpret_cast<void *>(uintptr_t(0x2000)), reinterpret_cast<void *>(uintptr_t(0x2000)), 8, 8, false, false, false, 0, 8, true, AllocationOrigin::ALLOCATION);
+	AllocationRecord reused = _make_record(state, reinterpret_cast<void *>(uintptr_t(0x2000)), reinterpret_cast<void *>(uintptr_t(0x2000)), 8, 8, false, false, false, 0, 8, true, AllocationOrigin::ALLOCATION, uintptr_t(0x3330), 0);
 	const bool reuse_inserted = _insert_new_record(state, reused);
 	r_result.address_reuse_changed_id = reuse_inserted && reused.allocation_id != original_id;
-	r_result.passed = r_result.allocation_inserted && r_result.reallocation_preserved_id && r_result.failed_reallocation_preserved_record && r_result.free_removed_record && r_result.address_reuse_changed_id;
+	r_result.passed = r_result.allocation_inserted && r_result.reallocation_preserved_id && r_result.reallocation_preserved_origin_caller_pc && r_result.reallocation_updated_caller_pc && r_result.failed_reallocation_preserved_record && r_result.free_removed_record && r_result.address_reuse_changed_id;
 	free(state.slots);
 	return r_result.passed;
 }
@@ -372,15 +378,29 @@ bool enable() {
 	state->statistics.enable_requested = true;
 	state->statistics.enabled = true;
 	state->statistics.tracker_start_unix_usec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+#if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
+	state->statistics.caller_pc_supported = true;
+#endif
+#ifdef _MSC_VER
+	char caller_pc_value[2] = {};
+	size_t caller_pc_value_length = 0;
+	const errno_t caller_pc_environment_error = getenv_s(&caller_pc_value_length, caller_pc_value, sizeof(caller_pc_value), "ANTHROPOLIS_NATIVE_ALLOCATION_CALLER_PC");
+	state->statistics.caller_pc_requested = caller_pc_environment_error == 0 && caller_pc_value_length == 2 && caller_pc_value[0] == '1';
+#else
+	const char *caller_pc_environment_value = getenv("ANTHROPOLIS_NATIVE_ALLOCATION_CALLER_PC");
+	state->statistics.caller_pc_requested = caller_pc_environment_value != nullptr && caller_pc_environment_value[0] == '1' && caller_pc_environment_value[1] == '\0';
+#endif
+	state->statistics.caller_pc_enabled = state->statistics.caller_pc_requested && state->statistics.caller_pc_supported;
 #ifdef _MSC_VER
 	state->statistics.allocator_usable_bytes_supported = true;
 #endif
 	tracker_state = state;
+	caller_pc_enabled.store(state->statistics.caller_pc_enabled, std::memory_order_release);
 	enabled.store(true, std::memory_order_release);
 	return true;
 }
 
-void record_allocation(void *p_user_base, void *p_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_aligned, bool p_prepad, bool p_zeroed, size_t p_alignment, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available) {
+void record_allocation(void *p_user_base, void *p_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_aligned, bool p_prepad, bool p_zeroed, size_t p_alignment, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available, uintptr_t p_caller_pc) {
 	if (tracker_suppressed || p_user_base == nullptr) {
 		return;
 	}
@@ -388,7 +408,7 @@ void record_allocation(void *p_user_base, void *p_raw_base, size_t p_requested_b
 	TrackerState &state = *tracker_state;
 	std::lock_guard<std::mutex> lock(state.mutex);
 	state.statistics.allocation_count++;
-	AllocationRecord record = _make_record(state, p_user_base, p_raw_base, p_requested_bytes, p_raw_requested_bytes, p_aligned, p_prepad, p_zeroed, p_alignment, p_allocator_usable_bytes, p_allocator_usable_bytes_available, AllocationOrigin::ALLOCATION);
+	AllocationRecord record = _make_record(state, p_user_base, p_raw_base, p_requested_bytes, p_raw_requested_bytes, p_aligned, p_prepad, p_zeroed, p_alignment, p_allocator_usable_bytes, p_allocator_usable_bytes_available, AllocationOrigin::ALLOCATION, p_caller_pc, 0);
 	_insert_new_record(state, record);
 }
 
@@ -412,7 +432,7 @@ void begin_reallocation(void *p_old_user_base, ReallocationTransaction &r_transa
 	r_transaction.active = true;
 }
 
-void finish_reallocation(ReallocationTransaction &r_transaction, void *p_new_user_base, void *p_new_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_prepad, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available) {
+void finish_reallocation(ReallocationTransaction &r_transaction, void *p_new_user_base, void *p_new_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_prepad, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available, uintptr_t p_caller_pc) {
 	if (!r_transaction.active) {
 		return;
 	}
@@ -421,7 +441,7 @@ void finish_reallocation(ReallocationTransaction &r_transaction, void *p_new_use
 	const size_t old_index = _find_index(state, r_transaction.old_user_base);
 	if (old_index == SIZE_MAX) {
 		state.statistics.adopted_reallocation_count++;
-		AllocationRecord adopted = _make_record(state, p_new_user_base, p_new_raw_base, p_requested_bytes, p_raw_requested_bytes, false, p_prepad, false, 0, p_allocator_usable_bytes, p_allocator_usable_bytes_available, AllocationOrigin::REALLOCATION_OF_PRE_ENABLE_ALLOCATION);
+		AllocationRecord adopted = _make_record(state, p_new_user_base, p_new_raw_base, p_requested_bytes, p_raw_requested_bytes, false, p_prepad, false, 0, p_allocator_usable_bytes, p_allocator_usable_bytes_available, AllocationOrigin::REALLOCATION_OF_PRE_ENABLE_ALLOCATION, 0, p_caller_pc);
 		_insert_new_record(state, adopted);
 		_finish_transaction(r_transaction);
 		return;
@@ -438,6 +458,7 @@ void finish_reallocation(ReallocationTransaction &r_transaction, void *p_new_use
 	resized.raw_requested_bytes = p_raw_requested_bytes;
 	resized.allocator_usable_bytes = p_allocator_usable_bytes;
 	resized.allocator_usable_bytes_available = p_allocator_usable_bytes_available;
+	resized.last_reallocation_caller_pc = p_caller_pc;
 	resized.prepad = p_prepad;
 	resized.last_resize_sequence = ++state.sequence;
 	if (reinterpret_cast<uintptr_t>(p_new_user_base) == state.slots[old_index].record.user_base) {

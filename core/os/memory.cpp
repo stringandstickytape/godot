@@ -41,7 +41,16 @@
 #include <cstdlib>
 
 #ifdef _MSC_VER
+#include <intrin.h>
 #include <malloc.h>
+#endif
+
+#if defined(_MSC_VER)
+#define MEMORY_TRACKER_CALLER_PC() reinterpret_cast<uintptr_t>(_ReturnAddress())
+#elif defined(__GNUC__) || defined(__clang__)
+#define MEMORY_TRACKER_CALLER_PC() reinterpret_cast<uintptr_t>(__builtin_extract_return_addr(__builtin_return_address(0)))
+#else
+#define MEMORY_TRACKER_CALLER_PC() uintptr_t(0)
 #endif
 
 #ifdef DEBUG_ENABLED
@@ -59,10 +68,7 @@ static size_t _allocator_usable_size(void *p_raw_base, bool &r_available) {
 #endif
 }
 
-static _FORCE_INLINE_ void *_realloc_with_optional_tracking(void *p_old_user_base, void *p_old_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_prepad) {
-	if (likely(!MemoryTracker::is_enabled())) {
-		return realloc(p_old_raw_base, p_raw_requested_bytes);
-	}
+static _FORCE_INLINE_ void *_realloc_with_tracking(void *p_old_user_base, void *p_old_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_prepad, uintptr_t p_caller_pc) {
 	MemoryTracker::ReallocationTransaction transaction;
 	MemoryTracker::begin_reallocation(p_old_user_base, transaction);
 	void *new_raw_base = realloc(p_old_raw_base, p_raw_requested_bytes);
@@ -77,9 +83,12 @@ static _FORCE_INLINE_ void *_realloc_with_optional_tracking(void *p_old_user_bas
 	bool usable_available = false;
 	const size_t usable_bytes = _allocator_usable_size(new_raw_base, usable_available);
 	void *new_user_base = p_prepad ? static_cast<void *>(static_cast<uint8_t *>(new_raw_base) + Memory::DATA_OFFSET) : new_raw_base;
-	MemoryTracker::finish_reallocation(transaction, new_user_base, new_raw_base, p_requested_bytes, p_raw_requested_bytes, p_prepad, usable_bytes, usable_available);
+	MemoryTracker::finish_reallocation(transaction, new_user_base, new_raw_base, p_requested_bytes, p_raw_requested_bytes, p_prepad, usable_bytes, usable_available, p_caller_pc);
 	return new_raw_base;
 }
+
+#define MEMORY_REALLOC_WITH_OPTIONAL_TRACKING(m_old_user_base, m_old_raw_base, m_requested_bytes, m_raw_requested_bytes, m_prepad) \
+	(likely(!MemoryTracker::is_enabled()) ? realloc(m_old_raw_base, m_raw_requested_bytes) : _realloc_with_tracking(m_old_user_base, m_old_raw_base, m_requested_bytes, m_raw_requested_bytes, m_prepad, MemoryTracker::is_caller_pc_enabled() ? MEMORY_TRACKER_CALLER_PC() : 0))
 
 void *operator new(size_t p_size, DefaultAllocator p_allocator) {
 	return Memory::alloc_static(p_size);
@@ -103,7 +112,8 @@ void *Memory::alloc_aligned_static(size_t p_bytes, size_t p_alignment) {
 	if (unlikely(MemoryTracker::is_enabled())) {
 		bool usable_available = false;
 		const size_t usable_bytes = _allocator_usable_size(p1, usable_available);
-		MemoryTracker::record_allocation(p2, p1, p_bytes, p_bytes + p_alignment - 1 + sizeof(uint32_t), true, false, false, p_alignment, usable_bytes, usable_available);
+		const uintptr_t caller_pc = MemoryTracker::is_caller_pc_enabled() ? MEMORY_TRACKER_CALLER_PC() : 0;
+		MemoryTracker::record_allocation(p2, p1, p_bytes, p_bytes + p_alignment - 1 + sizeof(uint32_t), true, false, false, p_alignment, usable_bytes, usable_available, caller_pc);
 	}
 	return p2;
 }
@@ -163,14 +173,16 @@ void *Memory::alloc_static(size_t p_bytes, bool p_pad_align) {
 		if (unlikely(MemoryTracker::is_enabled())) {
 			bool usable_available = false;
 			const size_t usable_bytes = _allocator_usable_size(mem, usable_available);
-			MemoryTracker::record_allocation(user_mem, mem, p_bytes, p_bytes + DATA_OFFSET, false, true, p_ensure_zero, 0, usable_bytes, usable_available);
+			const uintptr_t caller_pc = MemoryTracker::is_caller_pc_enabled() ? MEMORY_TRACKER_CALLER_PC() : 0;
+			MemoryTracker::record_allocation(user_mem, mem, p_bytes, p_bytes + DATA_OFFSET, false, true, p_ensure_zero, 0, usable_bytes, usable_available, caller_pc);
 		}
 		return user_mem;
 	} else {
 		if (unlikely(MemoryTracker::is_enabled())) {
 			bool usable_available = false;
 			const size_t usable_bytes = _allocator_usable_size(mem, usable_available);
-			MemoryTracker::record_allocation(mem, mem, p_bytes, p_bytes, false, false, p_ensure_zero, 0, usable_bytes, usable_available);
+			const uintptr_t caller_pc = MemoryTracker::is_caller_pc_enabled() ? MEMORY_TRACKER_CALLER_PC() : 0;
+			MemoryTracker::record_allocation(mem, mem, p_bytes, p_bytes, false, false, p_ensure_zero, 0, usable_bytes, usable_available, caller_pc);
 		}
 		return mem;
 	}
@@ -185,7 +197,6 @@ void *Memory::realloc_static(void *p_memory, size_t p_bytes, bool p_pad_align) {
 	}
 
 	uint8_t *mem = (uint8_t *)p_memory;
-
 #ifdef DEBUG_ENABLED
 	bool prepad = true;
 #else
@@ -217,7 +228,7 @@ void *Memory::realloc_static(void *p_memory, size_t p_bytes, bool p_pad_align) {
 			*s = p_bytes;
 
 			GodotProfileFree(mem);
-			uint8_t *new_mem = (uint8_t *)_realloc_with_optional_tracking(old_user_mem, mem, p_bytes, p_bytes + DATA_OFFSET, true);
+			uint8_t *new_mem = (uint8_t *)MEMORY_REALLOC_WITH_OPTIONAL_TRACKING(old_user_mem, mem, p_bytes, p_bytes + DATA_OFFSET, true);
 			if (new_mem == nullptr) {
 				ERR_FAIL_NULL_V(new_mem, nullptr);
 			}
@@ -232,7 +243,7 @@ void *Memory::realloc_static(void *p_memory, size_t p_bytes, bool p_pad_align) {
 	} else {
 		void *old_user_mem = mem;
 		GodotProfileFree(mem);
-		uint8_t *new_mem = (uint8_t *)_realloc_with_optional_tracking(old_user_mem, mem, p_bytes, p_bytes, false);
+		uint8_t *new_mem = (uint8_t *)MEMORY_REALLOC_WITH_OPTIONAL_TRACKING(old_user_mem, mem, p_bytes, p_bytes, false);
 
 		if (new_mem == nullptr && p_bytes > 0) {
 			ERR_FAIL_COND_V(new_mem == nullptr, nullptr);

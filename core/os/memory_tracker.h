@@ -45,6 +45,12 @@ struct AllocationRecord {
 	uint64_t allocation_id = 0;
 	uintptr_t user_base = 0;
 	uintptr_t raw_base = 0;
+	// Raw return addresses. Zero means unavailable. Offline symbolication must
+	// use address - 1 to resolve the instruction containing the call.
+	uintptr_t origin_caller_pc = 0;
+	// Updated only after a successful ordinary realloc; failed reallocs leave
+	// the complete record unchanged.
+	uintptr_t last_reallocation_caller_pc = 0;
 	uint64_t requested_bytes = 0;
 	uint64_t raw_requested_bytes = 0;
 	uint64_t allocator_usable_bytes = 0;
@@ -90,6 +96,9 @@ struct Statistics {
 	bool enabled = false;
 	bool inventory_complete = false;
 	bool allocator_usable_bytes_supported = false;
+	bool caller_pc_requested = false;
+	bool caller_pc_enabled = false;
+	bool caller_pc_supported = false;
 };
 
 struct Snapshot {
@@ -108,15 +117,22 @@ struct SelfCheckResult {
 	bool passed = false;
 	bool allocation_inserted = false;
 	bool reallocation_preserved_id = false;
+	bool reallocation_preserved_origin_caller_pc = false;
+	bool reallocation_updated_caller_pc = false;
 	bool failed_reallocation_preserved_record = false;
 	bool free_removed_record = false;
 	bool address_reuse_changed_id = false;
 };
 
 extern std::atomic<bool> enabled;
+extern std::atomic<bool> caller_pc_enabled;
 
 inline bool is_enabled() {
 	return enabled.load(std::memory_order_acquire);
+}
+
+inline bool is_caller_pc_enabled() {
+	return caller_pc_enabled.load(std::memory_order_acquire);
 }
 
 // May be called once during early process setup. Tracker storage is intentionally
@@ -124,14 +140,14 @@ inline bool is_enabled() {
 // engine and static-object teardown.
 bool enable();
 
-void record_allocation(void *p_user_base, void *p_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_aligned, bool p_prepad, bool p_zeroed, size_t p_alignment, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available);
+void record_allocation(void *p_user_base, void *p_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_aligned, bool p_prepad, bool p_zeroed, size_t p_alignment, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available, uintptr_t p_caller_pc);
 void record_free(void *p_user_base);
 
 // The transaction holds the tracker mutex across the CRT realloc call. This
 // prevents a moved allocation's old address from being reused and published by
 // another thread before its old record has been removed.
 void begin_reallocation(void *p_old_user_base, ReallocationTransaction &r_transaction);
-void finish_reallocation(ReallocationTransaction &r_transaction, void *p_new_user_base, void *p_new_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_prepad, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available);
+void finish_reallocation(ReallocationTransaction &r_transaction, void *p_new_user_base, void *p_new_raw_base, size_t p_requested_bytes, size_t p_raw_requested_bytes, bool p_prepad, size_t p_allocator_usable_bytes, bool p_allocator_usable_bytes_available, uintptr_t p_caller_pc);
 void finish_reallocation_failure(ReallocationTransaction &r_transaction);
 void finish_reallocation_free(ReallocationTransaction &r_transaction);
 

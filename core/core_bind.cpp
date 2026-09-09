@@ -49,6 +49,10 @@
 #include "core/os/thread_safe.h"
 #include "core/variant/typed_array.h"
 
+#ifdef WINDOWS_ENABLED
+#include "platform/windows/windows.h"
+#endif
+
 #include <cerrno>
 #include <cstdio>
 
@@ -613,9 +617,39 @@ Dictionary OS::get_memory_info() const {
 	return ::OS::get_singleton()->get_memory_info();
 }
 
+struct MemoryInventoryMainImage {
+	uintptr_t base = 0;
+	uint64_t size_bytes = 0;
+	bool available = false;
+};
+
+static MemoryInventoryMainImage _get_memory_inventory_main_image() {
+	MemoryInventoryMainImage result;
+#ifdef WINDOWS_ENABLED
+	const HMODULE module = GetModuleHandleW(nullptr);
+	if (module == nullptr) {
+		return result;
+	}
+	const uintptr_t image_base = reinterpret_cast<uintptr_t>(module);
+	const IMAGE_DOS_HEADER *dos_header = reinterpret_cast<const IMAGE_DOS_HEADER *>(image_base);
+	if (dos_header->e_magic != IMAGE_DOS_SIGNATURE || dos_header->e_lfanew <= 0) {
+		return result;
+	}
+	const IMAGE_NT_HEADERS *nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS *>(image_base + static_cast<uintptr_t>(dos_header->e_lfanew));
+	if (nt_headers->Signature != IMAGE_NT_SIGNATURE || nt_headers->OptionalHeader.SizeOfImage == 0) {
+		return result;
+	}
+	result.base = image_base;
+	result.size_bytes = nt_headers->OptionalHeader.SizeOfImage;
+	result.available = true;
+#endif
+	return result;
+}
+
 Dictionary OS::_get_memory_allocation_inventory() const {
 	MemoryTracker::Statistics stats;
 	MemoryTracker::get_statistics(stats);
+	const MemoryInventoryMainImage main_image = _get_memory_inventory_main_image();
 
 	Dictionary result;
 	result["schema_version"] = 1;
@@ -623,6 +657,21 @@ Dictionary OS::_get_memory_allocation_inventory() const {
 	result["enable_requested"] = stats.enable_requested;
 	result["enable_failed"] = stats.enable_failed;
 	result["enable_environment"] = "ANTHROPOLIS_NATIVE_ALLOCATION_TRACKING=1";
+	result["caller_pc_environment"] = "ANTHROPOLIS_NATIVE_ALLOCATION_CALLER_PC=1";
+	result["caller_pc_requires_allocation_tracking"] = true;
+	result["caller_pc_requested"] = stats.caller_pc_requested;
+	result["caller_pc_enabled"] = stats.caller_pc_enabled;
+	result["caller_pc_supported"] = stats.caller_pc_supported;
+	result["caller_pc_identity_scope"] = "process-absolute-return-address";
+	result["caller_pc_values_are_raw_return_addresses"] = true;
+	result["caller_pc_symbolication_adjustment_bytes"] = -1;
+	result["caller_pc_note"] = "Subtract one byte before offline symbolication so a return address resolves to its call instruction. PCs may lie outside the main image; no symbols or stack unwinding are performed in-process.";
+	result["caller_pc_fields_storage_bytes_per_record"] = uint64_t(sizeof(uintptr_t) * 2);
+	result["caller_pc_storage_note"] = "The two uintptr_t fields are present in each tracker record and POD snapshot row whenever allocation tracking is enabled, even when caller capture is disabled.";
+	result["main_image_metadata_available"] = main_image.available;
+	result["main_image_base"] = "0x" + String::num_uint64(main_image.base, 16);
+	result["main_image_size_bytes"] = main_image.size_bytes;
+	result["main_image_path"] = ::OS::get_singleton()->get_executable_path();
 	result["identity_scope"] = "process-memory-allocation-generation";
 	result["identity_note"] = "Allocation IDs are stable for one ordinary Memory::realloc_static lifetime, including pointer moves, and are never valid across processes.";
 	result["summary_only"] = true;
@@ -771,10 +820,12 @@ Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path)
 	const MemoryTracker::Statistics stats = snapshot.statistics;
 	const uint64_t allocation_count = snapshot.record_count;
 	const uint64_t process_id = static_cast<uint64_t>(::OS::get_singleton()->get_process_id());
+	const MemoryInventoryMainImage main_image = _get_memory_inventory_main_image();
+	const CharString main_image_path_json = ::OS::get_singleton()->get_executable_path().json_escape().utf8();
 	uint64_t output_bytes = 0;
 	int line_length = snprintf(line, LINE_CAPACITY,
-			"{\"record_type\":\"metadata\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"snapshot_copy_atomic\":true,\"cross_inventory_join_non_atomic\":true,\"inventory_capped\":false,\"tracker_inventory_complete\":%s,\"enabled\":%s,\"enable_requested\":%s,\"enable_failed\":%s,\"pre_enable_allocations_unknown\":true,\"process_allocation_coverage_complete\":false,\"active_requested_bytes\":%llu,\"active_raw_requested_bytes\":%llu,\"active_allocator_usable_bytes\":%llu,\"allocation_count\":%llu,\"reallocation_count\":%llu,\"failed_reallocation_count\":%llu,\"failed_reallocation_without_record_count\":%llu,\"free_count\":%llu,\"free_without_record_count\":%llu,\"adopted_reallocation_count\":%llu,\"duplicate_active_address_count\":%llu,\"dropped_record_count\":%llu,\"snapshot_failure_count\":%llu,\"instrumentation_failure_count\":%llu,\"tracker_storage_current_requested_bytes\":%llu,\"tracker_storage_peak_requested_bytes\":%llu,\"snapshot_copy_bytes\":%llu,\"allocator_usable_bytes_supported\":%s}\n",
-			static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), stats.inventory_complete ? "true" : "false", stats.enabled ? "true" : "false", stats.enable_requested ? "true" : "false", stats.enable_failed ? "true" : "false", static_cast<unsigned long long>(stats.active_requested_bytes), static_cast<unsigned long long>(stats.active_raw_requested_bytes), static_cast<unsigned long long>(stats.active_allocator_usable_bytes), static_cast<unsigned long long>(stats.allocation_count), static_cast<unsigned long long>(stats.reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_without_record_count), static_cast<unsigned long long>(stats.free_count), static_cast<unsigned long long>(stats.free_without_record_count), static_cast<unsigned long long>(stats.adopted_reallocation_count), static_cast<unsigned long long>(stats.duplicate_active_address_count), static_cast<unsigned long long>(stats.dropped_record_count), static_cast<unsigned long long>(stats.snapshot_failure_count), static_cast<unsigned long long>(stats.instrumentation_failure_count), static_cast<unsigned long long>(stats.tracker_storage_current_bytes), static_cast<unsigned long long>(stats.tracker_storage_peak_bytes), static_cast<unsigned long long>(stats.snapshot_copy_bytes), stats.allocator_usable_bytes_supported ? "true" : "false");
+			"{\"record_type\":\"metadata\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"snapshot_copy_atomic\":true,\"cross_inventory_join_non_atomic\":true,\"inventory_capped\":false,\"tracker_inventory_complete\":%s,\"enabled\":%s,\"enable_requested\":%s,\"enable_failed\":%s,\"pre_enable_allocations_unknown\":true,\"process_allocation_coverage_complete\":false,\"active_requested_bytes\":%llu,\"active_raw_requested_bytes\":%llu,\"active_allocator_usable_bytes\":%llu,\"allocation_count\":%llu,\"reallocation_count\":%llu,\"failed_reallocation_count\":%llu,\"failed_reallocation_without_record_count\":%llu,\"free_count\":%llu,\"free_without_record_count\":%llu,\"adopted_reallocation_count\":%llu,\"duplicate_active_address_count\":%llu,\"dropped_record_count\":%llu,\"snapshot_failure_count\":%llu,\"instrumentation_failure_count\":%llu,\"tracker_storage_current_requested_bytes\":%llu,\"tracker_storage_peak_requested_bytes\":%llu,\"snapshot_copy_bytes\":%llu,\"allocator_usable_bytes_supported\":%s,\"caller_pc_requested\":%s,\"caller_pc_enabled\":%s,\"caller_pc_supported\":%s,\"caller_pc_requires_allocation_tracking\":true,\"caller_pc_identity_scope\":\"process-absolute-return-address\",\"caller_pc_values_are_raw_return_addresses\":true,\"caller_pc_symbolication_adjustment_bytes\":-1,\"caller_pc_capture_mode\":\"single-return-address-no-unwind\",\"caller_pc_fields_storage_bytes_per_record\":%llu,\"main_image_metadata_available\":%s,\"main_image_base\":\"0x%llx\",\"main_image_size_bytes\":%llu,\"main_image_size_source\":\"PE-OptionalHeader-SizeOfImage-on-Windows\",\"main_image_path\":\"%s\"}\n",
+			static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), stats.inventory_complete ? "true" : "false", stats.enabled ? "true" : "false", stats.enable_requested ? "true" : "false", stats.enable_failed ? "true" : "false", static_cast<unsigned long long>(stats.active_requested_bytes), static_cast<unsigned long long>(stats.active_raw_requested_bytes), static_cast<unsigned long long>(stats.active_allocator_usable_bytes), static_cast<unsigned long long>(stats.allocation_count), static_cast<unsigned long long>(stats.reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_without_record_count), static_cast<unsigned long long>(stats.free_count), static_cast<unsigned long long>(stats.free_without_record_count), static_cast<unsigned long long>(stats.adopted_reallocation_count), static_cast<unsigned long long>(stats.duplicate_active_address_count), static_cast<unsigned long long>(stats.dropped_record_count), static_cast<unsigned long long>(stats.snapshot_failure_count), static_cast<unsigned long long>(stats.instrumentation_failure_count), static_cast<unsigned long long>(stats.tracker_storage_current_bytes), static_cast<unsigned long long>(stats.tracker_storage_peak_bytes), static_cast<unsigned long long>(stats.snapshot_copy_bytes), stats.allocator_usable_bytes_supported ? "true" : "false", stats.caller_pc_requested ? "true" : "false", stats.caller_pc_enabled ? "true" : "false", stats.caller_pc_supported ? "true" : "false", static_cast<unsigned long long>(sizeof(uintptr_t) * 2), main_image.available ? "true" : "false", static_cast<unsigned long long>(main_image.base), static_cast<unsigned long long>(main_image.size_bytes), main_image_path_json.get_data());
 	bool stream_ok = line_length >= 0 && line_length < LINE_CAPACITY && _store_memory_inventory_line(file, line, line_length, output_bytes);
 	uint64_t records_written = 0;
 	for (uint64_t i = 0; i < snapshot.record_count && stream_ok; i++) {
@@ -783,8 +834,8 @@ Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path)
 		const uint64_t allocator_slack = record.allocator_usable_bytes_available && record.allocator_usable_bytes >= record.raw_requested_bytes ? record.allocator_usable_bytes - record.raw_requested_bytes : 0;
 		const uint64_t total_overhead = record.allocator_usable_bytes_available && record.allocator_usable_bytes >= record.requested_bytes ? record.allocator_usable_bytes - record.requested_bytes : 0;
 		line_length = snprintf(line, LINE_CAPACITY,
-				"{\"record_type\":\"allocation\",\"schema_version\":1,\"allocation_id\":\"memory-allocation:%llu\",\"identity_scope\":\"process-memory-allocation-generation\",\"user_base\":\"0x%llx\",\"raw_base\":\"0x%llx\",\"requested_bytes\":%llu,\"raw_requested_bytes\":%llu,\"memory_api_overhead_bytes\":%llu,\"allocator_usable_bytes_available\":%s,\"allocator_usable_bytes\":%llu,\"allocator_slack_bytes\":%llu,\"total_overhead_and_slack_bytes\":%llu,\"created_sequence\":%llu,\"last_resize_sequence\":%llu,\"origin\":\"%s\",\"aligned\":%s,\"prepad\":%s,\"initial_allocation_zeroed\":%s,\"alignment_bytes\":%llu}\n",
-				static_cast<unsigned long long>(record.allocation_id), static_cast<unsigned long long>(record.user_base), static_cast<unsigned long long>(record.raw_base), static_cast<unsigned long long>(record.requested_bytes), static_cast<unsigned long long>(record.raw_requested_bytes), static_cast<unsigned long long>(memory_api_overhead), record.allocator_usable_bytes_available ? "true" : "false", static_cast<unsigned long long>(record.allocator_usable_bytes), static_cast<unsigned long long>(allocator_slack), static_cast<unsigned long long>(total_overhead), static_cast<unsigned long long>(record.created_sequence), static_cast<unsigned long long>(record.last_resize_sequence), record.origin == MemoryTracker::AllocationOrigin::ALLOCATION ? "allocation" : "reallocation_of_pre_enable_allocation", record.aligned ? "true" : "false", record.prepad ? "true" : "false", record.zeroed ? "true" : "false", static_cast<unsigned long long>(record.alignment));
+				"{\"record_type\":\"allocation\",\"schema_version\":1,\"allocation_id\":\"memory-allocation:%llu\",\"identity_scope\":\"process-memory-allocation-generation\",\"user_base\":\"0x%llx\",\"raw_base\":\"0x%llx\",\"requested_bytes\":%llu,\"raw_requested_bytes\":%llu,\"memory_api_overhead_bytes\":%llu,\"allocator_usable_bytes_available\":%s,\"allocator_usable_bytes\":%llu,\"allocator_slack_bytes\":%llu,\"total_overhead_and_slack_bytes\":%llu,\"created_sequence\":%llu,\"last_resize_sequence\":%llu,\"origin\":\"%s\",\"origin_caller_pc_available\":%s,\"origin_caller_pc\":\"0x%llx\",\"latest_successful_reallocation_caller_pc_available\":%s,\"latest_successful_reallocation_caller_pc\":\"0x%llx\",\"aligned\":%s,\"prepad\":%s,\"initial_allocation_zeroed\":%s,\"alignment_bytes\":%llu}\n",
+				static_cast<unsigned long long>(record.allocation_id), static_cast<unsigned long long>(record.user_base), static_cast<unsigned long long>(record.raw_base), static_cast<unsigned long long>(record.requested_bytes), static_cast<unsigned long long>(record.raw_requested_bytes), static_cast<unsigned long long>(memory_api_overhead), record.allocator_usable_bytes_available ? "true" : "false", static_cast<unsigned long long>(record.allocator_usable_bytes), static_cast<unsigned long long>(allocator_slack), static_cast<unsigned long long>(total_overhead), static_cast<unsigned long long>(record.created_sequence), static_cast<unsigned long long>(record.last_resize_sequence), record.origin == MemoryTracker::AllocationOrigin::ALLOCATION ? "allocation" : "reallocation_of_pre_enable_allocation", record.origin_caller_pc != 0 ? "true" : "false", static_cast<unsigned long long>(record.origin_caller_pc), record.last_reallocation_caller_pc != 0 ? "true" : "false", static_cast<unsigned long long>(record.last_reallocation_caller_pc), record.aligned ? "true" : "false", record.prepad ? "true" : "false", record.zeroed ? "true" : "false", static_cast<unsigned long long>(record.alignment));
 		stream_ok = line_length >= 0 && line_length < LINE_CAPACITY && _store_memory_inventory_line(file, line, line_length, output_bytes);
 		if (stream_ok) {
 			records_written++;
@@ -812,6 +863,13 @@ Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path)
 	result["allocation_count"] = allocation_count;
 	result["snapshot_sequence"] = stats.snapshot_sequence;
 	result["success"] = stream_ok;
+	result["caller_pc_requested"] = stats.caller_pc_requested;
+	result["caller_pc_enabled"] = stats.caller_pc_enabled;
+	result["caller_pc_supported"] = stats.caller_pc_supported;
+	result["main_image_metadata_available"] = main_image.available;
+	result["main_image_base"] = "0x" + String::num_uint64(main_image.base, 16);
+	result["main_image_size_bytes"] = main_image.size_bytes;
+	result["main_image_path"] = ::OS::get_singleton()->get_executable_path();
 	Dictionary tracker_statistics;
 	tracker_statistics["inventory_complete_for_enabled_memory_api_window"] = stats.inventory_complete;
 	tracker_statistics["instrumentation_failure_count"] = stats.instrumentation_failure_count;
@@ -834,6 +892,8 @@ Dictionary OS::_memory_allocation_tracker_self_check() const {
 	result["passed"] = check.passed;
 	result["allocation_inserted"] = check.allocation_inserted;
 	result["reallocation_preserved_id"] = check.reallocation_preserved_id;
+	result["reallocation_preserved_origin_caller_pc"] = check.reallocation_preserved_origin_caller_pc;
+	result["reallocation_updated_caller_pc"] = check.reallocation_updated_caller_pc;
 	result["failed_reallocation_preserved_record"] = check.failed_reallocation_preserved_record;
 	result["free_removed_record"] = check.free_removed_record;
 	result["address_reuse_changed_id"] = check.address_reuse_changed_id;
