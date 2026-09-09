@@ -1152,6 +1152,8 @@ Array MeshStorage::get_memory_resource_links() const {
 		data_row["requested_storage_bytes"] = gpu_payload_bytes;
 		data_row["single_payload_bytes"] = single_payload_bytes;
 		data_row["instance_count"] = multimesh->instances;
+		data_row["visible_instance_count"] = multimesh->visible_instances;
+		data_row["visible_instance_count_semantics"] = "MultiMesh requested draw visibility count; it is not an occupancy measurement.";
 		data_row["stride_floats"] = multimesh->stride_cache;
 		data_row["transform_format"] = int(multimesh->xform_format);
 		data_row["uses_colors"] = multimesh->uses_colors;

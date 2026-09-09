@@ -206,11 +206,96 @@ private:
 		UINT object_type = 0;
 		D3D12_HEAP_PROPERTIES heap_properties = {};
 		D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+		uint64_t va_observation_index = UINT64_MAX;
 		bool heap_properties_available = false;
+	};
+
+	struct PhysicalMemoryVaInterval {
+		uintptr_t base_address = 0;
+		uintptr_t allocation_base = 0;
+		uint64_t size_bytes = 0;
+		uint32_t state = 0;
+		uint32_t type = 0;
+		uint32_t protect = 0;
+		uint32_t allocation_protect = 0;
+	};
+
+	struct PhysicalMemoryProcessCounters {
+		uint64_t private_usage_bytes = 0;
+		uint64_t working_set_bytes = 0;
+		uint64_t private_working_set_bytes = 0;
+		uint64_t shared_commit_usage_bytes = 0;
+		uint32_t structure_bytes = 0;
+		uint32_t win32_error = 0;
+		bool available = false;
+	};
+
+	struct PhysicalMemoryVaScan {
+		PhysicalMemoryVaInterval *intervals = nullptr;
+		uint64_t interval_count = 0;
+		uint64_t interval_capacity = 0;
+		uint64_t committed_wc_bytes = 0;
+		uint64_t elapsed_usec = 0;
+		uint32_t win32_error = 0;
+		bool complete = true;
+	};
+
+	struct PhysicalMemoryVaObservation {
+		uint64_t attempt_token = 0;
+		uint64_t physical_generation = 0;
+		uint64_t size_bytes = 0;
+		uint64_t begin_unix_usec = 0;
+		uint64_t end_unix_usec = 0;
+		uint64_t registration_sequence = 0;
+		uint64_t retirement_sequence = 0;
+		uint64_t retirement_unix_usec = 0;
+		uint64_t before_interval_offset = 0;
+		uint64_t before_interval_count = 0;
+		uint64_t after_interval_offset = 0;
+		uint64_t after_interval_count = 0;
+		void *object = nullptr;
+		int64_t native_create_result = 0;
+		UINT object_type = 0;
+		D3D12_HEAP_PROPERTIES heap_properties = {};
+		D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+		PhysicalMemoryProcessCounters before_create_counters;
+		PhysicalMemoryProcessCounters after_create_counters;
+		uint64_t before_wc_bytes = 0;
+		uint64_t after_wc_bytes = 0;
+		uint64_t before_scan_usec = 0;
+		uint64_t after_scan_usec = 0;
+		uint32_t before_scan_error = 0;
+		uint32_t after_scan_error = 0;
+		bool heap_properties_available = false;
+		bool below_explicit_threshold = false;
+		bool native_create_succeeded = false;
+		bool before_scan_complete = false;
+		bool after_scan_complete = false;
+		bool registered = false;
+		bool abandoned = false;
+		bool retired = false;
+		bool creation_boundary_available = true;
+	};
+
+	struct PhysicalMemoryActiveVaAttempt {
+		uint64_t token = 0;
+		uint64_t size_bytes = 0;
+		uint64_t begin_unix_usec = 0;
+		UINT object_type = 0;
+		D3D12_HEAP_PROPERTIES heap_properties = {};
+		D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+		PhysicalMemoryProcessCounters before_create_counters;
+		PhysicalMemoryVaScan before_scan;
+		bool heap_properties_available = false;
+		bool below_explicit_threshold = false;
+		bool active = false;
 	};
 
 	struct PhysicalMemoryTrackerSnapshot {
 		PhysicalMemoryRecord *records = nullptr;
+		PhysicalMemoryVaObservation *va_observations = nullptr;
+		PhysicalMemoryVaInterval *va_intervals = nullptr;
+		PhysicalMemoryVaInterval *current_va_intervals = nullptr;
 		uint64_t record_count = 0;
 		uint64_t active_object_count = 0;
 		uint64_t record_capacity = 0;
@@ -229,8 +314,39 @@ private:
 		uint64_t snapshot_copy_failure_count = 0;
 		uint64_t tracker_start_unix_usec = 0;
 		uint64_t snapshot_copy_bytes = 0;
+		uint64_t va_observation_count = 0;
+		uint64_t va_observation_capacity = 0;
+		uint64_t va_interval_count = 0;
+		uint64_t va_interval_capacity = 0;
+		uint64_t current_va_interval_count = 0;
+		uint64_t current_va_interval_capacity = 0;
+		uint64_t current_wc_bytes = 0;
+		uint64_t current_va_scan_usec = 0;
+		uint64_t current_snapshot_unix_usec = 0;
+		uint64_t va_min_bytes = 0;
+		uint64_t va_attempt_count = 0;
+		uint64_t va_native_success_count = 0;
+		uint64_t va_native_failure_count = 0;
+		uint64_t va_abandoned_count = 0;
+		uint64_t va_creation_boundary_unavailable_count = 0;
+		uint64_t va_pair_failure_count = 0;
+		uint64_t va_scan_failure_count = 0;
+		uint64_t va_storage_failure_count = 0;
+		uint64_t va_initialization_failure_count = 0;
+		uint64_t va_total_scan_usec = 0;
+		uint64_t va_max_scan_usec = 0;
+		uint64_t va_skipped_count[6] = {};
+		uint64_t va_skipped_bytes[6] = {};
+		PhysicalMemoryProcessCounters current_counters_before_scan;
+		PhysicalMemoryProcessCounters current_counters_after_scan;
+		uint32_t current_va_scan_error = 0;
 		uint32_t process_id = 0;
 		bool enabled = false;
+		bool va_requested = false;
+		bool va_enabled = false;
+		bool va_scope_complete = true;
+		bool va_copy_succeeded = true;
+		bool current_va_scan_complete = false;
 		bool complete = true;
 		bool copy_succeeded = true;
 	};
@@ -253,14 +369,49 @@ private:
 		uint64_t creation_metadata_failure_count = 0;
 		uint64_t initialization_failure_count = 0;
 		uint64_t snapshot_copy_failure_count = 0;
+		PhysicalMemoryVaObservation *va_observations = nullptr;
+		uint64_t va_observation_count = 0;
+		uint64_t va_observation_capacity = 0;
+		PhysicalMemoryVaInterval *va_intervals = nullptr;
+		uint64_t va_interval_count = 0;
+		uint64_t va_interval_capacity = 0;
+		PhysicalMemoryActiveVaAttempt active_va_attempt;
+		uint64_t va_min_bytes = 0;
+		uint64_t va_attempt_count = 0;
+		uint64_t va_native_success_count = 0;
+		uint64_t va_native_failure_count = 0;
+		uint64_t va_abandoned_count = 0;
+		uint64_t va_creation_boundary_unavailable_count = 0;
+		uint64_t va_pair_failure_count = 0;
+		uint64_t va_scan_failure_count = 0;
+		uint64_t va_storage_failure_count = 0;
+		uint64_t va_initialization_failure_count = 0;
+		uint64_t va_total_scan_usec = 0;
+		uint64_t va_max_scan_usec = 0;
+		uint64_t va_skipped_count[6] = {};
+		uint64_t va_skipped_bytes[6] = {};
 		uint64_t tracker_start_unix_usec = 0;
 		uint32_t process_id = 0;
 		bool initialized = false;
 		bool enabled = false;
+		bool va_requested = false;
+		bool va_enabled = false;
+		bool va_scope_complete = true;
 		bool complete = true;
+
+		static uint64_t _now_unix_usec();
+		static PhysicalMemoryProcessCounters _query_process_counters();
+		static PhysicalMemoryVaScan _scan_private_committed_wc();
+		static void _free_va_scan(PhysicalMemoryVaScan &r_scan);
+		bool _ensure_va_observation_capacity(uint64_t p_required);
+		bool _ensure_va_interval_capacity(uint64_t p_required);
+		uint64_t _append_va_observation(const PhysicalMemoryVaObservation &p_observation, const PhysicalMemoryVaScan *p_before, const PhysicalMemoryVaScan *p_after);
 
 		~PhysicalMemoryTracker();
 		void initialize_from_environment();
+		uint64_t begin_creation(UINT p_object_type, const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, uint64_t p_size_bytes);
+		void end_creation(uint64_t p_token, HRESULT p_native_result, ID3D12Pageable *p_object);
+		void abandon_creation(uint64_t p_token);
 		void record_created(UINT p_object_type, ID3D12Pageable *p_object, const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, uint64_t p_size_bytes);
 		void record_destroyed(UINT p_object_type, ID3D12Pageable *p_object);
 		bool find_record(ID3D12Pageable *p_object, PhysicalMemoryRecord &r_record);
@@ -273,6 +424,9 @@ private:
 
 	static void _physical_memory_created(UINT p_object_type, ID3D12Pageable *p_object, const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, UINT64 p_size, void *p_private_data);
 	static void _physical_memory_destroyed(UINT p_object_type, ID3D12Pageable *p_object, void *p_private_data);
+	static UINT64 _physical_memory_creation_begin(UINT p_object_type, const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, UINT64 p_size, void *p_private_data);
+	static void _physical_memory_creation_end(UINT64 p_token, HRESULT p_native_result, ID3D12Pageable *p_object, void *p_private_data);
+	static void _physical_memory_creation_abandoned(UINT64 p_token, void *p_private_data);
 	void _add_physical_memory_identity(Dictionary &r_result, ID3D12Resource *p_resource, D3D12MA::Allocation *p_allocation);
 	Dictionary _get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes);
 

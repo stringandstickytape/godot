@@ -291,11 +291,45 @@ using PHYSICAL_MEMORY_DESTROYED_FUNC_PTR = void (*)(
     ID3D12Pageable* pObject,
     void* pPrivateData);
 
+/**
+\brief Called immediately before a native API call which may create physical D3D12 memory.
+
+The returned token is passed to the matching end callback. A nonzero token is not required,
+but implementations can use it to validate balanced observations. The callback is diagnostic
+only and must not call back into D3D12MA.
+*/
+using PHYSICAL_MEMORY_CREATION_BEGIN_FUNC_PTR = UINT64 (*)(
+    UINT ObjectType,
+    const D3D12_HEAP_PROPERTIES* pHeapProperties,
+    D3D12_HEAP_FLAGS HeapFlags,
+    UINT64 Size,
+    void* pPrivateData);
+
+/** Called exactly once after the native create call matched by `pCreationBegin`. */
+using PHYSICAL_MEMORY_CREATION_END_FUNC_PTR = void (*)(
+    UINT64 Token,
+    HRESULT NativeCreateResult,
+    ID3D12Pageable* pObject,
+    void* pPrivateData);
+
+/**
+\brief Called when the native create succeeded but later allocator registration failed.
+
+This is distinct from normal destruction because the object was never reported through
+`pCreated`.
+*/
+using PHYSICAL_MEMORY_CREATION_ABANDONED_FUNC_PTR = void (*)(
+    UINT64 Token,
+    void* pPrivateData);
+
 /// Optional callbacks for observing physical D3D12 memory object lifetimes.
 struct PHYSICAL_MEMORY_CALLBACKS
 {
     PHYSICAL_MEMORY_CREATED_FUNC_PTR pCreated;
     PHYSICAL_MEMORY_DESTROYED_FUNC_PTR pDestroyed;
+    PHYSICAL_MEMORY_CREATION_BEGIN_FUNC_PTR pCreationBegin;
+    PHYSICAL_MEMORY_CREATION_END_FUNC_PTR pCreationEnd;
+    PHYSICAL_MEMORY_CREATION_ABANDONED_FUNC_PTR pCreationAbandoned;
     void* pPrivateData;
 };
 

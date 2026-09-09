@@ -41,7 +41,9 @@
 #include <drivers/d3d12/godot_nir.h>
 #include <dxgi1_6.h>
 
+#include <cerrno>
 #include <cstdlib>
+#include <cwchar>
 
 #if !defined(_MSC_VER)
 #include <thirdparty/directx_headers/include/dxguids/dxguids.h>
@@ -53,9 +55,217 @@ using Microsoft::WRL::ComPtr;
 
 static SafeNumeric<uint64_t> _d3d12_resource_identity_counter{ 0 };
 static SafeNumeric<uint64_t> _d3d12_physical_memory_identity_counter{ 0 };
+static SafeNumeric<uint64_t> _d3d12_physical_memory_va_attempt_counter{ 0 };
+// Serializes native physical-memory creates across every D3D12 driver instance in this process.
+static BinaryMutex _d3d12_physical_memory_creation_mutex;
+
+struct D3D12PhysicalProcessMemoryCountersEx2 {
+	DWORD cb;
+	DWORD page_fault_count;
+	SIZE_T peak_working_set_size;
+	SIZE_T working_set_size;
+	SIZE_T quota_peak_paged_pool_usage;
+	SIZE_T quota_paged_pool_usage;
+	SIZE_T quota_peak_non_paged_pool_usage;
+	SIZE_T quota_non_paged_pool_usage;
+	SIZE_T pagefile_usage;
+	SIZE_T peak_pagefile_usage;
+	SIZE_T private_usage;
+	SIZE_T private_working_set_size;
+	ULONG64 shared_commit_usage;
+};
+
+static uint32_t _d3d12_physical_heap_index(const D3D12_HEAP_PROPERTIES *p_properties) {
+	if (p_properties == nullptr || p_properties->Type < D3D12_HEAP_TYPE_DEFAULT || p_properties->Type > D3D12_HEAP_TYPE_GPU_UPLOAD) {
+		return 0;
+	}
+	return uint32_t(p_properties->Type);
+}
 
 RenderingDeviceDriverD3D12::PhysicalMemoryTracker::~PhysicalMemoryTracker() {
 	std::free(records);
+	std::free(va_observations);
+	std::free(va_intervals);
+	_free_va_scan(active_va_attempt.before_scan);
+}
+
+uint64_t RenderingDeviceDriverD3D12::PhysicalMemoryTracker::_now_unix_usec() {
+	FILETIME file_time = {};
+	GetSystemTimePreciseAsFileTime(&file_time);
+	ULARGE_INTEGER value = {};
+	value.LowPart = file_time.dwLowDateTime;
+	value.HighPart = file_time.dwHighDateTime;
+	constexpr uint64_t WINDOWS_TO_UNIX_EPOCH_100NS = 116444736000000000ULL;
+	return value.QuadPart >= WINDOWS_TO_UNIX_EPOCH_100NS ? (value.QuadPart - WINDOWS_TO_UNIX_EPOCH_100NS) / 10ULL : 0;
+}
+
+RenderingDeviceDriverD3D12::PhysicalMemoryProcessCounters RenderingDeviceDriverD3D12::PhysicalMemoryTracker::_query_process_counters() {
+	PhysicalMemoryProcessCounters result;
+	result.structure_bytes = sizeof(D3D12PhysicalProcessMemoryCountersEx2);
+	D3D12PhysicalProcessMemoryCountersEx2 counters;
+	memset(&counters, 0xCD, sizeof(counters));
+	counters.cb = sizeof(counters);
+	using GetProcessMemoryInfoFunc = BOOL(WINAPI *)(HANDLE, void *, DWORD);
+	HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+	GetProcessMemoryInfoFunc query = kernel32 != nullptr ? (GetProcessMemoryInfoFunc)(void *)GetProcAddress(kernel32, "K32GetProcessMemoryInfo") : nullptr;
+	if (query == nullptr) {
+		result.win32_error = ERROR_PROC_NOT_FOUND;
+		return result;
+	}
+	SetLastError(ERROR_SUCCESS);
+	if (!query(GetCurrentProcess(), &counters, sizeof(counters))) {
+		result.win32_error = GetLastError();
+		return result;
+	}
+	constexpr SIZE_T UNWRITTEN_SIZE_T = SIZE_MAX / 0xFF * 0xCD;
+	constexpr ULONG64 UNWRITTEN_ULONG64 = UINT64_MAX / 0xFF * 0xCD;
+	if (counters.private_working_set_size == UNWRITTEN_SIZE_T || counters.shared_commit_usage == UNWRITTEN_ULONG64) {
+		result.win32_error = ERROR_OLD_WIN_VERSION;
+		return result;
+	}
+	result.private_usage_bytes = counters.private_usage;
+	result.working_set_bytes = counters.working_set_size;
+	result.private_working_set_bytes = counters.private_working_set_size;
+	result.shared_commit_usage_bytes = counters.shared_commit_usage;
+	result.available = true;
+	return result;
+}
+
+RenderingDeviceDriverD3D12::PhysicalMemoryVaScan RenderingDeviceDriverD3D12::PhysicalMemoryTracker::_scan_private_committed_wc() {
+	PhysicalMemoryVaScan result;
+	LARGE_INTEGER frequency = {};
+	LARGE_INTEGER started = {};
+	QueryPerformanceFrequency(&frequency);
+	QueryPerformanceCounter(&started);
+	SYSTEM_INFO system_info = {};
+	GetNativeSystemInfo(&system_info);
+	uintptr_t address = reinterpret_cast<uintptr_t>(system_info.lpMinimumApplicationAddress);
+	const uintptr_t maximum = reinterpret_cast<uintptr_t>(system_info.lpMaximumApplicationAddress);
+	while (address < maximum) {
+		MEMORY_BASIC_INFORMATION info = {};
+		const SIZE_T returned = VirtualQuery(reinterpret_cast<LPCVOID>(address), &info, sizeof(info));
+		if (returned != sizeof(info)) {
+			result.win32_error = GetLastError();
+			result.complete = false;
+			break;
+		}
+		const uintptr_t base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+		const uint64_t size = info.RegionSize;
+		if (size == 0 || base > address || size > UINTPTR_MAX - base || base + size <= address) {
+			result.win32_error = ERROR_INVALID_DATA;
+			result.complete = false;
+			break;
+		}
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && (info.Protect & PAGE_WRITECOMBINE) != 0) {
+			if (result.interval_count == result.interval_capacity) {
+				const uint64_t new_capacity = result.interval_capacity == 0 ? 64 : result.interval_capacity * 2;
+				if (new_capacity < result.interval_capacity || new_capacity > SIZE_MAX / sizeof(PhysicalMemoryVaInterval)) {
+					result.win32_error = ERROR_NOT_ENOUGH_MEMORY;
+					result.complete = false;
+					break;
+				}
+				void *new_intervals = std::realloc(result.intervals, static_cast<size_t>(new_capacity * sizeof(PhysicalMemoryVaInterval)));
+				if (new_intervals == nullptr) {
+					result.win32_error = ERROR_NOT_ENOUGH_MEMORY;
+					result.complete = false;
+					break;
+				}
+				result.intervals = static_cast<PhysicalMemoryVaInterval *>(new_intervals);
+				result.interval_capacity = new_capacity;
+			}
+			PhysicalMemoryVaInterval &interval = result.intervals[result.interval_count++];
+			interval.base_address = base;
+			interval.allocation_base = reinterpret_cast<uintptr_t>(info.AllocationBase);
+			interval.size_bytes = size;
+			interval.state = info.State;
+			interval.type = info.Type;
+			interval.protect = info.Protect;
+			interval.allocation_protect = info.AllocationProtect;
+			result.committed_wc_bytes += size;
+		}
+		address = base + size;
+	}
+	LARGE_INTEGER ended = {};
+	QueryPerformanceCounter(&ended);
+	if (frequency.QuadPart > 0 && ended.QuadPart >= started.QuadPart) {
+		result.elapsed_usec = uint64_t((ended.QuadPart - started.QuadPart) * 1000000ULL / frequency.QuadPart);
+	}
+	return result;
+}
+
+void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::_free_va_scan(PhysicalMemoryVaScan &r_scan) {
+	std::free(r_scan.intervals);
+	r_scan = {};
+}
+
+bool RenderingDeviceDriverD3D12::PhysicalMemoryTracker::_ensure_va_observation_capacity(uint64_t p_required) {
+	if (p_required <= va_observation_capacity) {
+		return true;
+	}
+	uint64_t new_capacity = va_observation_capacity == 0 ? 64 : va_observation_capacity;
+	while (new_capacity < p_required && new_capacity <= UINT64_MAX / 2) {
+		new_capacity *= 2;
+	}
+	if (new_capacity < p_required || new_capacity > SIZE_MAX / sizeof(PhysicalMemoryVaObservation)) {
+		return false;
+	}
+	void *storage = std::realloc(va_observations, static_cast<size_t>(new_capacity * sizeof(PhysicalMemoryVaObservation)));
+	if (storage == nullptr) {
+		return false;
+	}
+	va_observations = static_cast<PhysicalMemoryVaObservation *>(storage);
+	va_observation_capacity = new_capacity;
+	return true;
+}
+
+bool RenderingDeviceDriverD3D12::PhysicalMemoryTracker::_ensure_va_interval_capacity(uint64_t p_required) {
+	if (p_required <= va_interval_capacity) {
+		return true;
+	}
+	uint64_t new_capacity = va_interval_capacity == 0 ? 256 : va_interval_capacity;
+	while (new_capacity < p_required && new_capacity <= UINT64_MAX / 2) {
+		new_capacity *= 2;
+	}
+	if (new_capacity < p_required || new_capacity > SIZE_MAX / sizeof(PhysicalMemoryVaInterval)) {
+		return false;
+	}
+	void *storage = std::realloc(va_intervals, static_cast<size_t>(new_capacity * sizeof(PhysicalMemoryVaInterval)));
+	if (storage == nullptr) {
+		return false;
+	}
+	va_intervals = static_cast<PhysicalMemoryVaInterval *>(storage);
+	va_interval_capacity = new_capacity;
+	return true;
+}
+
+uint64_t RenderingDeviceDriverD3D12::PhysicalMemoryTracker::_append_va_observation(const PhysicalMemoryVaObservation &p_observation,
+		const PhysicalMemoryVaScan *p_before, const PhysicalMemoryVaScan *p_after) {
+	const uint64_t before_count = p_before != nullptr ? p_before->interval_count : 0;
+	const uint64_t after_count = p_after != nullptr ? p_after->interval_count : 0;
+	if (!_ensure_va_observation_capacity(va_observation_count + 1) ||
+			before_count > UINT64_MAX - va_interval_count ||
+			after_count > UINT64_MAX - va_interval_count - before_count ||
+			!_ensure_va_interval_capacity(va_interval_count + before_count + after_count)) {
+		va_storage_failure_count++;
+		va_scope_complete = false;
+		return UINT64_MAX;
+	}
+	const uint64_t index = va_observation_count++;
+	PhysicalMemoryVaObservation &observation = va_observations[index];
+	observation = p_observation;
+	observation.before_interval_offset = va_interval_count;
+	observation.before_interval_count = before_count;
+	if (before_count > 0) {
+		memcpy(va_intervals + va_interval_count, p_before->intervals, static_cast<size_t>(before_count * sizeof(PhysicalMemoryVaInterval)));
+		va_interval_count += before_count;
+	}
+	observation.after_interval_offset = va_interval_count;
+	observation.after_interval_count = after_count;
+	if (after_count > 0) {
+		memcpy(va_intervals + va_interval_count, p_after->intervals, static_cast<size_t>(after_count * sizeof(PhysicalMemoryVaInterval)));
+		va_interval_count += after_count;
+	}
+	return index;
 }
 
 void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::initialize_from_environment() {
@@ -68,23 +278,177 @@ void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::initialize_from_environm
 	wchar_t value[2] = {};
 	const DWORD value_length = GetEnvironmentVariableW(L"ANTHROPOLIS_D3D12_PHYSICAL_MEMORY_TRACKING", value, 2);
 	enabled = value_length == 1 && value[0] == L'1';
+	wchar_t va_value[2] = {};
+	const DWORD va_value_length = GetEnvironmentVariableW(L"ANTHROPOLIS_D3D12_VA_DELTA_TRACKING", va_value, 2);
+	va_requested = va_value_length == 1 && va_value[0] == L'1';
+	va_enabled = enabled && va_requested;
+	if (va_requested && !enabled) {
+		va_scope_complete = false;
+	}
 	if (!enabled) {
 		return;
 	}
+	if (va_enabled) {
+		wchar_t threshold[32] = {};
+		const DWORD threshold_length = GetEnvironmentVariableW(L"ANTHROPOLIS_D3D12_VA_MIN_BYTES", threshold, 32);
+		if (threshold_length > 0 && threshold_length < 32) {
+			bool decimal_only = true;
+			for (DWORD i = 0; i < threshold_length; i++) {
+				if (threshold[i] < L'0' || threshold[i] > L'9') {
+					decimal_only = false;
+					break;
+				}
+			}
+			wchar_t *end = nullptr;
+			errno = 0;
+			const unsigned long long parsed = std::wcstoull(threshold, &end, 10);
+			if (!decimal_only || errno != 0 || end == threshold || *end != L'\0') {
+				va_initialization_failure_count++;
+				va_scope_complete = false;
+				va_enabled = false;
+			} else {
+				va_min_bytes = uint64_t(parsed);
+				if (va_min_bytes > 0) {
+					va_scope_complete = false;
+				}
+			}
+		} else if (threshold_length >= 32) {
+			va_initialization_failure_count++;
+			va_scope_complete = false;
+			va_enabled = false;
+		}
+	}
 
 	process_id = GetCurrentProcessId();
-	FILETIME file_time = {};
-	GetSystemTimePreciseAsFileTime(&file_time);
-	ULARGE_INTEGER file_time_value = {};
-	file_time_value.LowPart = file_time.dwLowDateTime;
-	file_time_value.HighPart = file_time.dwHighDateTime;
-	constexpr uint64_t WINDOWS_TO_UNIX_EPOCH_100NS = 116444736000000000ULL;
-	if (file_time_value.QuadPart >= WINDOWS_TO_UNIX_EPOCH_100NS) {
-		tracker_start_unix_usec = (file_time_value.QuadPart - WINDOWS_TO_UNIX_EPOCH_100NS) / 10ULL;
-	} else {
+	tracker_start_unix_usec = _now_unix_usec();
+	if (tracker_start_unix_usec == 0) {
 		initialization_failure_count++;
 		complete = false;
 	}
+}
+
+uint64_t RenderingDeviceDriverD3D12::PhysicalMemoryTracker::begin_creation(UINT p_object_type,
+		const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, uint64_t p_size_bytes) {
+	if (!va_enabled) {
+		return 0;
+	}
+	_d3d12_physical_memory_creation_mutex.lock();
+	if (active_va_attempt.active) {
+		MutexLock lock(mutex);
+		va_pair_failure_count++;
+		va_scope_complete = false;
+		_d3d12_physical_memory_creation_mutex.unlock();
+		return 0;
+	}
+	active_va_attempt = {};
+	active_va_attempt.active = true;
+	active_va_attempt.token = _d3d12_physical_memory_va_attempt_counter.increment();
+	active_va_attempt.object_type = p_object_type;
+	active_va_attempt.size_bytes = p_size_bytes;
+	active_va_attempt.begin_unix_usec = _now_unix_usec();
+	active_va_attempt.heap_flags = p_heap_flags;
+	active_va_attempt.heap_properties_available = p_heap_properties != nullptr;
+	if (p_heap_properties != nullptr) {
+		active_va_attempt.heap_properties = *p_heap_properties;
+	}
+	active_va_attempt.below_explicit_threshold = p_size_bytes < va_min_bytes;
+	if (!active_va_attempt.below_explicit_threshold) {
+		active_va_attempt.before_scan = _scan_private_committed_wc();
+	}
+	// This counter sample is deliberately the last operation before the native Create call.
+	active_va_attempt.before_create_counters = _query_process_counters();
+	return active_va_attempt.token;
+}
+
+void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::end_creation(uint64_t p_token, HRESULT p_native_result, ID3D12Pageable *p_object) {
+	if (!va_enabled || p_token == 0) {
+		return;
+	}
+	// Deliberately first after the native Create call: no scan or tracker allocation precedes it.
+	const PhysicalMemoryProcessCounters after_counters = _query_process_counters();
+	if (!active_va_attempt.active || active_va_attempt.token != p_token) {
+		MutexLock lock(mutex);
+		va_pair_failure_count++;
+		va_scope_complete = false;
+		_d3d12_physical_memory_creation_mutex.unlock();
+		return;
+	}
+	PhysicalMemoryVaScan after_scan;
+	if (!active_va_attempt.below_explicit_threshold) {
+		after_scan = _scan_private_committed_wc();
+	}
+
+	PhysicalMemoryVaObservation observation;
+	observation.attempt_token = p_token;
+	observation.size_bytes = active_va_attempt.size_bytes;
+	observation.begin_unix_usec = active_va_attempt.begin_unix_usec;
+	observation.end_unix_usec = _now_unix_usec();
+	observation.object = p_object;
+	observation.native_create_result = int64_t(p_native_result);
+	observation.object_type = active_va_attempt.object_type;
+	observation.heap_properties = active_va_attempt.heap_properties;
+	observation.heap_flags = active_va_attempt.heap_flags;
+	observation.heap_properties_available = active_va_attempt.heap_properties_available;
+	observation.below_explicit_threshold = active_va_attempt.below_explicit_threshold;
+	observation.native_create_succeeded = SUCCEEDED(p_native_result) && p_object != nullptr;
+	observation.before_create_counters = active_va_attempt.before_create_counters;
+	observation.after_create_counters = after_counters;
+	observation.before_wc_bytes = active_va_attempt.before_scan.committed_wc_bytes;
+	observation.after_wc_bytes = after_scan.committed_wc_bytes;
+	observation.before_scan_usec = active_va_attempt.before_scan.elapsed_usec;
+	observation.after_scan_usec = after_scan.elapsed_usec;
+	observation.before_scan_error = active_va_attempt.before_scan.win32_error;
+	observation.after_scan_error = after_scan.win32_error;
+	observation.before_scan_complete = !observation.below_explicit_threshold && active_va_attempt.before_scan.complete;
+	observation.after_scan_complete = !observation.below_explicit_threshold && after_scan.complete;
+
+	{
+		MutexLock lock(mutex);
+		va_attempt_count++;
+		if (observation.native_create_succeeded) {
+			va_native_success_count++;
+		} else {
+			va_native_failure_count++;
+		}
+		if (observation.below_explicit_threshold) {
+			if (observation.native_create_succeeded) {
+				const uint32_t index = _d3d12_physical_heap_index(observation.heap_properties_available ? &observation.heap_properties : nullptr);
+				va_skipped_count[index]++;
+				va_skipped_bytes[index] += observation.size_bytes;
+			}
+		} else {
+			va_total_scan_usec += observation.before_scan_usec + observation.after_scan_usec;
+			va_max_scan_usec = MAX(va_max_scan_usec, MAX(observation.before_scan_usec, observation.after_scan_usec));
+			if (!observation.before_scan_complete || !observation.after_scan_complete) {
+				va_scan_failure_count++;
+				va_scope_complete = false;
+			}
+		}
+		_append_va_observation(observation,
+				observation.below_explicit_threshold ? nullptr : &active_va_attempt.before_scan,
+				observation.below_explicit_threshold ? nullptr : &after_scan);
+	}
+	_free_va_scan(active_va_attempt.before_scan);
+	_free_va_scan(after_scan);
+	active_va_attempt = {};
+	_d3d12_physical_memory_creation_mutex.unlock();
+}
+
+void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::abandon_creation(uint64_t p_token) {
+	if (!va_enabled || p_token == 0) {
+		return;
+	}
+	MutexLock lock(mutex);
+	for (uint64_t i = va_observation_count; i > 0; i--) {
+		PhysicalMemoryVaObservation &observation = va_observations[i - 1];
+		if (observation.attempt_token == p_token && !observation.registered && !observation.abandoned) {
+			observation.abandoned = true;
+			va_abandoned_count++;
+			return;
+		}
+	}
+	va_pair_failure_count++;
+	va_scope_complete = false;
 }
 
 void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::record_created(UINT p_object_type, ID3D12Pageable *p_object,
@@ -146,6 +510,36 @@ void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::record_created(UINT p_ob
 		complete = false;
 	}
 	record.heap_flags = p_heap_flags;
+	if (va_enabled) {
+		for (uint64_t i = va_observation_count; i > 0; i--) {
+			PhysicalMemoryVaObservation &observation = va_observations[i - 1];
+			if (observation.object == p_object && observation.native_create_succeeded && !observation.registered && !observation.abandoned) {
+				observation.physical_generation = record.generation;
+				observation.registration_sequence = record.creation_sequence;
+				observation.registered = true;
+				record.va_observation_index = i - 1;
+				break;
+			}
+		}
+		if (record.va_observation_index == UINT64_MAX) {
+			PhysicalMemoryVaObservation observation;
+			observation.physical_generation = record.generation;
+			observation.size_bytes = p_size_bytes;
+			observation.registration_sequence = record.creation_sequence;
+			observation.object = p_object;
+			observation.object_type = p_object_type;
+			observation.heap_flags = p_heap_flags;
+			observation.heap_properties_available = p_heap_properties != nullptr;
+			if (p_heap_properties != nullptr) {
+				observation.heap_properties = *p_heap_properties;
+			}
+			observation.registered = true;
+			observation.creation_boundary_available = false;
+			record.va_observation_index = _append_va_observation(observation, nullptr, nullptr);
+			va_creation_boundary_unavailable_count++;
+			va_scope_complete = false;
+		}
+	}
 	active_bytes += p_size_bytes;
 	peak_active_count = MAX(peak_active_count, record_count);
 	peak_active_bytes = MAX(peak_active_bytes, active_bytes);
@@ -166,6 +560,12 @@ void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::record_destroyed(UINT p_
 			complete = false;
 		}
 		active_bytes -= records[i].size_bytes;
+		if (records[i].va_observation_index < va_observation_count) {
+			PhysicalMemoryVaObservation &observation = va_observations[records[i].va_observation_index];
+			observation.retired = true;
+			observation.retirement_sequence = total_destruction_count + 1;
+			observation.retirement_unix_usec = _now_unix_usec();
+		}
 		records[i] = records[record_count - 1];
 		record_count--;
 		total_destruction_count++;
@@ -193,47 +593,123 @@ bool RenderingDeviceDriverD3D12::PhysicalMemoryTracker::find_record(ID3D12Pageab
 
 RenderingDeviceDriverD3D12::PhysicalMemoryTrackerSnapshot RenderingDeviceDriverD3D12::PhysicalMemoryTracker::snapshot() {
 	PhysicalMemoryTrackerSnapshot result;
-	MutexLock lock(mutex);
-
-	if (record_count > 0) {
-		result.snapshot_copy_bytes = record_count * sizeof(PhysicalMemoryRecord);
-		result.records = static_cast<PhysicalMemoryRecord *>(std::malloc(static_cast<size_t>(result.snapshot_copy_bytes)));
-		if (result.records != nullptr) {
-			memcpy(result.records, records, static_cast<size_t>(result.snapshot_copy_bytes));
-		} else {
+	PhysicalMemoryVaScan current_scan;
+	if (va_enabled) {
+		_d3d12_physical_memory_creation_mutex.lock();
+		result.current_counters_before_scan = _query_process_counters();
+		current_scan = _scan_private_committed_wc();
+		result.current_counters_after_scan = _query_process_counters();
+		result.current_snapshot_unix_usec = _now_unix_usec();
+	}
+	{
+		MutexLock lock(mutex);
+		const uint64_t record_bytes = record_count * sizeof(PhysicalMemoryRecord);
+		const uint64_t observation_bytes = va_observation_count * sizeof(PhysicalMemoryVaObservation);
+		const uint64_t interval_bytes = va_interval_count * sizeof(PhysicalMemoryVaInterval);
+		uint64_t copied_record_bytes = 0;
+		uint64_t copied_observation_bytes = 0;
+		uint64_t copied_interval_bytes = 0;
+		if (record_count > 0) {
+			result.records = static_cast<PhysicalMemoryRecord *>(std::malloc(static_cast<size_t>(record_bytes)));
+			if (result.records != nullptr) {
+				memcpy(result.records, records, static_cast<size_t>(record_bytes));
+				copied_record_bytes = record_bytes;
+			} else {
+				result.copy_succeeded = false;
+			}
+		}
+		if (va_observation_count > 0) {
+			result.va_observations = static_cast<PhysicalMemoryVaObservation *>(std::malloc(static_cast<size_t>(observation_bytes)));
+			if (result.va_observations != nullptr) {
+				memcpy(result.va_observations, va_observations, static_cast<size_t>(observation_bytes));
+				copied_observation_bytes = observation_bytes;
+			} else {
+				result.va_copy_succeeded = false;
+			}
+		}
+		if (va_interval_count > 0) {
+			result.va_intervals = static_cast<PhysicalMemoryVaInterval *>(std::malloc(static_cast<size_t>(interval_bytes)));
+			if (result.va_intervals != nullptr) {
+				memcpy(result.va_intervals, va_intervals, static_cast<size_t>(interval_bytes));
+				copied_interval_bytes = interval_bytes;
+			} else {
+				result.va_copy_succeeded = false;
+			}
+		}
+		if (!result.copy_succeeded) {
 			snapshot_copy_failure_count++;
 			complete = false;
-			result.copy_succeeded = false;
-			result.snapshot_copy_bytes = 0;
 		}
+		if (!result.va_copy_succeeded) {
+			va_storage_failure_count++;
+			va_scope_complete = false;
+		}
+		result.snapshot_copy_bytes = copied_record_bytes + copied_observation_bytes + copied_interval_bytes;
+		result.record_count = result.copy_succeeded ? record_count : 0;
+		result.active_object_count = record_count;
+		result.record_capacity = record_capacity;
+		result.active_bytes = active_bytes;
+		result.peak_active_count = peak_active_count;
+		result.peak_active_bytes = peak_active_bytes;
+		result.total_creation_count = total_creation_count;
+		result.total_destruction_count = total_destruction_count;
+		result.duplicate_creation_count = duplicate_creation_count;
+		result.unmatched_destruction_count = unmatched_destruction_count;
+		result.destruction_type_mismatch_count = destruction_type_mismatch_count;
+		result.invalid_creation_count = invalid_creation_count;
+		result.record_allocation_failure_count = record_allocation_failure_count;
+		result.creation_metadata_failure_count = creation_metadata_failure_count;
+		result.initialization_failure_count = initialization_failure_count;
+		result.snapshot_copy_failure_count = snapshot_copy_failure_count;
+		result.va_observation_count = result.va_copy_succeeded ? va_observation_count : 0;
+		result.va_observation_capacity = va_observation_capacity;
+		result.va_interval_count = result.va_copy_succeeded ? va_interval_count : 0;
+		result.va_interval_capacity = va_interval_capacity;
+		result.va_min_bytes = va_min_bytes;
+		result.va_attempt_count = va_attempt_count;
+		result.va_native_success_count = va_native_success_count;
+		result.va_native_failure_count = va_native_failure_count;
+		result.va_abandoned_count = va_abandoned_count;
+		result.va_creation_boundary_unavailable_count = va_creation_boundary_unavailable_count;
+		result.va_pair_failure_count = va_pair_failure_count;
+		result.va_scan_failure_count = va_scan_failure_count;
+		result.va_storage_failure_count = va_storage_failure_count;
+		result.va_initialization_failure_count = va_initialization_failure_count;
+		result.va_total_scan_usec = va_total_scan_usec;
+		result.va_max_scan_usec = va_max_scan_usec;
+		memcpy(result.va_skipped_count, va_skipped_count, sizeof(va_skipped_count));
+		memcpy(result.va_skipped_bytes, va_skipped_bytes, sizeof(va_skipped_bytes));
+		result.tracker_start_unix_usec = tracker_start_unix_usec;
+		result.process_id = process_id;
+		result.enabled = enabled;
+		result.va_requested = va_requested;
+		result.va_enabled = va_enabled;
+		result.va_scope_complete = va_scope_complete && result.va_copy_succeeded;
+		result.complete = complete && result.copy_succeeded;
 	}
-
-	result.record_count = result.copy_succeeded ? record_count : 0;
-	result.active_object_count = record_count;
-	result.record_capacity = record_capacity;
-	result.active_bytes = active_bytes;
-	result.peak_active_count = peak_active_count;
-	result.peak_active_bytes = peak_active_bytes;
-	result.total_creation_count = total_creation_count;
-	result.total_destruction_count = total_destruction_count;
-	result.duplicate_creation_count = duplicate_creation_count;
-	result.unmatched_destruction_count = unmatched_destruction_count;
-	result.destruction_type_mismatch_count = destruction_type_mismatch_count;
-	result.invalid_creation_count = invalid_creation_count;
-	result.record_allocation_failure_count = record_allocation_failure_count;
-	result.creation_metadata_failure_count = creation_metadata_failure_count;
-	result.initialization_failure_count = initialization_failure_count;
-	result.snapshot_copy_failure_count = snapshot_copy_failure_count;
-	result.tracker_start_unix_usec = tracker_start_unix_usec;
-	result.process_id = process_id;
-	result.enabled = enabled;
-	result.complete = complete && result.copy_succeeded;
+	if (va_enabled) {
+		_d3d12_physical_memory_creation_mutex.unlock();
+		result.current_va_intervals = current_scan.intervals;
+		result.current_va_interval_count = current_scan.interval_count;
+		result.current_va_interval_capacity = current_scan.interval_capacity;
+		result.current_wc_bytes = current_scan.committed_wc_bytes;
+		result.current_va_scan_usec = current_scan.elapsed_usec;
+		result.current_va_scan_error = current_scan.win32_error;
+		result.current_va_scan_complete = current_scan.complete;
+		current_scan.intervals = nullptr;
+	}
 	return result;
 }
 
 void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::free_snapshot(PhysicalMemoryTrackerSnapshot &r_snapshot) {
 	std::free(r_snapshot.records);
+	std::free(r_snapshot.va_observations);
+	std::free(r_snapshot.va_intervals);
+	std::free(r_snapshot.current_va_intervals);
 	r_snapshot.records = nullptr;
+	r_snapshot.va_observations = nullptr;
+	r_snapshot.va_intervals = nullptr;
+	r_snapshot.current_va_intervals = nullptr;
 	r_snapshot.record_count = 0;
 }
 
@@ -252,6 +728,27 @@ void RenderingDeviceDriverD3D12::_physical_memory_destroyed(UINT p_object_type, 
 		return;
 	}
 	tracker->record_destroyed(p_object_type, p_object);
+}
+
+UINT64 RenderingDeviceDriverD3D12::_physical_memory_creation_begin(UINT p_object_type,
+		const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, UINT64 p_size, void *p_private_data) {
+	PhysicalMemoryTracker *tracker = static_cast<PhysicalMemoryTracker *>(p_private_data);
+	return tracker != nullptr ? tracker->begin_creation(p_object_type, p_heap_properties, p_heap_flags, p_size) : 0;
+}
+
+void RenderingDeviceDriverD3D12::_physical_memory_creation_end(UINT64 p_token, HRESULT p_native_result,
+		ID3D12Pageable *p_object, void *p_private_data) {
+	PhysicalMemoryTracker *tracker = static_cast<PhysicalMemoryTracker *>(p_private_data);
+	if (tracker != nullptr) {
+		tracker->end_creation(p_token, p_native_result, p_object);
+	}
+}
+
+void RenderingDeviceDriverD3D12::_physical_memory_creation_abandoned(UINT64 p_token, void *p_private_data) {
+	PhysicalMemoryTracker *tracker = static_cast<PhysicalMemoryTracker *>(p_private_data);
+	if (tracker != nullptr) {
+		tracker->abandon_creation(p_token);
+	}
 }
 
 // Mesa may define this.
@@ -6319,8 +6816,96 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 		object["cpu_visible"] = record.heap_properties_available && _d3d12_heap_is_cpu_visible(record.heap_properties);
 		object["cpu_page_property"] = record.heap_properties_available ? (int64_t)record.heap_properties.CPUPageProperty : -1;
 		object["memory_pool_preference"] = record.heap_properties_available ? (int64_t)record.heap_properties.MemoryPoolPreference : -1;
+		object["va_observation_available"] = record.va_observation_index < snapshot.va_observation_count;
+		object["va_observation_index"] = record.va_observation_index < snapshot.va_observation_count ? int64_t(record.va_observation_index) : -1;
 		objects.push_back(object);
 	}
+
+	auto counters_dictionary = [](const PhysicalMemoryProcessCounters &p_counters) {
+		Dictionary counters;
+		counters["available"] = p_counters.available;
+		counters["structure"] = "PROCESS_MEMORY_COUNTERS_EX2";
+		counters["structure_bytes"] = p_counters.structure_bytes;
+		counters["win32_error"] = p_counters.win32_error;
+		counters["private_usage_bytes"] = p_counters.private_usage_bytes;
+		counters["working_set_bytes"] = p_counters.working_set_bytes;
+		counters["private_working_set_bytes"] = p_counters.private_working_set_bytes;
+		counters["shared_commit_usage_bytes"] = p_counters.shared_commit_usage_bytes;
+		return counters;
+	};
+	auto interval_dictionary = [](const PhysicalMemoryVaInterval &p_interval) {
+		Dictionary interval;
+		interval["base_address"] = "0x" + String::num_uint64(p_interval.base_address, 16);
+		interval["allocation_base"] = "0x" + String::num_uint64(p_interval.allocation_base, 16);
+		interval["size_bytes"] = p_interval.size_bytes;
+		interval["state"] = p_interval.state;
+		interval["type"] = p_interval.type;
+		interval["protect"] = p_interval.protect;
+		interval["allocation_protect"] = p_interval.allocation_protect;
+		return interval;
+	};
+	auto interval_array = [&interval_dictionary](const PhysicalMemoryVaInterval *p_intervals, uint64_t p_offset, uint64_t p_count) {
+		Array intervals;
+		for (uint64_t i = 0; i < p_count; i++) {
+			intervals.push_back(interval_dictionary(p_intervals[p_offset + i]));
+		}
+		return intervals;
+	};
+
+	Array va_observations;
+	for (uint64_t i = 0; i < snapshot.va_observation_count; i++) {
+		const PhysicalMemoryVaObservation &observation = snapshot.va_observations[i];
+		Dictionary row;
+		row["observation_index"] = i;
+		row["attempt_token"] = String::num_uint64(observation.attempt_token);
+		row["physical_memory_id"] = _d3d12_physical_memory_identity(observation.physical_generation);
+		row["physical_generation_available"] = observation.physical_generation != 0;
+		row["size_bytes"] = observation.size_bytes;
+		row["begin_unix_usec"] = observation.begin_unix_usec;
+		row["end_unix_usec"] = observation.end_unix_usec;
+		row["registration_sequence"] = observation.registration_sequence;
+		row["retirement_sequence"] = observation.retirement_sequence;
+		row["retirement_unix_usec"] = observation.retirement_unix_usec;
+		row["native_object_id"] = _d3d12_capture_local_pointer_identity("id3d12pageable", observation.object);
+		row["native_object_identity_scope"] = "capture-local-pointer";
+		row["object_kind"] = _d3d12_physical_memory_object_type_name(observation.object_type);
+		row["object_type_value"] = observation.object_type;
+		row["heap_properties_available"] = observation.heap_properties_available;
+		row["heap_type"] = observation.heap_properties_available ? _d3d12_heap_type_name(observation.heap_properties.Type) : String("unknown");
+		row["heap_type_value"] = observation.heap_properties_available ? int64_t(observation.heap_properties.Type) : -1;
+		row["heap_flags"] = uint64_t(observation.heap_flags);
+		row["creation_boundary_available"] = observation.creation_boundary_available;
+		row["below_explicit_threshold"] = observation.below_explicit_threshold;
+		row["native_create_result"] = observation.native_create_result;
+		row["native_create_succeeded"] = observation.native_create_succeeded;
+		row["allocator_registration_succeeded"] = observation.registered;
+		row["allocator_registration_abandoned"] = observation.abandoned;
+		row["physical_object_retired"] = observation.retired;
+		row["before_create_process_counters"] = counters_dictionary(observation.before_create_counters);
+		row["after_create_process_counters"] = counters_dictionary(observation.after_create_counters);
+		row["before_wc_bytes"] = observation.before_wc_bytes;
+		row["after_wc_bytes"] = observation.after_wc_bytes;
+		row["wc_delta_bytes"] = int64_t(observation.after_wc_bytes) - int64_t(observation.before_wc_bytes);
+		row["before_scan_usec"] = observation.before_scan_usec;
+		row["after_scan_usec"] = observation.after_scan_usec;
+		row["before_scan_complete"] = observation.before_scan_complete;
+		row["after_scan_complete"] = observation.after_scan_complete;
+		row["before_scan_win32_error"] = observation.before_scan_error;
+		row["after_scan_win32_error"] = observation.after_scan_error;
+		row["before_wc_intervals"] = interval_array(snapshot.va_intervals, observation.before_interval_offset, observation.before_interval_count);
+		row["after_wc_intervals"] = interval_array(snapshot.va_intervals, observation.after_interval_offset, observation.after_interval_count);
+		va_observations.push_back(row);
+	}
+
+	Dictionary current_va_snapshot;
+	current_va_snapshot["scan_complete"] = snapshot.current_va_scan_complete;
+	current_va_snapshot["snapshot_unix_usec"] = snapshot.current_snapshot_unix_usec;
+	current_va_snapshot["scan_win32_error"] = snapshot.current_va_scan_error;
+	current_va_snapshot["scan_usec"] = snapshot.current_va_scan_usec;
+	current_va_snapshot["committed_private_wc_bytes"] = snapshot.current_wc_bytes;
+	current_va_snapshot["process_counters_before_scan"] = counters_dictionary(snapshot.current_counters_before_scan);
+	current_va_snapshot["process_counters_after_scan"] = counters_dictionary(snapshot.current_counters_after_scan);
+	current_va_snapshot["wc_intervals"] = interval_array(snapshot.current_va_intervals, 0, snapshot.current_va_interval_count);
 
 	const uint64_t failure_count = snapshot.duplicate_creation_count +
 			snapshot.unmatched_destruction_count +
@@ -6360,7 +6945,7 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 	}
 
 	Dictionary result;
-	result["schema_version"] = 1;
+	result["schema_version"] = 2;
 	result["enabled"] = snapshot.enabled;
 	result["enable_environment_variable"] = "ANTHROPOLIS_D3D12_PHYSICAL_MEMORY_TRACKING";
 	result["tracking_start_scope"] = "before_d3d12ma_allocator_creation";
@@ -6369,7 +6954,69 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 	result["physical_inventory_incomplete_reasons"] = incomplete_reasons;
 	result["identity_scope"] = "process-d3d12-device-memory-generation";
 	result["identity_note"] = "Physical IDs are stable across captures only while this process and physical object generation remain alive.";
-	result["va_observation_enabled"] = false;
+	result["va_observation_requested"] = snapshot.va_requested;
+	result["va_observation_enabled"] = snapshot.va_enabled;
+	result["va_observation_enable_environment_variable"] = "ANTHROPOLIS_D3D12_VA_DELTA_TRACKING";
+	result["va_min_bytes_environment_variable"] = "ANTHROPOLIS_D3D12_VA_MIN_BYTES";
+	result["va_min_bytes"] = snapshot.va_min_bytes;
+	result["va_min_bytes_semantics"] = "Full private committed write-combined interval scans run only for native creates whose reported size meets this threshold. Every native create remains serialized and retains a metadata/process-counter observation.";
+	Array va_incomplete_reasons;
+	if (!snapshot.va_requested) {
+		va_incomplete_reasons.push_back("va_observation_not_requested");
+	} else if (!snapshot.enabled) {
+		va_incomplete_reasons.push_back("physical_tracking_required");
+	} else if (!snapshot.va_enabled) {
+		va_incomplete_reasons.push_back("va_observation_initialization_failed");
+	}
+	if (snapshot.va_min_bytes > 0) {
+		va_incomplete_reasons.push_back("explicit_nonzero_size_threshold");
+	}
+	if (snapshot.va_pair_failure_count > 0) {
+		va_incomplete_reasons.push_back("creation_callback_pair_failure");
+	}
+	if (snapshot.va_scan_failure_count > 0 || (snapshot.va_enabled && !snapshot.current_va_scan_complete)) {
+		va_incomplete_reasons.push_back("virtual_query_scan_failure");
+	}
+	if (snapshot.va_storage_failure_count > 0 || !snapshot.va_copy_succeeded) {
+		va_incomplete_reasons.push_back("va_observation_storage_failure");
+	}
+	if (snapshot.va_initialization_failure_count > 0) {
+		va_incomplete_reasons.push_back("va_observation_initialization_failure");
+	}
+	if (snapshot.va_creation_boundary_unavailable_count > 0) {
+		va_incomplete_reasons.push_back("physical_registration_without_native_create_boundary");
+	}
+	result["va_observation_scope_complete"] = snapshot.va_enabled && snapshot.va_scope_complete && snapshot.current_va_scan_complete;
+	result["va_observation_incomplete_reasons"] = va_incomplete_reasons;
+	result["va_association_semantics"] = "temporal_native_create_window_only";
+	result["va_default_identity_exact"] = false;
+	result["va_observation_concurrency_note"] = "D3D12MA physical creates are process-global serialized during each observation window. Other process threads and deferred driver work can still change virtual memory.";
+	result["va_attempt_count"] = snapshot.va_attempt_count;
+	result["va_native_success_count"] = snapshot.va_native_success_count;
+	result["va_native_failure_count"] = snapshot.va_native_failure_count;
+	result["va_abandoned_after_native_success_count"] = snapshot.va_abandoned_count;
+	result["va_creation_boundary_unavailable_count"] = snapshot.va_creation_boundary_unavailable_count;
+	result["va_callback_pair_failure_count"] = snapshot.va_pair_failure_count;
+	result["va_scan_failure_count"] = snapshot.va_scan_failure_count;
+	result["va_storage_failure_count"] = snapshot.va_storage_failure_count;
+	result["va_initialization_failure_count"] = snapshot.va_initialization_failure_count;
+	result["va_total_scan_usec"] = snapshot.va_total_scan_usec;
+	result["va_max_scan_usec"] = snapshot.va_max_scan_usec;
+	result["va_history_uncapped"] = true;
+	result["va_history_retention"] = "process_lifetime_including_retired_physical_objects";
+	result["va_observation_count"] = snapshot.va_observation_count;
+	result["va_interval_record_count"] = snapshot.va_interval_count;
+	Dictionary skipped_count;
+	Dictionary skipped_bytes;
+	static const char *heap_names[6] = { "unknown", "default", "upload", "readback", "custom", "gpu_upload" };
+	for (uint32_t i = 0; i < 6; i++) {
+		skipped_count[heap_names[i]] = snapshot.va_skipped_count[i];
+		skipped_bytes[heap_names[i]] = snapshot.va_skipped_bytes[i];
+	}
+	result["va_skipped_object_count_by_heap"] = skipped_count;
+	result["va_skipped_bytes_by_heap"] = skipped_bytes;
+	result["va_observations"] = va_observations;
+	result["current_private_wc_snapshot"] = current_va_snapshot;
 	result["mapped_resource_va_tracking_enabled"] = false;
 	result["tracker_start_unix_usec"] = snapshot.tracker_start_unix_usec;
 	result["process_id"] = snapshot.process_id;
@@ -6392,8 +7039,12 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 	result["snapshot_copy_failure_count"] = snapshot.snapshot_copy_failure_count;
 	result["record_capacity"] = snapshot.record_capacity;
 	result["record_storage_bytes"] = snapshot.record_capacity * sizeof(PhysicalMemoryRecord);
-	result["tracker_storage_bytes"] = sizeof(PhysicalMemoryTracker) + snapshot.record_capacity * sizeof(PhysicalMemoryRecord);
+	result["tracker_storage_bytes"] = sizeof(PhysicalMemoryTracker) +
+			snapshot.record_capacity * sizeof(PhysicalMemoryRecord) +
+			snapshot.va_observation_capacity * sizeof(PhysicalMemoryVaObservation) +
+			snapshot.va_interval_capacity * sizeof(PhysicalMemoryVaInterval);
 	result["snapshot_copy_bytes"] = snapshot.snapshot_copy_bytes;
+	result["current_va_snapshot_storage_bytes"] = snapshot.current_va_interval_capacity * sizeof(PhysicalMemoryVaInterval);
 	result["d3d12ma_block_count"] = p_d3d12ma_block_count;
 	result["d3d12ma_block_bytes"] = p_d3d12ma_block_bytes;
 	result["matches_d3d12ma_block_count"] = snapshot.enabled && snapshot.complete && snapshot.active_object_count == p_d3d12ma_block_count;
@@ -6952,6 +7603,11 @@ Error RenderingDeviceDriverD3D12::_initialize_allocator() {
 	if (physical_memory_tracker.enabled) {
 		physical_memory_callbacks.pCreated = _physical_memory_created;
 		physical_memory_callbacks.pDestroyed = _physical_memory_destroyed;
+		if (physical_memory_tracker.va_enabled) {
+			physical_memory_callbacks.pCreationBegin = _physical_memory_creation_begin;
+			physical_memory_callbacks.pCreationEnd = _physical_memory_creation_end;
+			physical_memory_callbacks.pCreationAbandoned = _physical_memory_creation_abandoned;
+		}
 		physical_memory_callbacks.pPrivateData = &physical_memory_tracker;
 	}
 
