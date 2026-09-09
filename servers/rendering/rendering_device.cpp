@@ -1303,7 +1303,8 @@ Vector<uint8_t> RenderingDevice::buffer_get_data(RID p_buffer, uint32_t p_offset
 
 	_check_transfer_worker_buffer(buffer);
 
-	RDD::BufferID tmp_buffer = driver->buffer_create(buffer->size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+	// Only the requested slice is copied to offset zero in the readback buffer.
+	RDD::BufferID tmp_buffer = driver->buffer_create(p_size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
 	ERR_FAIL_COND_V(!tmp_buffer, Vector<uint8_t>());
 
 	RDD::BufferCopyRegion region;
