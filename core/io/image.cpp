@@ -34,11 +34,213 @@
 #include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
 #include "core/io/image_loader.h"
+#include "core/io/json.h"
 #include "core/io/resource_loader.h"
 #include "core/math/math_funcs.h"
 #include "core/object/class_db.h"
+#include "core/object/object.h"
+#include "core/os/memory_tracker.h"
+#include "core/os/os.h"
+#include "core/os/time.h"
 #include "core/templates/hash_map.h"
 #include "core/variant/dictionary.h"
+
+#ifdef WINDOWS_ENABLED
+#include "platform/windows/windows.h"
+#endif
+
+#include <cerrno>
+#include <cstdio>
+
+namespace {
+
+#ifdef WINDOWS_ENABLED
+
+constexpr uint32_t IMAGE_MEMORY_PROBE_MAX_ATTEMPTS = 3;
+
+struct ImageObjectIDScan {
+	uint64_t *ids = nullptr;
+	uint64_t capacity = 0;
+	uint64_t object_count = 0;
+	uint64_t image_count = 0;
+	uint64_t stored_count = 0;
+	uint64_t overflow_count = 0;
+};
+
+struct ImageScalarSnapshot {
+	Image::Format format = Image::FORMAT_L8;
+	int width = 0;
+	int height = 0;
+	bool mipmaps = false;
+};
+
+struct ImageBackingSnapshot {
+	MemoryTracker::AllocationRecord allocation;
+	uintptr_t pointer_storage_address = 0;
+	uintptr_t data_address = 0;
+	uintptr_t user_base = 0;
+	uint64_t refcount = 0;
+	uint64_t capacity = 0;
+	uint64_t size = 0;
+	uint32_t attempt_count = 0;
+	const char *unavailable_reason = "Backing snapshot was not attempted.";
+	bool pointer_read_succeeded = false;
+	bool pointer_stable = false;
+	bool header_read_succeeded = false;
+	bool header_bounds_valid = false;
+	bool allocation_lookup_before = false;
+	bool allocation_lookup_after = false;
+	bool allocation_generation_stable = false;
+	bool empty = false;
+	bool exact_snapshot_available = false;
+};
+
+struct ImageMemoryLinkCounters {
+	uint64_t allocation_lookup_attempt_count = 0;
+	uint64_t allocation_lookup_success_count = 0;
+	uint64_t allocation_lookup_unavailable_count = 0;
+	uint64_t empty_backing_count = 0;
+	uint64_t unstable_backing_count = 0;
+	uint64_t backing_probe_failure_count = 0;
+	uint64_t pointer_read_failure_count = 0;
+	uint64_t scalar_snapshot_failure_count = 0;
+};
+
+void _collect_image_object_id(Object *p_object, void *p_user_data) {
+	ImageObjectIDScan *scan = static_cast<ImageObjectIDScan *>(p_user_data);
+	scan->object_count++;
+	if (Object::cast_to<Image>(p_object) == nullptr) {
+		return;
+	}
+	scan->image_count++;
+	if (scan->stored_count < scan->capacity) {
+		scan->ids[scan->stored_count++] = uint64_t(p_object->get_instance_id());
+	} else {
+		scan->overflow_count++;
+	}
+}
+
+String _image_memory_address(uintptr_t p_address) {
+	return "0x" + String::num_uint64(uint64_t(p_address), 16);
+}
+
+bool _same_image_allocation_generation(const MemoryTracker::AllocationRecord &p_a, const MemoryTracker::AllocationRecord &p_b) {
+	return p_a.allocation_id == p_b.allocation_id &&
+			p_a.user_base == p_b.user_base &&
+			p_a.raw_base == p_b.raw_base &&
+			p_a.origin_caller_pc == p_b.origin_caller_pc &&
+			p_a.last_reallocation_caller_pc == p_b.last_reallocation_caller_pc &&
+			p_a.requested_bytes == p_b.requested_bytes &&
+			p_a.raw_requested_bytes == p_b.raw_requested_bytes &&
+			p_a.allocator_usable_bytes == p_b.allocator_usable_bytes &&
+			p_a.created_sequence == p_b.created_sequence &&
+			p_a.last_resize_sequence == p_b.last_resize_sequence &&
+			p_a.alignment == p_b.alignment &&
+			p_a.origin == p_b.origin &&
+			p_a.allocator_usable_bytes_available == p_b.allocator_usable_bytes_available &&
+			p_a.aligned == p_b.aligned &&
+			p_a.prepad == p_b.prepad &&
+			p_a.zeroed == p_b.zeroed;
+}
+
+#ifdef WINDOWS_ENABLED
+bool _read_image_process_memory(const void *p_source, void *p_destination, size_t p_size) {
+	SIZE_T bytes_read = 0;
+	return ReadProcessMemory(GetCurrentProcess(), p_source, p_destination, p_size, &bytes_read) != 0 && bytes_read == p_size;
+}
+
+ImageBackingSnapshot _probe_image_backing_once(const void *p_pointer_storage) {
+	ImageBackingSnapshot result;
+	result.pointer_storage_address = uintptr_t(p_pointer_storage);
+	uintptr_t first_data_address = 0;
+	uintptr_t second_data_address = 0;
+	result.pointer_read_succeeded = _read_image_process_memory(p_pointer_storage, &first_data_address, sizeof(first_data_address));
+	if (!result.pointer_read_succeeded) {
+		result.unavailable_reason = "ReadProcessMemory could not copy the Image CowData pointer storage.";
+		return result;
+	}
+
+	result.data_address = first_data_address;
+	if (first_data_address == 0) {
+		if (!_read_image_process_memory(p_pointer_storage, &second_data_address, sizeof(second_data_address))) {
+			result.unavailable_reason = "ReadProcessMemory could not repeat the empty Image CowData pointer observation.";
+			return result;
+		}
+		result.pointer_stable = second_data_address == 0;
+		result.empty = result.pointer_stable;
+		result.header_read_succeeded = result.pointer_stable;
+		result.header_bounds_valid = result.pointer_stable;
+		result.exact_snapshot_available = result.pointer_stable;
+		result.unavailable_reason = result.pointer_stable ? "" : "Image CowData pointer changed during the empty-backing probe.";
+		return result;
+	}
+
+	constexpr size_t data_offset = Vector<uint8_t>::get_memory_data_offset();
+	if (first_data_address < data_offset) {
+		result.unavailable_reason = "Observed Image CowData pointer is smaller than the source-defined header offset.";
+		return result;
+	}
+	result.user_base = first_data_address - data_offset;
+
+	MemoryTracker::AllocationRecord before;
+	MemoryTracker::AllocationRecord after;
+	result.allocation_lookup_before = MemoryTracker::query_allocation(reinterpret_cast<const void *>(result.user_base), before);
+
+	const bool refcount_read = _read_image_process_memory(reinterpret_cast<const void *>(result.user_base + Vector<uint8_t>::get_memory_refcount_offset()), &result.refcount, sizeof(result.refcount));
+	const bool capacity_read = _read_image_process_memory(reinterpret_cast<const void *>(result.user_base + Vector<uint8_t>::get_memory_capacity_offset()), &result.capacity, sizeof(result.capacity));
+	const bool size_read = _read_image_process_memory(reinterpret_cast<const void *>(result.user_base + Vector<uint8_t>::get_memory_size_offset()), &result.size, sizeof(result.size));
+	result.header_read_succeeded = refcount_read && capacity_read && size_read;
+
+	const bool second_pointer_read = _read_image_process_memory(p_pointer_storage, &second_data_address, sizeof(second_data_address));
+	result.pointer_stable = second_pointer_read && first_data_address == second_data_address;
+	result.allocation_lookup_after = MemoryTracker::query_allocation(reinterpret_cast<const void *>(result.user_base), after);
+	result.allocation_generation_stable = result.allocation_lookup_before && result.allocation_lookup_after && _same_image_allocation_generation(before, after);
+
+	if (result.allocation_generation_stable) {
+		result.allocation = after;
+		const bool capacity_addition_valid = result.capacity <= UINT64_MAX - uint64_t(data_offset);
+		const uint64_t expected_requested_bytes = capacity_addition_valid ? uint64_t(data_offset) + result.capacity : 0;
+		result.header_bounds_valid = result.header_read_succeeded && result.refcount > 0 && result.size <= result.capacity && capacity_addition_valid && expected_requested_bytes == after.requested_bytes;
+	}
+
+	result.exact_snapshot_available = result.pointer_stable && result.header_read_succeeded && result.allocation_generation_stable && result.header_bounds_valid;
+	if (result.exact_snapshot_available) {
+		result.unavailable_reason = "";
+	} else if (!second_pointer_read) {
+		result.unavailable_reason = "ReadProcessMemory could not repeat the Image CowData pointer observation.";
+	} else if (!result.pointer_stable) {
+		result.unavailable_reason = "Image CowData pointer changed during the backing probe.";
+	} else if (!result.header_read_succeeded) {
+		result.unavailable_reason = "ReadProcessMemory could not copy the complete source-defined CowData header.";
+	} else if (!result.allocation_lookup_before || !result.allocation_lookup_after) {
+		result.unavailable_reason = MemoryTracker::is_enabled() ? "Backing allocation is absent from at least one current tracker lookup; it may predate tracking or have changed. No identity inferred." : "Native allocation tracking is disabled. No identity inferred.";
+	} else if (!result.allocation_generation_stable) {
+		result.unavailable_reason = "Backing allocation generation changed during the probe. No identity inferred.";
+	} else {
+		result.unavailable_reason = "Copied CowData header is inconsistent with the exact current tracker allocation. No identity inferred.";
+	}
+	return result;
+}
+#endif
+
+FILE *_open_image_memory_inventory_exclusive(const String &p_absolute_path) {
+#ifdef WINDOWS_ENABLED
+	Char16String path_utf16 = p_absolute_path.utf16();
+	FILE *file = nullptr;
+	const errno_t open_error = _wfopen_s(&file, reinterpret_cast<const wchar_t *>(path_utf16.get_data()), L"wbx");
+	if (open_error != 0) {
+		errno = open_error;
+	}
+	return file;
+#else
+	CharString path_utf8 = p_absolute_path.utf8();
+	return fopen(path_utf8.get_data(), "wbx");
+#endif
+}
+
+#endif // WINDOWS_ENABLED
+
+} // namespace
 
 const char *Image::format_names[Image::FORMAT_MAX] = {
 	"Lum8",
@@ -3844,6 +4046,368 @@ void Image::optimize_channels() {
 	}
 }
 
+Dictionary Image::_write_memory_allocation_links(const String &p_absolute_path) {
+	Dictionary receipt;
+	receipt["schema_version"] = 1;
+	receipt["format"] = "anthropolis-image-memory-links-v1";
+	receipt["output_path"] = p_absolute_path;
+	receipt["output_bytes"] = uint64_t(0);
+	receipt["capture_succeeded"] = false;
+	receipt["success"] = false;
+
+	if (!p_absolute_path.is_absolute_path()) {
+		receipt["error"] = "The Image memory-link destination must be an absolute path.";
+		return receipt;
+	}
+
+#ifndef WINDOWS_ENABLED
+	receipt["supported"] = false;
+	receipt["error"] = "Concurrent-safe Image backing capture is supported only on Windows because it requires ReadProcessMemory against the current process. No direct-read fallback is used.";
+	return receipt;
+#else
+	const uint64_t capture_started_ticks_usec = OS::get_singleton()->get_ticks_usec();
+	const uint64_t capture_started_unix_usec = static_cast<uint64_t>(Time::get_singleton()->get_unix_time_from_system() * 1000000.0);
+	MemoryTracker::Statistics tracker_before;
+	MemoryTracker::get_statistics(tracker_before);
+
+	const uint64_t objectdb_object_count_before = uint64_t(MAX(ObjectDB::get_object_count(), 0));
+	const uint64_t object_id_capacity = objectdb_object_count_before > 0 ? objectdb_object_count_before : uint64_t(1);
+	if (object_id_capacity > uint64_t(SIZE_MAX) / sizeof(uint64_t)) {
+		receipt["supported"] = true;
+		receipt["error"] = "The ObjectDB count cannot be represented as a native POD ID-buffer allocation.";
+		return receipt;
+	}
+	const uint64_t object_id_buffer_requested_bytes = object_id_capacity * sizeof(uint64_t);
+	uint64_t *object_ids = static_cast<uint64_t *>(Memory::alloc_static(size_t(object_id_buffer_requested_bytes), false));
+	if (object_ids == nullptr) {
+		receipt["supported"] = true;
+		receipt["error"] = "Could not allocate the uncapped POD ObjectID buffer.";
+		receipt["object_id_buffer_capacity"] = object_id_capacity;
+		receipt["object_id_buffer_requested_bytes"] = object_id_buffer_requested_bytes;
+		return receipt;
+	}
+
+	ImageObjectIDScan scan;
+	scan.ids = object_ids;
+	scan.capacity = object_id_capacity;
+	ObjectDB::debug_objects(_collect_image_object_id, &scan);
+
+	Array rows;
+	Array errors;
+	ImageMemoryLinkCounters counters;
+	uint64_t disappeared_before_pin_count = 0;
+	if (scan.overflow_count != 0) {
+		Dictionary error;
+		error["code"] = "image_object_id_buffer_overflow";
+		error["overflow_count"] = scan.overflow_count;
+		error["message"] = "More Image ObjectIDs were observed than fit the preallocated ObjectDB-count buffer; stored rows remain explicit and the inventory is incomplete.";
+		errors.push_back(error);
+	}
+	for (uint64_t i = 0; i < scan.stored_count; i++) {
+		const ObjectID image_id(object_ids[i]);
+		Ref<Image> image = ObjectDB::get_ref<Image>(image_id);
+		if (image.is_null()) {
+			disappeared_before_pin_count++;
+			Dictionary error;
+			error["code"] = "image_disappeared_before_pin";
+			error["image_instance_id"] = String::num_uint64(uint64_t(image_id));
+			error["message"] = "The Image ObjectID disappeared after ObjectDB enumeration and before ObjectDB::get_ref could pin it.";
+			errors.push_back(error);
+			continue;
+		}
+
+		ImageScalarSnapshot scalar_before;
+		ImageScalarSnapshot scalar_after;
+		ImageBackingSnapshot backing;
+		bool scalar_read_succeeded = false;
+		bool scalar_snapshot_stable = false;
+		for (uint32_t attempt = 1; attempt <= IMAGE_MEMORY_PROBE_MAX_ATTEMPTS; attempt++) {
+			const bool scalar_before_ok = _read_image_process_memory(&image->format, &scalar_before.format, sizeof(scalar_before.format)) &&
+					_read_image_process_memory(&image->width, &scalar_before.width, sizeof(scalar_before.width)) &&
+					_read_image_process_memory(&image->height, &scalar_before.height, sizeof(scalar_before.height)) &&
+					_read_image_process_memory(&image->mipmaps, &scalar_before.mipmaps, sizeof(scalar_before.mipmaps));
+			backing = _probe_image_backing_once(image->data.get_memory_pointer_storage_address());
+			backing.attempt_count = attempt;
+			const bool scalar_after_ok = _read_image_process_memory(&image->format, &scalar_after.format, sizeof(scalar_after.format)) &&
+					_read_image_process_memory(&image->width, &scalar_after.width, sizeof(scalar_after.width)) &&
+					_read_image_process_memory(&image->height, &scalar_after.height, sizeof(scalar_after.height)) &&
+					_read_image_process_memory(&image->mipmaps, &scalar_after.mipmaps, sizeof(scalar_after.mipmaps));
+			scalar_read_succeeded = scalar_before_ok && scalar_after_ok;
+			scalar_snapshot_stable = scalar_read_succeeded && scalar_before.format == scalar_after.format && scalar_before.width == scalar_after.width && scalar_before.height == scalar_after.height && scalar_before.mipmaps == scalar_after.mipmaps;
+			if (scalar_snapshot_stable && backing.exact_snapshot_available) {
+				break;
+			}
+			if (scalar_snapshot_stable && backing.pointer_stable && backing.header_read_succeeded && !MemoryTracker::is_enabled()) {
+				break;
+			}
+		}
+
+		if (!scalar_snapshot_stable) {
+			counters.scalar_snapshot_failure_count++;
+			Dictionary error;
+			error["code"] = scalar_read_succeeded ? "image_scalar_snapshot_changed" : "image_scalar_snapshot_read_failed";
+			error["image_instance_id"] = String::num_uint64(uint64_t(image_id));
+			error["message"] = scalar_read_succeeded ? "Image scalar metadata changed during every bounded ReadProcessMemory probe." : "ReadProcessMemory could not copy all Image scalar metadata.";
+			errors.push_back(error);
+		}
+
+		const bool has_backing_available = backing.pointer_read_succeeded;
+		const bool has_backing = has_backing_available && backing.data_address != 0;
+		if (!has_backing_available || (!has_backing && !backing.exact_snapshot_available)) {
+			counters.backing_probe_failure_count++;
+			counters.unstable_backing_count++;
+			if (!has_backing_available) {
+				counters.pointer_read_failure_count++;
+			}
+			Dictionary error;
+			error["code"] = "image_backing_pointer_snapshot_failed";
+			error["image_instance_id"] = String::num_uint64(uint64_t(image_id));
+			error["message"] = backing.unavailable_reason;
+			errors.push_back(error);
+		} else if (!has_backing && backing.exact_snapshot_available) {
+			counters.empty_backing_count++;
+		} else if (has_backing) {
+			counters.allocation_lookup_attempt_count++;
+			if (backing.exact_snapshot_available) {
+				counters.allocation_lookup_success_count++;
+			} else {
+				counters.allocation_lookup_unavailable_count++;
+				if (!backing.pointer_stable || !backing.header_read_succeeded || (backing.allocation_lookup_before && backing.allocation_lookup_after && (!backing.allocation_generation_stable || !backing.header_bounds_valid))) {
+					counters.unstable_backing_count++;
+				}
+			}
+		}
+
+		const bool format_valid = scalar_snapshot_stable && int(scalar_before.format) >= 0 && int(scalar_before.format) < int(FORMAT_MAX);
+		const bool dimensions_valid = scalar_snapshot_stable && scalar_before.width >= 0 && scalar_before.height >= 0 && scalar_before.width <= MAX_WIDTH && scalar_before.height <= MAX_HEIGHT && uint64_t(scalar_before.width) * uint64_t(scalar_before.height) <= uint64_t(MAX_PIXELS);
+		const bool data_sizes_available = backing.exact_snapshot_available;
+		const bool image_layout_available = format_valid && dimensions_valid;
+		uint64_t expected_data_size_bytes = 0;
+		bool expected_data_size_available = false;
+		if (image_layout_available && scalar_before.width > 0 && scalar_before.height > 0) {
+			const int64_t expected_size = get_image_data_size(scalar_before.width, scalar_before.height, scalar_before.format, scalar_before.mipmaps);
+			if (expected_size >= 0) {
+				expected_data_size_available = true;
+				expected_data_size_bytes = uint64_t(expected_size);
+			}
+		}
+
+		Dictionary cpu_backing;
+		cpu_backing["tracking_enabled"] = tracker_before.enabled;
+		cpu_backing["tracker_start_unix_usec"] = tracker_before.tracker_start_unix_usec;
+		cpu_backing["tracker_inventory_complete_for_enabled_memory_api_window"] = tracker_before.inventory_complete;
+		cpu_backing["native_allocation_coverage_complete"] = false;
+		cpu_backing["has_backing_available"] = has_backing_available;
+		cpu_backing["has_backing"] = has_backing;
+		cpu_backing["allocation_available"] = has_backing && backing.exact_snapshot_available;
+		cpu_backing["snapshot_source"] = "ReadProcessMemory(GetCurrentProcess) plus before/after MemoryTracker generation equality";
+		cpu_backing["snapshot_attempt_count"] = backing.attempt_count;
+		cpu_backing["pointer_storage_address"] = _image_memory_address(backing.pointer_storage_address);
+		cpu_backing["pointer_stable"] = backing.pointer_stable;
+		cpu_backing["allocation_generation_stable"] = backing.allocation_generation_stable;
+		cpu_backing["header_read_succeeded"] = backing.header_read_succeeded;
+		cpu_backing["header_bounds_valid"] = backing.header_bounds_valid;
+		cpu_backing["user_base"] = _image_memory_address(backing.user_base);
+		cpu_backing["data_address"] = _image_memory_address(backing.data_address);
+		cpu_backing["logical_bytes_available"] = data_sizes_available;
+		cpu_backing["logical_bytes"] = data_sizes_available ? backing.size : uint64_t(0);
+		cpu_backing["container_capacity_bytes_available"] = data_sizes_available;
+		cpu_backing["container_capacity_bytes"] = data_sizes_available ? backing.capacity : uint64_t(0);
+		cpu_backing["container_slack_bytes"] = data_sizes_available ? backing.capacity - backing.size : uint64_t(0);
+		cpu_backing["shared_cow"] = true;
+		cpu_backing["cow_refcount_available"] = data_sizes_available;
+		cpu_backing["cow_refcount_observed"] = data_sizes_available ? backing.refcount : uint64_t(0);
+		cpu_backing["observed_unvalidated_logical_bytes"] = backing.header_read_succeeded ? backing.size : uint64_t(0);
+		cpu_backing["observed_unvalidated_capacity_bytes"] = backing.header_read_succeeded ? backing.capacity : uint64_t(0);
+		cpu_backing["observed_unvalidated_cow_refcount"] = backing.header_read_succeeded ? backing.refcount : uint64_t(0);
+		if (!backing.exact_snapshot_available) {
+			cpu_backing["unavailable_reason"] = backing.unavailable_reason;
+		}
+		if (has_backing && backing.exact_snapshot_available) {
+			const MemoryTracker::AllocationRecord &allocation = backing.allocation;
+			cpu_backing["allocation_id"] = "memory-allocation:" + String::num_uint64(allocation.allocation_id);
+			cpu_backing["identity_scope"] = "process-memory-allocation-generation";
+			cpu_backing["requested_bytes"] = allocation.requested_bytes;
+			cpu_backing["raw_requested_bytes"] = allocation.raw_requested_bytes;
+			cpu_backing["raw_base"] = _image_memory_address(allocation.raw_base);
+			cpu_backing["allocator_usable_bytes_available"] = allocation.allocator_usable_bytes_available;
+			cpu_backing["allocator_usable_bytes"] = allocation.allocator_usable_bytes;
+			cpu_backing["created_sequence"] = allocation.created_sequence;
+			cpu_backing["last_resize_sequence"] = allocation.last_resize_sequence;
+			cpu_backing["origin"] = allocation.origin == MemoryTracker::AllocationOrigin::ALLOCATION ? "allocation" : "reallocation_of_pre_enable_allocation";
+			cpu_backing["origin_caller_pc_available"] = allocation.origin_caller_pc != 0;
+			cpu_backing["origin_caller_pc"] = _image_memory_address(allocation.origin_caller_pc);
+			cpu_backing["latest_successful_reallocation_caller_pc_available"] = allocation.last_reallocation_caller_pc != 0;
+			cpu_backing["latest_successful_reallocation_caller_pc"] = _image_memory_address(allocation.last_reallocation_caller_pc);
+			cpu_backing["aligned"] = allocation.aligned;
+			cpu_backing["prepad"] = allocation.prepad;
+			cpu_backing["initial_allocation_zeroed"] = allocation.zeroed;
+			cpu_backing["alignment_bytes"] = allocation.alignment;
+		}
+
+		Dictionary row;
+		const String image_instance_id = String::num_uint64(uint64_t(image_id));
+		row["image_instance_id"] = image_instance_id;
+		row["image_object_address"] = _image_memory_address(uintptr_t(image.ptr()));
+		row["image_object_address_identity_scope"] = "process-native-object-address";
+		row["logical_parent_key"] = "image/" + image_instance_id;
+		row["role"] = "image_data";
+		row["element_type"] = "uint8_t";
+		row["element_size_bytes"] = uint64_t(1);
+		row["resource_name_available"] = false;
+		row["resource_name"] = "";
+		row["resource_path_available"] = false;
+		row["resource_path"] = "";
+		row["resource_string_unavailable_reason"] = "Resource name/path String storage is mutable and has no concurrent snapshot API; it is intentionally not read by this probe.";
+		row["scalar_metadata_available"] = scalar_snapshot_stable;
+		row["scalar_read_succeeded"] = scalar_read_succeeded;
+		row["width"] = scalar_snapshot_stable ? scalar_before.width : 0;
+		row["height"] = scalar_snapshot_stable ? scalar_before.height : 0;
+		row["dimensions_valid"] = dimensions_valid;
+		row["format"] = scalar_snapshot_stable ? int(scalar_before.format) : -1;
+		row["format_valid"] = format_valid;
+		row["format_name"] = format_valid ? get_format_name(scalar_before.format) : String();
+		row["has_mipmaps"] = scalar_snapshot_stable ? scalar_before.mipmaps : false;
+		row["mipmap_count"] = image_layout_available && scalar_before.mipmaps && scalar_before.width > 0 && scalar_before.height > 0 ? get_image_required_mipmaps(scalar_before.width, scalar_before.height, scalar_before.format) : 0;
+		row["data_size_bytes_available"] = data_sizes_available;
+		row["data_size_bytes"] = data_sizes_available ? backing.size : uint64_t(0);
+		row["data_capacity_bytes_available"] = data_sizes_available;
+		row["data_capacity_bytes"] = data_sizes_available ? backing.capacity : uint64_t(0);
+		row["data_slack_bytes"] = data_sizes_available ? backing.capacity - backing.size : uint64_t(0);
+		row["expected_data_size_bytes_available"] = expected_data_size_available;
+		row["expected_data_size_bytes"] = expected_data_size_bytes;
+		row["data_size_matches_scalar_metadata"] = expected_data_size_available && data_sizes_available && expected_data_size_bytes == backing.size;
+		row["backing_snapshot_exact"] = backing.exact_snapshot_available;
+		row["cpu_backing"] = cpu_backing;
+		rows.push_back(row);
+	}
+
+	Memory::free_static(object_ids, false);
+	object_ids = nullptr;
+
+	MemoryTracker::Statistics tracker_after;
+	MemoryTracker::get_statistics(tracker_after);
+	const uint64_t capture_finished_unix_usec = static_cast<uint64_t>(Time::get_singleton()->get_unix_time_from_system() * 1000000.0);
+	const uint64_t capture_finished_ticks_usec = OS::get_singleton()->get_ticks_usec();
+	const uint64_t objectdb_object_count_after = uint64_t(MAX(ObjectDB::get_object_count(), 0));
+	const bool row_count_consistent = uint64_t(rows.size()) + disappeared_before_pin_count == scan.stored_count;
+	const uint64_t confirmed_backing_count = counters.allocation_lookup_success_count + counters.empty_backing_count;
+	const uint64_t unclassified_backing_count = uint64_t(rows.size()) >= confirmed_backing_count ? uint64_t(rows.size()) - confirmed_backing_count : 0;
+	const bool backing_row_count_consistent = confirmed_backing_count + unclassified_backing_count == uint64_t(rows.size());
+	const bool metadata_inventory_complete = scan.overflow_count == 0 && disappeared_before_pin_count == 0 && counters.scalar_snapshot_failure_count == 0 && row_count_consistent;
+	const bool backing_identity_complete = tracker_before.enabled && tracker_after.enabled && tracker_before.inventory_complete && tracker_after.inventory_complete && scan.overflow_count == 0 && disappeared_before_pin_count == 0 && row_count_consistent && backing_row_count_consistent && unclassified_backing_count == 0 && confirmed_backing_count == uint64_t(rows.size());
+
+	Dictionary output;
+	output["schema_version"] = 1;
+	output["format"] = "anthropolis-image-memory-links-v1";
+	output["supported"] = true;
+	output["capture_complete"] = true;
+	output["invocation_opt_in"] = true;
+	output["invocation_method"] = "Image._write_memory_allocation_links(absolute_path)";
+	output["process_id"] = uint64_t(OS::get_singleton()->get_process_id());
+	output["output_path"] = p_absolute_path;
+	output["capture_started_unix_usec"] = capture_started_unix_usec;
+	output["capture_finished_unix_usec"] = capture_finished_unix_usec;
+	output["capture_started_ticks_usec"] = capture_started_ticks_usec;
+	output["capture_finished_ticks_usec"] = capture_finished_ticks_usec;
+	output["tracker_start_unix_usec"] = tracker_before.tracker_start_unix_usec;
+	output["snapshot_sequence_before"] = tracker_before.snapshot_sequence;
+	output["snapshot_sequence_after"] = tracker_after.snapshot_sequence;
+	output["native_allocation_tracking_enabled"] = tracker_before.enabled && tracker_after.enabled;
+	output["native_allocation_inventory_complete_for_enabled_memory_api_window"] = tracker_before.inventory_complete && tracker_after.inventory_complete;
+	output["native_allocation_coverage_complete"] = false;
+	output["backing_identity_complete_for_nonempty_images"] = backing_identity_complete;
+	output["cross_inventory_join_non_atomic"] = true;
+	output["contents_snapshot_non_atomic"] = true;
+	output["concurrent_memory_access_source"] = "Windows ReadProcessMemory(GetCurrentProcess)";
+	output["live_vector_or_cow_header_dereferenced"] = false;
+	output["pixel_contents_captured"] = false;
+	output["image_pixel_bytes_copied"] = uint64_t(0);
+	output["gpu_readbacks_performed"] = false;
+	output["resource_strings_omitted_for_concurrent_safety"] = true;
+	output["inventory_capped"] = scan.overflow_count != 0;
+	output["objectdb_object_count_before"] = objectdb_object_count_before;
+	output["objectdb_object_count_after"] = objectdb_object_count_after;
+	output["objectdb_scanned_count"] = scan.object_count;
+	output["objectdb_callback_allocations"] = uint64_t(0);
+	output["objectdb_callback_only_cast_and_id_store"] = true;
+	output["image_object_count_observed"] = scan.image_count;
+	output["image_id_count"] = scan.stored_count;
+	output["object_id_buffer_capacity"] = object_id_capacity;
+	output["object_id_buffer_requested_bytes"] = object_id_buffer_requested_bytes;
+	output["object_id_buffer_overflow_count"] = scan.overflow_count;
+	output["disappeared_before_pin_count"] = disappeared_before_pin_count;
+	output["pinned_image_count"] = uint64_t(rows.size());
+	output["row_count"] = uint64_t(rows.size());
+	output["error_count"] = uint64_t(errors.size());
+	output["allocation_lookup_attempt_count"] = counters.allocation_lookup_attempt_count;
+	output["allocation_lookup_success_count"] = counters.allocation_lookup_success_count;
+	output["allocation_lookup_unavailable_count"] = counters.allocation_lookup_unavailable_count;
+	output["empty_backing_count"] = counters.empty_backing_count;
+	output["confirmed_nonempty_backing_count"] = counters.allocation_lookup_success_count;
+	output["confirmed_backing_count"] = confirmed_backing_count;
+	output["unclassified_backing_count"] = unclassified_backing_count;
+	output["unstable_backing_count"] = counters.unstable_backing_count;
+	output["backing_probe_failure_count"] = counters.backing_probe_failure_count;
+	output["pointer_read_failure_count"] = counters.pointer_read_failure_count;
+	output["scalar_snapshot_failure_count"] = counters.scalar_snapshot_failure_count;
+	output["row_count_consistent"] = row_count_consistent;
+	output["backing_row_count_consistent"] = backing_row_count_consistent;
+	output["metadata_inventory_complete"] = metadata_inventory_complete;
+	output["observer_id_buffer_requested_bytes"] = object_id_buffer_requested_bytes;
+	output["observer_max_simultaneously_pinned_images"] = uint64_t(1);
+	output["observer_self_storage_note"] = "The exact POD ObjectID buffer request is reported and is freed before serialization. Temporary Dictionary/Array/String/JSON/File containers and allocator overhead are excluded from observer self-storage; no Image pixel buffer is copied.";
+	output["snapshot_semantics_note"] = "Each surviving Image is pinned while its scalar fields and CowData pointer/header are copied through ReadProcessMemory. A non-empty backing receives an exact native identity only when before/after MemoryTracker records describe the same complete allocation generation and the copied header fits it. Rows are sequential observations, not an atomic snapshot of all Images.";
+	output["rows"] = rows;
+	output["errors"] = errors;
+
+	const String json = JSON::stringify(output);
+	const CharString json_utf8 = json.utf8();
+	errno = 0;
+	FILE *file = _open_image_memory_inventory_exclusive(p_absolute_path);
+	if (file == nullptr) {
+		receipt["supported"] = true;
+		receipt["row_count"] = uint64_t(rows.size());
+		receipt["error_count"] = uint64_t(errors.size());
+		receipt["metadata_inventory_complete"] = metadata_inventory_complete;
+		receipt["error"] = vformat("Could not exclusively create the new Image memory-link file (errno %d). The destination may already exist.", errno);
+		return receipt;
+	}
+
+	const size_t json_bytes = size_t(json_utf8.length());
+	const size_t bytes_written = fwrite(json_utf8.get_data(), 1, json_bytes, file);
+	bool write_succeeded = bytes_written == json_bytes;
+	if (write_succeeded) {
+		write_succeeded = fflush(file) == 0;
+	}
+	if (fclose(file) != 0) {
+		write_succeeded = false;
+	}
+
+	receipt["supported"] = true;
+	receipt["capture_succeeded"] = write_succeeded;
+	receipt["success"] = write_succeeded;
+	receipt["output_bytes"] = uint64_t(bytes_written);
+	receipt["process_id"] = uint64_t(OS::get_singleton()->get_process_id());
+	receipt["row_count"] = uint64_t(rows.size());
+	receipt["image_object_count_observed"] = scan.image_count;
+	receipt["disappeared_before_pin_count"] = disappeared_before_pin_count;
+	receipt["object_id_buffer_overflow_count"] = scan.overflow_count;
+	receipt["error_count"] = uint64_t(errors.size());
+	receipt["metadata_inventory_complete"] = metadata_inventory_complete;
+	receipt["backing_identity_complete_for_nonempty_images"] = backing_identity_complete;
+	receipt["confirmed_backing_count"] = confirmed_backing_count;
+	receipt["unclassified_backing_count"] = unclassified_backing_count;
+	receipt["pointer_read_failure_count"] = counters.pointer_read_failure_count;
+	receipt["snapshot_sequence_before"] = tracker_before.snapshot_sequence;
+	receipt["snapshot_sequence_after"] = tracker_after.snapshot_sequence;
+	if (!write_succeeded) {
+		receipt["error"] = "Writing or flushing the Image memory-link JSON failed. The partial file must be rejected.";
+	}
+	return receipt;
+#endif
+}
+
 void Image::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_width"), &Image::get_width);
 	ClassDB::bind_method(D_METHOD("get_height"), &Image::get_height);
@@ -3873,6 +4437,7 @@ void Image::_bind_methods() {
 #endif
 	ClassDB::bind_static_method("Image", D_METHOD("create_empty", "width", "height", "use_mipmaps", "format"), &Image::create_empty);
 	ClassDB::bind_static_method("Image", D_METHOD("create_from_data", "width", "height", "use_mipmaps", "format", "data"), &Image::create_from_data);
+	ClassDB::bind_static_method("Image", D_METHOD("_write_memory_allocation_links", "absolute_path"), &Image::_write_memory_allocation_links);
 	ClassDB::bind_method(D_METHOD("set_data", "width", "height", "use_mipmaps", "format", "data"), &Image::set_data);
 
 	ClassDB::bind_method(D_METHOD("is_empty"), &Image::is_empty);

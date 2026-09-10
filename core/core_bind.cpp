@@ -43,6 +43,7 @@
 #include "core/object/class_db.h"
 #include "core/os/keyboard.h"
 #include "core/os/main_loop.h"
+#include "core/os/crt_heap_inventory.h"
 #include "core/os/memory_tracker.h"
 #include "core/os/os.h"
 #include "core/os/process_id.h"
@@ -901,6 +902,54 @@ Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path)
 	return result;
 }
 
+Dictionary OS::_write_crt_heap_inventory(const String &p_absolute_path) const {
+	if (!p_absolute_path.is_absolute_path()) {
+		Dictionary result;
+		result["capture_succeeded"] = false;
+		result["write_succeeded"] = false;
+		result["enumeration_complete"] = false;
+		result["output_path"] = p_absolute_path;
+		result["output_bytes"] = uint64_t(0);
+		result["entry_count"] = uint64_t(0);
+		result["success"] = false;
+		result["error"] = "The CRT heap inventory destination must be an absolute path.";
+		return result;
+	}
+	const CrtHeapInventoryResult capture = CrtHeapInventory::write_jsonl(p_absolute_path);
+	Dictionary result;
+	result["capture_succeeded"] = capture.capture_succeeded;
+	result["write_succeeded"] = capture.write_succeeded;
+	result["enumeration_complete"] = capture.enumeration_complete;
+	result["heap_lock_succeeded"] = capture.heap_lock_succeeded;
+	result["heap_unlock_succeeded"] = capture.heap_unlock_succeeded;
+	result["terminal_error_no_more_items"] = capture.terminal_no_more_items;
+	result["limit_reached"] = capture.limit_reached;
+	result["process_id"] = capture.process_id;
+	result["crt_heap_handle"] = "0x" + String::num_uint64(capture.heap_handle, 16);
+	result["entry_count"] = capture.entry_count;
+	result["output_path"] = capture.output_path;
+	result["output_bytes"] = capture.output_bytes;
+	result["observer_buffer_requested_bytes"] = capture.observer_buffer_requested_bytes;
+	result["observer_buffer_capacity_entries"] = capture.observer_buffer_capacity_entries;
+	result["observer_record_size_bytes"] = capture.observer_record_size_bytes;
+	result["configured_max_buffer_bytes"] = capture.configured_max_buffer_bytes;
+	result["phase_count"] = capture.phase_count;
+	result["capture_started_unix_usec"] = capture.capture_started_unix_usec;
+	result["capture_finished_unix_usec"] = capture.capture_finished_unix_usec;
+	result["capture_elapsed_usec"] = capture.capture_elapsed_usec;
+	result["selected_phase_started_unix_usec"] = capture.selected_phase_started_unix_usec;
+	result["selected_phase_finished_unix_usec"] = capture.selected_phase_finished_unix_usec;
+	result["terminal_win32_error"] = capture.terminal_win32_error;
+	result["buffer_allocation_win32_error"] = capture.buffer_allocation_win32_error;
+	result["lock_win32_error"] = capture.lock_win32_error;
+	result["unlock_win32_error"] = capture.unlock_win32_error;
+	result["success"] = capture.capture_succeeded;
+	if (!capture.error.is_empty()) {
+		result["error"] = capture.error;
+	}
+	return result;
+}
+
 static Dictionary _memory_tracker_compaction_statistics(const MemoryTracker::Statistics &p_statistics) {
 	Dictionary result;
 	result["snapshot_sequence"] = p_statistics.snapshot_sequence;
@@ -1217,6 +1266,7 @@ void OS::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_memory_info"), &OS::get_memory_info);
 	ClassDB::bind_method(D_METHOD("_get_memory_allocation_inventory"), &OS::_get_memory_allocation_inventory);
 	ClassDB::bind_method(D_METHOD("_write_memory_allocation_inventory", "absolute_path"), &OS::_write_memory_allocation_inventory);
+	ClassDB::bind_method(D_METHOD("_write_crt_heap_inventory", "absolute_path"), &OS::_write_crt_heap_inventory);
 	ClassDB::bind_method(D_METHOD("_compact_memory_allocation_tracker"), &OS::_compact_memory_allocation_tracker);
 	ClassDB::bind_method(D_METHOD("_memory_allocation_tracker_self_check"), &OS::_memory_allocation_tracker_self_check);
 

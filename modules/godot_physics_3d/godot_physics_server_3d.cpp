@@ -144,11 +144,11 @@ Dictionary _shape_vector_cpu_backing(const Vector<T> &p_vector, bool p_tracker_i
 }
 
 template <typename T>
-void _append_shape_vector_row(Array &r_rows, const String &p_shape_rid, const String &p_logical_parent_key, const char *p_role, const char *p_element_type, const Vector<T> &p_vector, bool p_tracker_inventory_complete, ShapeMemoryLinkCounters &r_counters) {
+void _append_shape_vector_row(Array &r_rows, const String &p_shape_rid, const String &p_logical_parent_key, PhysicsServer3D::ShapeType p_shape_type, const char *p_shape_type_name, const char *p_role, const char *p_element_type, const Vector<T> &p_vector, bool p_tracker_inventory_complete, ShapeMemoryLinkCounters &r_counters, const char *p_layout = nullptr, uint64_t p_width = 0, uint64_t p_depth = 0) {
 	Dictionary row;
 	row["shape_rid"] = p_shape_rid;
-	row["shape_type"] = int(PhysicsServer3D::SHAPE_CONCAVE_POLYGON);
-	row["shape_type_name"] = "concave_polygon";
+	row["shape_type"] = int(p_shape_type);
+	row["shape_type_name"] = p_shape_type_name;
 	row["logical_parent_key"] = p_logical_parent_key;
 	row["role"] = p_role;
 	row["element_type"] = p_element_type;
@@ -157,6 +157,11 @@ void _append_shape_vector_row(Array &r_rows, const String &p_shape_rid, const St
 	row["capacity_elements"] = uint64_t(p_vector.capacity());
 	row["logical_bytes"] = uint64_t(p_vector.size()) * sizeof(T);
 	row["capacity_bytes"] = uint64_t(p_vector.capacity()) * sizeof(T);
+	if (p_layout != nullptr) {
+		row["layout"] = p_layout;
+		row["width"] = p_width;
+		row["depth"] = p_depth;
+	}
 	row["cpu_backing"] = _shape_vector_cpu_backing(p_vector, p_tracker_inventory_complete, r_counters);
 	r_rows.push_back(row);
 }
@@ -263,6 +268,9 @@ Dictionary GodotPhysicsServer3D::get_shape_memory_links() const {
 	uint64_t lookup_error_count = 0;
 	uint64_t invalid_shape_count = 0;
 	uint64_t concave_shape_count = 0;
+	uint64_t heightmap_shape_count = 0;
+	uint64_t concave_row_count = 0;
+	uint64_t heightmap_row_count = 0;
 	ShapeMemoryLinkCounters link_counters;
 
 	for (const RID &shape_rid : owned_shape_rids) {
@@ -317,9 +325,10 @@ Dictionary GodotPhysicsServer3D::get_shape_memory_links() const {
 			shape_info["bvh_count_consistent"] = bvh_count_consistent;
 			shape_info["storage_counts_consistent"] = vertex_count_consistent && bvh_count_consistent;
 
-			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, "faces", "GodotConcavePolygonShape3D::Face", concave->faces, tracker_before.inventory_complete, link_counters);
-			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, "vertices", "Vector3", concave->vertices, tracker_before.inventory_complete, link_counters);
-			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, "bvh", "GodotConcavePolygonShape3D::BVH", concave->bvh, tracker_before.inventory_complete, link_counters);
+			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, SHAPE_CONCAVE_POLYGON, "concave_polygon", "faces", "GodotConcavePolygonShape3D::Face", concave->faces, tracker_before.inventory_complete, link_counters);
+			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, SHAPE_CONCAVE_POLYGON, "concave_polygon", "vertices", "Vector3", concave->vertices, tracker_before.inventory_complete, link_counters);
+			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, SHAPE_CONCAVE_POLYGON, "concave_polygon", "bvh", "GodotConcavePolygonShape3D::BVH", concave->bvh, tracker_before.inventory_complete, link_counters);
+			concave_row_count += 3;
 
 			if (!vertex_count_consistent || !bvh_count_consistent) {
 				invalid_shape_count++;
@@ -335,13 +344,47 @@ Dictionary GodotPhysicsServer3D::get_shape_memory_links() const {
 				error["message"] = "Concave shape storage counts differ from the current _setup layout; all observed rows are retained.";
 				errors.push_back(error);
 			}
+		} else if (shape_type == SHAPE_HEIGHTMAP) {
+			heightmap_shape_count++;
+			const GodotHeightMapShape3D *heightmap = static_cast<const GodotHeightMapShape3D *>(shape);
+			const uint64_t height_count = uint64_t(heightmap->heights.size());
+			const uint64_t width = uint64_t(MAX(heightmap->width, 0));
+			const uint64_t depth = uint64_t(MAX(heightmap->depth, 0));
+			const uint64_t expected_height_count = width * depth;
+			const bool height_count_consistent = height_count == expected_height_count;
+			shape_info["height_count"] = height_count;
+			shape_info["width"] = width;
+			shape_info["depth"] = depth;
+			shape_info["expected_height_count"] = expected_height_count;
+			shape_info["height_count_consistent"] = height_count_consistent;
+			shape_info["storage_counts_consistent"] = height_count_consistent;
+
+			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, SHAPE_HEIGHTMAP, "heightmap", "heights", "real_t", heightmap->heights, tracker_before.inventory_complete, link_counters, "row_major_z_then_x", width, depth);
+			heightmap_row_count++;
+
+			if (!height_count_consistent) {
+				invalid_shape_count++;
+				Dictionary error;
+				error["code"] = "heightmap_storage_count_mismatch";
+				error["shape_rid"] = shape_rid_string;
+				error["logical_parent_key"] = logical_parent_key;
+				error["height_count"] = height_count;
+				error["width"] = width;
+				error["depth"] = depth;
+				error["expected_height_count"] = expected_height_count;
+				error["message"] = "Heightmap shape storage count differs from width * depth; the observed row is retained.";
+				errors.push_back(error);
+			}
 		}
 		owned_shapes.push_back(shape_info);
 	}
 
 	const bool shape_count_consistent = shape_owner_rid_count == uint64_t(owned_shape_rids.size()) && uint64_t(owned_shapes.size()) == uint64_t(owned_shape_rids.size());
-	const bool concave_row_count_consistent = uint64_t(rows.size()) == concave_shape_count * 3;
-	const bool metadata_inventory_complete = shape_count_consistent && concave_row_count_consistent && lookup_error_count == 0 && invalid_shape_count == 0;
+	const uint64_t expected_row_count = concave_shape_count * 3 + heightmap_shape_count;
+	const bool concave_row_count_consistent = concave_row_count == concave_shape_count * 3;
+	const bool heightmap_row_count_consistent = heightmap_row_count == heightmap_shape_count;
+	const bool row_count_consistent = uint64_t(rows.size()) == expected_row_count && uint64_t(rows.size()) == concave_row_count + heightmap_row_count;
+	const bool metadata_inventory_complete = shape_count_consistent && concave_row_count_consistent && heightmap_row_count_consistent && row_count_consistent && lookup_error_count == 0 && invalid_shape_count == 0;
 	MemoryTracker::Statistics tracker_after;
 	MemoryTracker::get_statistics(tracker_after);
 	const uint64_t capture_finished_unix_usec = static_cast<uint64_t>(Time::get_singleton()->get_unix_time_from_system() * 1000000.0);
@@ -369,6 +412,10 @@ Dictionary GodotPhysicsServer3D::get_shape_memory_links() const {
 	result["shape_owner_rid_count"] = shape_owner_rid_count;
 	result["owned_shape_count"] = uint64_t(owned_shapes.size());
 	result["concave_shape_count"] = concave_shape_count;
+	result["heightmap_shape_count"] = heightmap_shape_count;
+	result["concave_row_count"] = concave_row_count;
+	result["heightmap_row_count"] = heightmap_row_count;
+	result["expected_row_count"] = expected_row_count;
 	result["row_count"] = uint64_t(rows.size());
 	result["lookup_error_count"] = lookup_error_count;
 	result["invalid_shape_count"] = invalid_shape_count;
@@ -379,11 +426,13 @@ Dictionary GodotPhysicsServer3D::get_shape_memory_links() const {
 	result["empty_backing_count"] = link_counters.empty_backing_count;
 	result["shape_count_consistent"] = shape_count_consistent;
 	result["concave_row_count_consistent"] = concave_row_count_consistent;
+	result["heightmap_row_count_consistent"] = heightmap_row_count_consistent;
+	result["row_count_consistent"] = row_count_consistent;
 	result["metadata_inventory_complete"] = metadata_inventory_complete;
 	result["owned_shapes"] = owned_shapes;
 	result["rows"] = rows;
 	result["errors"] = errors;
-	result["coverage_note"] = "Uncapped metadata-only enumeration of GodotPhysics3D shape_owner. Exactly three direct Vector rows are emitted per resolved concave-polygon shape without calling shape_get_data/get_faces or copying shape storage. Empty and untracked backings remain explicit. Native allocation coverage is never declared complete because pre-enable and excluded allocations remain possible. Result-container and RID-list diagnostic storage is excluded.";
+	result["coverage_note"] = "Uncapped metadata-only enumeration of GodotPhysics3D shape_owner. Exactly three direct Vector rows are emitted per resolved concave-polygon shape and exactly one direct heights Vector row per resolved heightmap shape without calling shape_get_data/get_faces or copying shape storage. Empty and untracked backings remain explicit. Native allocation coverage is never declared complete because pre-enable and excluded allocations remain possible. Result-container and RID-list diagnostic storage is excluded.";
 	return result;
 }
 

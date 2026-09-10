@@ -268,6 +268,7 @@ public:
 	Dictionary get_memory_info() const;
 	Dictionary _get_memory_allocation_inventory() const;
 	Dictionary _write_memory_allocation_inventory(const String &p_absolute_path) const;
+	Dictionary _write_crt_heap_inventory(const String &p_absolute_path) const;
 	Dictionary _compact_memory_allocation_tracker() const;
 	Dictionary _memory_allocation_tracker_self_check() const;
 

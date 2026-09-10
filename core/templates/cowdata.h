@@ -75,6 +75,8 @@ private:
 	static constexpr size_t CAPACITY_OFFSET = Memory::get_aligned_address(REF_COUNT_OFFSET + sizeof(SafeNumeric<USize>), alignof(USize));
 	static constexpr size_t SIZE_OFFSET = Memory::get_aligned_address(CAPACITY_OFFSET + sizeof(USize), alignof(USize));
 	static constexpr size_t DATA_OFFSET = Memory::get_aligned_address(SIZE_OFFSET + sizeof(USize), Memory::MAX_ALIGN);
+	static_assert(sizeof(SafeNumeric<USize>) == sizeof(USize));
+	static_assert(alignof(SafeNumeric<USize>) == alignof(USize));
 
 	mutable T *_ptr = nullptr;
 
@@ -177,6 +179,14 @@ public:
 	// Diagnostic only: exact Memory API user pointer, before the COW header.
 	// Never calls ptrw(), changes the reference count, or forks the backing.
 	_FORCE_INLINE_ const void *get_memory_allocation_base() const { return _ptr ? (const uint8_t *)_ptr - DATA_OFFSET : nullptr; }
+	// Diagnostic only: addresses and layout needed to copy the backing identity
+	// through an OS memory reader without racing a concurrent _ptr publication.
+	// Callers must not dereference or modify the returned storage address.
+	_FORCE_INLINE_ const void *get_memory_pointer_storage_address() const { return &_ptr; }
+	static constexpr size_t get_memory_refcount_offset() { return REF_COUNT_OFFSET; }
+	static constexpr size_t get_memory_capacity_offset() { return CAPACITY_OFFSET; }
+	static constexpr size_t get_memory_size_offset() { return SIZE_OFFSET; }
+	static constexpr size_t get_memory_data_offset() { return DATA_OFFSET; }
 
 	_FORCE_INLINE_ void clear() { _unref(); }
 	_FORCE_INLINE_ bool is_empty() const { return size() == 0; }

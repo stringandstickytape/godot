@@ -386,6 +386,7 @@ public:
 
 	static Ref<Image> create_empty(int p_width, int p_height, bool p_use_mipmaps, Format p_format);
 	static Ref<Image> create_from_data(int p_width, int p_height, bool p_use_mipmaps, Format p_format, const Vector<uint8_t> &p_data);
+	static Dictionary _write_memory_allocation_links(const String &p_absolute_path);
 	void set_data(int p_width, int p_height, bool p_use_mipmaps, Format p_format, const Vector<uint8_t> &p_data);
 
 	Image() = default; // Create an empty image.

@@ -93,6 +93,13 @@ public:
 	_FORCE_INLINE_ USize capacity() const { return _cowdata.capacity(); }
 	_FORCE_INLINE_ const void *get_memory_allocation_base() const { return _cowdata.get_memory_allocation_base(); }
 	_FORCE_INLINE_ USize get_memory_refcount() const { return _cowdata.refcount(); }
+	// Diagnostic-only source locations for OS-assisted snapshots. These expose
+	// object layout, not the current pointer value or COW header contents.
+	_FORCE_INLINE_ const void *get_memory_pointer_storage_address() const { return _cowdata.get_memory_pointer_storage_address(); }
+	static constexpr size_t get_memory_refcount_offset() { return CowData<T>::get_memory_refcount_offset(); }
+	static constexpr size_t get_memory_capacity_offset() { return CowData<T>::get_memory_capacity_offset(); }
+	static constexpr size_t get_memory_size_offset() { return CowData<T>::get_memory_size_offset(); }
+	static constexpr size_t get_memory_data_offset() { return CowData<T>::get_memory_data_offset(); }
 
 	_FORCE_INLINE_ operator Span<T>() const { return _cowdata.span(); }
 	_FORCE_INLINE_ Span<T> span() const { return _cowdata.span(); }
