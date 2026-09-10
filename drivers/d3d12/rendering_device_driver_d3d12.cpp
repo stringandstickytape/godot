@@ -56,8 +56,40 @@ using Microsoft::WRL::ComPtr;
 static SafeNumeric<uint64_t> _d3d12_resource_identity_counter{ 0 };
 static SafeNumeric<uint64_t> _d3d12_physical_memory_identity_counter{ 0 };
 static SafeNumeric<uint64_t> _d3d12_physical_memory_va_attempt_counter{ 0 };
-// Serializes native physical-memory creates across every D3D12 driver instance in this process.
+static SafeNumeric<uint64_t> _d3d12_implicit_object_identity_counter{ 0 };
+static SafeNumeric<uint64_t> _d3d12_implicit_object_va_attempt_counter{ 0 };
+// Serializes observed native creates across every D3D12 driver instance in this process.
 static BinaryMutex _d3d12_physical_memory_creation_mutex;
+static thread_local bool _d3d12_memory_creation_observation_active = false;
+
+static bool _d3d12_memory_creation_observation_lock() {
+	if (_d3d12_memory_creation_observation_active) {
+		return false;
+	}
+	_d3d12_physical_memory_creation_mutex.lock();
+	_d3d12_memory_creation_observation_active = true;
+	return true;
+}
+
+static void _d3d12_memory_creation_observation_unlock() {
+	DEV_ASSERT(_d3d12_memory_creation_observation_active);
+	_d3d12_memory_creation_observation_active = false;
+	_d3d12_physical_memory_creation_mutex.unlock();
+}
+
+static void *_d3d12_canonical_iunknown_identity(IUnknown *p_object) {
+	if (p_object == nullptr) {
+		return nullptr;
+	}
+	IUnknown *identity = nullptr;
+	const HRESULT result = p_object->QueryInterface(IID_PPV_ARGS(&identity));
+	if (FAILED(result) || identity == nullptr) {
+		return nullptr;
+	}
+	void *identity_pointer = identity;
+	identity->Release();
+	return identity_pointer;
+}
 
 struct D3D12PhysicalProcessMemoryCountersEx2 {
 	DWORD cb;
@@ -332,12 +364,17 @@ uint64_t RenderingDeviceDriverD3D12::PhysicalMemoryTracker::begin_creation(UINT 
 	if (!va_enabled) {
 		return 0;
 	}
-	_d3d12_physical_memory_creation_mutex.lock();
+	if (!_d3d12_memory_creation_observation_lock()) {
+		MutexLock lock(mutex);
+		va_pair_failure_count++;
+		va_scope_complete = false;
+		return 0;
+	}
 	if (active_va_attempt.active) {
 		MutexLock lock(mutex);
 		va_pair_failure_count++;
 		va_scope_complete = false;
-		_d3d12_physical_memory_creation_mutex.unlock();
+		_d3d12_memory_creation_observation_unlock();
 		return 0;
 	}
 	active_va_attempt = {};
@@ -370,7 +407,7 @@ void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::end_creation(uint64_t p_
 		MutexLock lock(mutex);
 		va_pair_failure_count++;
 		va_scope_complete = false;
-		_d3d12_physical_memory_creation_mutex.unlock();
+		_d3d12_memory_creation_observation_unlock();
 		return;
 	}
 	PhysicalMemoryVaScan after_scan;
@@ -431,7 +468,7 @@ void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::end_creation(uint64_t p_
 	_free_va_scan(active_va_attempt.before_scan);
 	_free_va_scan(after_scan);
 	active_va_attempt = {};
-	_d3d12_physical_memory_creation_mutex.unlock();
+	_d3d12_memory_creation_observation_unlock();
 }
 
 void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::abandon_creation(uint64_t p_token) {
@@ -711,6 +748,311 @@ void RenderingDeviceDriverD3D12::PhysicalMemoryTracker::free_snapshot(PhysicalMe
 	r_snapshot.va_intervals = nullptr;
 	r_snapshot.current_va_intervals = nullptr;
 	r_snapshot.record_count = 0;
+}
+
+RenderingDeviceDriverD3D12::ImplicitObjectTracker::~ImplicitObjectTracker() {
+	std::free(records);
+	std::free(va_observations);
+	std::free(va_intervals);
+}
+
+bool RenderingDeviceDriverD3D12::ImplicitObjectTracker::_ensure_record_capacity(uint64_t p_required) {
+	if (p_required <= record_capacity) {
+		return true;
+	}
+	uint64_t new_capacity = record_capacity == 0 ? 16 : record_capacity;
+	while (new_capacity < p_required && new_capacity <= UINT64_MAX / 2) {
+		new_capacity *= 2;
+	}
+	if (new_capacity < p_required || new_capacity > SIZE_MAX / sizeof(ImplicitDescriptorHeapRecord)) {
+		return false;
+	}
+	void *storage = std::realloc(records, static_cast<size_t>(new_capacity * sizeof(ImplicitDescriptorHeapRecord)));
+	if (storage == nullptr) {
+		return false;
+	}
+	records = static_cast<ImplicitDescriptorHeapRecord *>(storage);
+	record_capacity = new_capacity;
+	return true;
+}
+
+bool RenderingDeviceDriverD3D12::ImplicitObjectTracker::_ensure_va_observation_capacity(uint64_t p_required) {
+	if (p_required <= va_observation_capacity) {
+		return true;
+	}
+	uint64_t new_capacity = va_observation_capacity == 0 ? 16 : va_observation_capacity;
+	while (new_capacity < p_required && new_capacity <= UINT64_MAX / 2) {
+		new_capacity *= 2;
+	}
+	if (new_capacity < p_required || new_capacity > SIZE_MAX / sizeof(ImplicitDescriptorHeapVaObservation)) {
+		return false;
+	}
+	void *storage = std::realloc(va_observations, static_cast<size_t>(new_capacity * sizeof(ImplicitDescriptorHeapVaObservation)));
+	if (storage == nullptr) {
+		return false;
+	}
+	va_observations = static_cast<ImplicitDescriptorHeapVaObservation *>(storage);
+	va_observation_capacity = new_capacity;
+	return true;
+}
+
+bool RenderingDeviceDriverD3D12::ImplicitObjectTracker::_ensure_va_interval_capacity(uint64_t p_required) {
+	if (p_required <= va_interval_capacity) {
+		return true;
+	}
+	uint64_t new_capacity = va_interval_capacity == 0 ? 256 : va_interval_capacity;
+	while (new_capacity < p_required && new_capacity <= UINT64_MAX / 2) {
+		new_capacity *= 2;
+	}
+	if (new_capacity < p_required || new_capacity > SIZE_MAX / sizeof(PhysicalMemoryVaInterval)) {
+		return false;
+	}
+	void *storage = std::realloc(va_intervals, static_cast<size_t>(new_capacity * sizeof(PhysicalMemoryVaInterval)));
+	if (storage == nullptr) {
+		return false;
+	}
+	va_intervals = static_cast<PhysicalMemoryVaInterval *>(storage);
+	va_interval_capacity = new_capacity;
+	return true;
+}
+
+uint64_t RenderingDeviceDriverD3D12::ImplicitObjectTracker::_append_va_observation(const ImplicitDescriptorHeapVaObservation &p_observation,
+		const PhysicalMemoryVaScan *p_before, const PhysicalMemoryVaScan *p_after) {
+	const uint64_t before_count = p_before != nullptr ? p_before->interval_count : 0;
+	const uint64_t after_count = p_after != nullptr ? p_after->interval_count : 0;
+	if (!_ensure_va_observation_capacity(va_observation_count + 1) ||
+			before_count > UINT64_MAX - va_interval_count ||
+			after_count > UINT64_MAX - va_interval_count - before_count ||
+			!_ensure_va_interval_capacity(va_interval_count + before_count + after_count)) {
+		va_storage_failure_count++;
+		va_scope_complete = false;
+		return UINT64_MAX;
+	}
+	const uint64_t index = va_observation_count++;
+	ImplicitDescriptorHeapVaObservation &observation = va_observations[index];
+	observation = p_observation;
+	observation.before_interval_offset = va_interval_count;
+	observation.before_interval_count = before_count;
+	if (before_count > 0) {
+		memcpy(va_intervals + va_interval_count, p_before->intervals, static_cast<size_t>(before_count * sizeof(PhysicalMemoryVaInterval)));
+		va_interval_count += before_count;
+	}
+	observation.after_interval_offset = va_interval_count;
+	observation.after_interval_count = after_count;
+	if (after_count > 0) {
+		memcpy(va_intervals + va_interval_count, p_after->intervals, static_cast<size_t>(after_count * sizeof(PhysicalMemoryVaInterval)));
+		va_interval_count += after_count;
+	}
+	return index;
+}
+
+void RenderingDeviceDriverD3D12::ImplicitObjectTracker::initialize_from_environment(const void *p_owner_driver, IUnknown *p_device) {
+	MutexLock lock(mutex);
+	if (initialized) {
+		return;
+	}
+	initialized = true;
+	owner_driver = p_owner_driver;
+	wchar_t tracking_value[2] = {};
+	const DWORD tracking_length = GetEnvironmentVariableW(L"ANTHROPOLIS_D3D12_IMPLICIT_OBJECT_TRACKING", tracking_value, 2);
+	enabled = tracking_length == 1 && tracking_value[0] == L'1';
+	const bool explicitly_disabled = tracking_length == 1 && tracking_value[0] == L'0';
+	if (tracking_length > 0 && !enabled && !explicitly_disabled) {
+		initialization_failure_count++;
+		complete = false;
+	}
+	wchar_t va_families[64] = {};
+	const DWORD va_length = GetEnvironmentVariableW(L"ANTHROPOLIS_D3D12_IMPLICIT_VA_FAMILIES", va_families, 64);
+	va_requested = va_length > 0;
+	const bool descriptor_heap_va_requested = va_length < 64 && std::wcscmp(va_families, L"descriptor_heap") == 0;
+	va_enabled = enabled && descriptor_heap_va_requested;
+	if (va_requested && !descriptor_heap_va_requested) {
+		va_initialization_failure_count++;
+		va_scope_complete = false;
+	}
+	if (va_requested && !enabled) {
+		va_initialization_failure_count++;
+		va_scope_complete = false;
+	}
+	if (!enabled) {
+		return;
+	}
+	owner_device_identity = _d3d12_canonical_iunknown_identity(p_device);
+	if (owner_driver == nullptr || owner_device_identity == nullptr) {
+		canonical_identity_failure_count++;
+		complete = false;
+	}
+	tracker_start_unix_usec = PhysicalMemoryTracker::_now_unix_usec();
+	if (tracker_start_unix_usec == 0) {
+		initialization_failure_count++;
+		complete = false;
+	}
+}
+
+void RenderingDeviceDriverD3D12::ImplicitObjectTracker::begin_descriptor_heap_creation(const D3D12_DESCRIPTOR_HEAP_DESC &p_descriptor,
+		ImplicitDescriptorHeapCreationAttempt &r_attempt) {
+	r_attempt = {};
+	if (!enabled) {
+		return;
+	}
+	r_attempt.tracking_enabled = true;
+	r_attempt.token = _d3d12_implicit_object_va_attempt_counter.increment();
+	r_attempt.begin_unix_usec = PhysicalMemoryTracker::_now_unix_usec();
+	r_attempt.descriptor = p_descriptor;
+	if (!va_enabled) {
+		return;
+	}
+	if (!_d3d12_memory_creation_observation_lock()) {
+		r_attempt.nested_observation_skipped = true;
+		MutexLock lock(mutex);
+		va_nested_observation_count++;
+		va_scope_complete = false;
+		return;
+	}
+	r_attempt.observation_mutex_acquired = true;
+	r_attempt.before_scan = PhysicalMemoryTracker::_scan_private_committed_wc();
+	// Deliberately last before ID3D12Device::CreateDescriptorHeap.
+	r_attempt.before_create_counters = PhysicalMemoryTracker::_query_process_counters();
+}
+
+void RenderingDeviceDriverD3D12::ImplicitObjectTracker::end_descriptor_heap_creation(ImplicitDescriptorHeapCreationAttempt &r_attempt,
+		HRESULT p_native_result, ID3D12DescriptorHeap *p_object) {
+	if (!r_attempt.tracking_enabled) {
+		return;
+	}
+
+	PhysicalMemoryProcessCounters after_counters;
+	PhysicalMemoryVaScan after_scan;
+	if (r_attempt.observation_mutex_acquired) {
+		// Deliberately first after ID3D12Device::CreateDescriptorHeap.
+		after_counters = PhysicalMemoryTracker::_query_process_counters();
+		after_scan = PhysicalMemoryTracker::_scan_private_committed_wc();
+	}
+	const bool native_create_succeeded = SUCCEEDED(p_native_result) && p_object != nullptr;
+	void *canonical_identity = native_create_succeeded ? _d3d12_canonical_iunknown_identity(p_object) : nullptr;
+	const uint64_t generation = native_create_succeeded ? _d3d12_implicit_object_identity_counter.increment() : 0;
+	const uint64_t end_unix_usec = PhysicalMemoryTracker::_now_unix_usec();
+
+	{
+		MutexLock lock(mutex);
+		const uint64_t creation_sequence = ++total_creation_attempt_count;
+		if (native_create_succeeded) {
+			native_success_count++;
+		} else {
+			native_failure_count++;
+			if (SUCCEEDED(p_native_result) || p_object != nullptr) {
+				invalid_creation_count++;
+				complete = false;
+			}
+		}
+		if (native_create_succeeded && canonical_identity == nullptr) {
+			canonical_identity_failure_count++;
+			complete = false;
+		}
+		if (native_create_succeeded) {
+			for (uint64_t i = 0; i < record_count; i++) {
+				const ImplicitDescriptorHeapRecord &existing = records[i];
+				if (existing.native_create_succeeded && !existing.owner_reference_released &&
+						((canonical_identity != nullptr && existing.canonical_iunknown_identity == canonical_identity) || existing.native_object == p_object)) {
+					duplicate_live_identity_count++;
+					complete = false;
+					break;
+				}
+			}
+		}
+
+		ImplicitDescriptorHeapRecord record;
+		record.native_object = p_object;
+		record.canonical_iunknown_identity = canonical_identity;
+		record.owner_driver = owner_driver;
+		record.owner_device_identity = owner_device_identity;
+		record.generation = generation;
+		record.creation_sequence = creation_sequence;
+		record.creation_begin_unix_usec = r_attempt.begin_unix_usec;
+		record.creation_end_unix_usec = end_unix_usec;
+		record.native_create_result = int64_t(p_native_result);
+		record.descriptor_capacity = r_attempt.descriptor.NumDescriptors;
+		record.descriptor_heap_type = r_attempt.descriptor.Type;
+		record.descriptor_heap_flags = r_attempt.descriptor.Flags;
+		record.native_create_succeeded = native_create_succeeded;
+
+		uint64_t record_index = UINT64_MAX;
+		if (_ensure_record_capacity(record_count + 1)) {
+			record_index = record_count++;
+			records[record_index] = record;
+		} else {
+			record_storage_failure_count++;
+			complete = false;
+		}
+
+		if (va_enabled) {
+			va_attempt_count++;
+			ImplicitDescriptorHeapVaObservation observation;
+			observation.attempt_token = r_attempt.token;
+			observation.object_generation = generation;
+			observation.creation_sequence = creation_sequence;
+			observation.begin_unix_usec = r_attempt.begin_unix_usec;
+			observation.end_unix_usec = end_unix_usec;
+			observation.before_wc_bytes = r_attempt.before_scan.committed_wc_bytes;
+			observation.after_wc_bytes = after_scan.committed_wc_bytes;
+			observation.before_scan_usec = r_attempt.before_scan.elapsed_usec;
+			observation.after_scan_usec = after_scan.elapsed_usec;
+			observation.native_object = p_object;
+			observation.canonical_iunknown_identity = canonical_identity;
+			observation.native_create_result = int64_t(p_native_result);
+			observation.before_scan_error = r_attempt.before_scan.win32_error;
+			observation.after_scan_error = after_scan.win32_error;
+			observation.descriptor_capacity = r_attempt.descriptor.NumDescriptors;
+			observation.descriptor_heap_type = r_attempt.descriptor.Type;
+			observation.descriptor_heap_flags = r_attempt.descriptor.Flags;
+			observation.before_create_counters = r_attempt.before_create_counters;
+			observation.after_create_counters = after_counters;
+			observation.native_create_succeeded = native_create_succeeded;
+			observation.observation_mutex_acquired = r_attempt.observation_mutex_acquired;
+			observation.nested_observation_skipped = r_attempt.nested_observation_skipped;
+			observation.before_scan_complete = r_attempt.observation_mutex_acquired && r_attempt.before_scan.complete;
+			observation.after_scan_complete = r_attempt.observation_mutex_acquired && after_scan.complete;
+			if (r_attempt.observation_mutex_acquired) {
+				va_total_scan_usec += observation.before_scan_usec + observation.after_scan_usec;
+				va_max_scan_usec = MAX(va_max_scan_usec, MAX(observation.before_scan_usec, observation.after_scan_usec));
+				if (!observation.before_scan_complete || !observation.after_scan_complete) {
+					va_scan_failure_count++;
+					va_scope_complete = false;
+				}
+			}
+			const uint64_t observation_index = _append_va_observation(observation,
+					r_attempt.observation_mutex_acquired ? &r_attempt.before_scan : nullptr,
+					r_attempt.observation_mutex_acquired ? &after_scan : nullptr);
+			if (record_index != UINT64_MAX) {
+				records[record_index].va_observation_index = observation_index;
+			}
+		}
+	}
+
+	PhysicalMemoryTracker::_free_va_scan(r_attempt.before_scan);
+	PhysicalMemoryTracker::_free_va_scan(after_scan);
+	if (r_attempt.observation_mutex_acquired) {
+		_d3d12_memory_creation_observation_unlock();
+	}
+	r_attempt = {};
+}
+
+void RenderingDeviceDriverD3D12::ImplicitObjectTracker::record_descriptor_heap_owner_release(ID3D12DescriptorHeap *p_object) {
+	if (!enabled || p_object == nullptr) {
+		return;
+	}
+	MutexLock lock(mutex);
+	for (uint64_t i = record_count; i > 0; i--) {
+		ImplicitDescriptorHeapRecord &record = records[i - 1];
+		if (record.native_object == p_object && record.native_create_succeeded && !record.owner_reference_released) {
+			record.owner_reference_released = true;
+			record.owner_release_sequence = ++owner_release_count;
+			record.owner_release_unix_usec = PhysicalMemoryTracker::_now_unix_usec();
+			return;
+		}
+	}
+	unmatched_owner_release_count++;
+	complete = false;
 }
 
 void RenderingDeviceDriverD3D12::_physical_memory_created(UINT p_object_type, ID3D12Pageable *p_object,
@@ -1036,7 +1378,8 @@ static D3D12_GPU_DESCRIPTOR_HANDLE get_gpu_handle(D3D12_GPU_DESCRIPTOR_HANDLE p_
 	return p_handle;
 }
 
-Error RenderingDeviceDriverD3D12::DescriptorHeap::initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible) {
+Error RenderingDeviceDriverD3D12::DescriptorHeap::initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible,
+		ImplicitObjectTracker *p_implicit_object_tracker) {
 	D3D12MA::VIRTUAL_BLOCK_DESC block_desc = {};
 	block_desc.Size = p_num_descriptors;
 
@@ -1048,7 +1391,14 @@ Error RenderingDeviceDriverD3D12::DescriptorHeap::initialize(ID3D12Device *p_dev
 	heap_desc.NumDescriptors = p_num_descriptors;
 	heap_desc.Flags = p_shader_visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 
+	ImplicitDescriptorHeapCreationAttempt implicit_attempt;
+	if (p_implicit_object_tracker != nullptr) {
+		p_implicit_object_tracker->begin_descriptor_heap_creation(heap_desc, implicit_attempt);
+	}
 	hr = p_device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(heap.GetAddressOf()));
+	if (p_implicit_object_tracker != nullptr) {
+		p_implicit_object_tracker->end_descriptor_heap_creation(implicit_attempt, hr, heap.Get());
+	}
 	ERR_FAIL_COND_V_MSG(FAILED(hr), ERR_CANT_CREATE, "CreateDescriptorHeap failed with error " + vformat("0x%08ux", (uint64_t)hr) + ".");
 
 #if defined(_MSC_VER) || !defined(_WIN32)
@@ -1097,9 +1447,11 @@ void RenderingDeviceDriverD3D12::DescriptorHeap::free(const Allocation &p_alloca
 	virtual_block->FreeAllocation(virtual_alloc);
 }
 
-void RenderingDeviceDriverD3D12::CPUDescriptorHeapPool::initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type) {
+void RenderingDeviceDriverD3D12::CPUDescriptorHeapPool::initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type,
+		ImplicitObjectTracker *p_implicit_object_tracker) {
 	type = p_type;
 	increment_size = p_device->GetDescriptorHandleIncrementSize(p_type);
+	implicit_object_tracker = p_implicit_object_tracker;
 }
 
 Error RenderingDeviceDriverD3D12::CPUDescriptorHeapPool::allocate(uint32_t p_descriptor_count, ID3D12Device *p_device, Allocation &r_allocation) {
@@ -1124,7 +1476,7 @@ Error RenderingDeviceDriverD3D12::CPUDescriptorHeapPool::allocate(uint32_t p_des
 		uint32_t heap_index = heaps.size();
 
 		DescriptorHeap heap;
-		Error err = heap.initialize(p_device, type, MAX(2048u, p_descriptor_count), false);
+		Error err = heap.initialize(p_device, type, MAX(2048u, p_descriptor_count), false, implicit_object_tracker);
 		ERR_FAIL_COND_V(err != OK, err);
 
 		heaps.push_back(std::move(heap));
@@ -6780,8 +7132,9 @@ static Dictionary _d3d12ma_memory_segment_to_dictionary(const D3D12MA::DetailedS
 	return result;
 }
 
-Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes, bool p_include_va_history) {
+Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes, bool p_include_va_history, bool &r_current_wc_snapshot_available) {
 	PhysicalMemoryTrackerSnapshot snapshot = physical_memory_tracker.snapshot();
+	r_current_wc_snapshot_available = snapshot.va_enabled && snapshot.current_va_scan_complete;
 	if (snapshot.records != nullptr && snapshot.record_count > 1) {
 		std::qsort(snapshot.records, static_cast<size_t>(snapshot.record_count), sizeof(PhysicalMemoryRecord), [](const void *p_left, const void *p_right) {
 			const PhysicalMemoryRecord *left = static_cast<const PhysicalMemoryRecord *>(p_left);
@@ -7061,6 +7414,261 @@ Dictionary RenderingDeviceDriverD3D12::_get_physical_memory_diagnostics(uint64_t
 	return result;
 }
 
+static const char *_d3d12_descriptor_heap_type_name(D3D12_DESCRIPTOR_HEAP_TYPE p_type) {
+	switch (p_type) {
+		case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV:
+			return "cbv_srv_uav";
+		case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER:
+			return "sampler";
+		case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
+			return "rtv";
+		case D3D12_DESCRIPTOR_HEAP_TYPE_DSV:
+			return "dsv";
+		default:
+			return "unknown";
+	}
+}
+
+Dictionary RenderingDeviceDriverD3D12::_get_implicit_object_diagnostics(bool p_include_va_history, bool p_current_wc_snapshot_available) {
+	MutexLock lock(implicit_object_tracker.mutex);
+	auto counters_dictionary = [](const PhysicalMemoryProcessCounters &p_counters) {
+		Dictionary counters;
+		counters["available"] = p_counters.available;
+		counters["structure"] = "PROCESS_MEMORY_COUNTERS_EX2";
+		counters["structure_bytes"] = p_counters.structure_bytes;
+		counters["win32_error"] = p_counters.win32_error;
+		counters["private_usage_bytes"] = p_counters.private_usage_bytes;
+		counters["working_set_bytes"] = p_counters.working_set_bytes;
+		counters["private_working_set_bytes"] = p_counters.private_working_set_bytes;
+		counters["shared_commit_usage_bytes"] = p_counters.shared_commit_usage_bytes;
+		return counters;
+	};
+	auto interval_dictionary = [](const PhysicalMemoryVaInterval &p_interval) {
+		Dictionary interval;
+		interval["base_address"] = "0x" + String::num_uint64(p_interval.base_address, 16);
+		interval["allocation_base"] = "0x" + String::num_uint64(p_interval.allocation_base, 16);
+		interval["size_bytes"] = p_interval.size_bytes;
+		interval["state"] = p_interval.state;
+		interval["type"] = p_interval.type;
+		interval["protect"] = p_interval.protect;
+		interval["allocation_protect"] = p_interval.allocation_protect;
+		return interval;
+	};
+	auto interval_array = [&interval_dictionary](const PhysicalMemoryVaInterval *p_intervals, uint64_t p_offset, uint64_t p_count) {
+		Array intervals;
+		for (uint64_t i = 0; i < p_count; i++) {
+			intervals.push_back(interval_dictionary(p_intervals[p_offset + i]));
+		}
+		return intervals;
+	};
+	auto object_identity = [](uint64_t p_generation) {
+		return p_generation == 0 ? String() : "d3d12-implicit-descriptor-heap:" + String::num_uint64(p_generation);
+	};
+
+	Array records;
+	uint64_t owner_retained_count = 0;
+	for (uint64_t i = 0; i < implicit_object_tracker.record_count; i++) {
+		const ImplicitDescriptorHeapRecord &record = implicit_object_tracker.records[i];
+		Dictionary row;
+		row["creation_event_index"] = i;
+		row["family"] = "descriptor_heap";
+		row["implicit_object_id"] = object_identity(record.generation);
+		row["object_generation_available"] = record.generation != 0;
+		row["identity_scope"] = "process-d3d12-implicit-object-generation";
+		row["identity_stable_across_captures"] = record.generation != 0;
+		row["native_interface_id"] = _d3d12_capture_local_pointer_identity("id3d12descriptorheap", record.native_object);
+		row["canonical_iunknown_id"] = _d3d12_capture_local_pointer_identity("iunknown", record.canonical_iunknown_identity);
+		row["native_identity_scope"] = "capture-local-pointer";
+		row["owner_driver_id"] = _d3d12_capture_local_pointer_identity("rendering-device-driver-d3d12", record.owner_driver);
+		row["owner_device_id"] = _d3d12_capture_local_pointer_identity("id3d12device-iunknown", record.owner_device_identity);
+		row["creation_sequence"] = record.creation_sequence;
+		row["creation_begin_unix_usec"] = record.creation_begin_unix_usec;
+		row["creation_end_unix_usec"] = record.creation_end_unix_usec;
+		row["native_create_result"] = record.native_create_result;
+		row["native_create_succeeded"] = record.native_create_succeeded;
+		row["descriptor_heap_type"] = _d3d12_descriptor_heap_type_name(record.descriptor_heap_type);
+		row["descriptor_heap_type_value"] = int64_t(record.descriptor_heap_type);
+		row["descriptor_capacity"] = record.descriptor_capacity;
+		row["descriptor_heap_flags"] = uint64_t(record.descriptor_heap_flags);
+		row["shader_visible"] = (record.descriptor_heap_flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+		row["actual_storage_bytes_available"] = false;
+		row["owner_reference_retained"] = record.native_create_succeeded && !record.owner_reference_released;
+		row["owner_release_recorded"] = record.owner_reference_released;
+		row["owner_release_sequence"] = record.owner_release_sequence;
+		row["owner_release_unix_usec"] = record.owner_release_unix_usec;
+		row["owner_release_semantics"] = "driver_owner_reference_released; not proof_of_com_object_destruction";
+		row["va_observation_available"] = record.va_observation_index < implicit_object_tracker.va_observation_count;
+		row["va_observation_index"] = record.va_observation_index < implicit_object_tracker.va_observation_count ? int64_t(record.va_observation_index) : -1;
+		if (record.native_create_succeeded && !record.owner_reference_released) {
+			owner_retained_count++;
+		}
+		records.push_back(row);
+	}
+
+	Array va_observations;
+	if (p_include_va_history) {
+		for (uint64_t i = 0; i < implicit_object_tracker.va_observation_count; i++) {
+			const ImplicitDescriptorHeapVaObservation &observation = implicit_object_tracker.va_observations[i];
+			Dictionary row;
+			row["observation_index"] = i;
+			row["attempt_token"] = String::num_uint64(observation.attempt_token);
+			row["family"] = "descriptor_heap";
+			row["implicit_object_id"] = object_identity(observation.object_generation);
+			row["object_generation_available"] = observation.object_generation != 0;
+			row["creation_sequence"] = observation.creation_sequence;
+			row["begin_unix_usec"] = observation.begin_unix_usec;
+			row["end_unix_usec"] = observation.end_unix_usec;
+			row["native_interface_id"] = _d3d12_capture_local_pointer_identity("id3d12descriptorheap", observation.native_object);
+			row["canonical_iunknown_id"] = _d3d12_capture_local_pointer_identity("iunknown", observation.canonical_iunknown_identity);
+			row["native_identity_scope"] = "capture-local-pointer";
+			row["native_create_result"] = observation.native_create_result;
+			row["native_create_succeeded"] = observation.native_create_succeeded;
+			row["descriptor_heap_type"] = _d3d12_descriptor_heap_type_name(observation.descriptor_heap_type);
+			row["descriptor_heap_type_value"] = int64_t(observation.descriptor_heap_type);
+			row["descriptor_capacity"] = observation.descriptor_capacity;
+			row["descriptor_heap_flags"] = uint64_t(observation.descriptor_heap_flags);
+			row["actual_storage_bytes_available"] = false;
+			row["creation_window_observed"] = observation.observation_mutex_acquired;
+			row["nested_observation_skipped"] = observation.nested_observation_skipped;
+			row["before_create_process_counters"] = counters_dictionary(observation.before_create_counters);
+			row["after_create_process_counters"] = counters_dictionary(observation.after_create_counters);
+			row["before_wc_bytes"] = observation.before_wc_bytes;
+			row["after_wc_bytes"] = observation.after_wc_bytes;
+			row["wc_delta_bytes"] = int64_t(observation.after_wc_bytes) - int64_t(observation.before_wc_bytes);
+			row["before_scan_usec"] = observation.before_scan_usec;
+			row["after_scan_usec"] = observation.after_scan_usec;
+			row["before_scan_complete"] = observation.before_scan_complete;
+			row["after_scan_complete"] = observation.after_scan_complete;
+			row["before_scan_win32_error"] = observation.before_scan_error;
+			row["after_scan_win32_error"] = observation.after_scan_error;
+			row["before_wc_intervals"] = interval_array(implicit_object_tracker.va_intervals, observation.before_interval_offset, observation.before_interval_count);
+			row["after_wc_intervals"] = interval_array(implicit_object_tracker.va_intervals, observation.after_interval_offset, observation.after_interval_count);
+			va_observations.push_back(row);
+		}
+	}
+
+	Array incomplete_reasons;
+	if (!implicit_object_tracker.enabled) {
+		incomplete_reasons.push_back("tracking_disabled");
+	}
+	if (implicit_object_tracker.duplicate_live_identity_count > 0) {
+		incomplete_reasons.push_back("duplicate_live_native_identity");
+	}
+	if (implicit_object_tracker.unmatched_owner_release_count > 0) {
+		incomplete_reasons.push_back("unmatched_owner_release");
+	}
+	if (implicit_object_tracker.invalid_creation_count > 0) {
+		incomplete_reasons.push_back("invalid_creation_event");
+	}
+	if (implicit_object_tracker.canonical_identity_failure_count > 0) {
+		incomplete_reasons.push_back("canonical_iunknown_identity_unavailable");
+	}
+	if (implicit_object_tracker.record_storage_failure_count > 0) {
+		incomplete_reasons.push_back("tracker_record_storage_failure");
+	}
+	if (implicit_object_tracker.initialization_failure_count > 0) {
+		incomplete_reasons.push_back("tracker_initialization_failure");
+	}
+	Array va_incomplete_reasons;
+	if (!implicit_object_tracker.va_requested) {
+		va_incomplete_reasons.push_back("va_observation_not_requested");
+	} else if (!implicit_object_tracker.enabled) {
+		va_incomplete_reasons.push_back("implicit_object_tracking_required");
+	} else if (!implicit_object_tracker.va_enabled) {
+		va_incomplete_reasons.push_back("descriptor_heap_family_not_enabled");
+	}
+	if (implicit_object_tracker.va_nested_observation_count > 0) {
+		va_incomplete_reasons.push_back("nested_creation_observation_skipped");
+	}
+	if (implicit_object_tracker.va_initialization_failure_count > 0) {
+		va_incomplete_reasons.push_back("va_observation_initialization_failure");
+	}
+	if (implicit_object_tracker.va_scan_failure_count > 0) {
+		va_incomplete_reasons.push_back("virtual_query_scan_failure");
+	}
+	if (implicit_object_tracker.va_storage_failure_count > 0) {
+		va_incomplete_reasons.push_back("va_observation_storage_failure");
+	}
+
+	const uint64_t failure_count = implicit_object_tracker.duplicate_live_identity_count +
+			implicit_object_tracker.unmatched_owner_release_count +
+			implicit_object_tracker.invalid_creation_count +
+			implicit_object_tracker.canonical_identity_failure_count +
+			implicit_object_tracker.record_storage_failure_count +
+			implicit_object_tracker.initialization_failure_count;
+	Dictionary result;
+	result["schema_version"] = 1;
+	result["family_scope"] = "descriptor_heap_only";
+	result["enabled"] = implicit_object_tracker.enabled;
+	result["enable_environment_variable"] = "ANTHROPOLIS_D3D12_IMPLICIT_OBJECT_TRACKING";
+	result["tracking_start_scope"] = "before_descriptor_heap_initialization";
+	result["status"] = !implicit_object_tracker.enabled ? "disabled" : (implicit_object_tracker.complete ? "complete" : "incomplete");
+	result["census_complete"] = implicit_object_tracker.enabled && implicit_object_tracker.complete;
+	result["census_incomplete_reasons"] = incomplete_reasons;
+	result["rows_capped"] = false;
+	result["history_uncapped"] = true;
+	result["history_retention"] = "driver_tracker_lifetime_including_failed_creates_and_owner_release_events";
+	result["identity_scope"] = "process-d3d12-implicit-object-generation";
+	result["identity_note"] = "Generated object identities distinguish native pointer reuse and remain stable only while this process and object generation remain alive. Canonical IUnknown and owner pointers are capture-local evidence.";
+	result["canonical_identity_sampling"] = "Transient QueryInterface(IID_IUnknown) pointer sample followed immediately by Release.";
+	result["tracker_retains_com_reference"] = false;
+	result["owner_driver_id"] = _d3d12_capture_local_pointer_identity("rendering-device-driver-d3d12", implicit_object_tracker.owner_driver);
+	result["owner_device_id"] = _d3d12_capture_local_pointer_identity("id3d12device-iunknown", implicit_object_tracker.owner_device_identity);
+	result["owner_release_semantics"] = "An owner release event records this driver dropping its reference; it does not prove COM object destruction.";
+	result["native_create_result_semantics"] = "Signed HRESULT returned by ID3D12Device::CreateDescriptorHeap.";
+	result["actual_storage_bytes_available"] = false;
+	result["descriptor_capacity_semantics"] = "Descriptor capacity and handle increment are not byte size and are never summed as RAM, WC, or physical storage.";
+	result["records"] = records;
+	result["creation_event_count"] = implicit_object_tracker.total_creation_attempt_count;
+	result["exported_record_count"] = implicit_object_tracker.record_count;
+	result["native_success_count"] = implicit_object_tracker.native_success_count;
+	result["native_failure_count"] = implicit_object_tracker.native_failure_count;
+	result["owner_retained_object_count"] = owner_retained_count;
+	result["owner_release_event_count"] = implicit_object_tracker.owner_release_count;
+	result["failure_count"] = failure_count;
+	result["duplicate_live_identity_count"] = implicit_object_tracker.duplicate_live_identity_count;
+	result["unmatched_owner_release_count"] = implicit_object_tracker.unmatched_owner_release_count;
+	result["invalid_creation_count"] = implicit_object_tracker.invalid_creation_count;
+	result["canonical_identity_failure_count"] = implicit_object_tracker.canonical_identity_failure_count;
+	result["record_storage_failure_count"] = implicit_object_tracker.record_storage_failure_count;
+	result["initialization_failure_count"] = implicit_object_tracker.initialization_failure_count;
+	result["tracker_start_unix_usec"] = implicit_object_tracker.tracker_start_unix_usec;
+	result["record_storage_capacity"] = implicit_object_tracker.record_capacity;
+	result["va_observation_storage_capacity"] = implicit_object_tracker.va_observation_capacity;
+	result["va_interval_storage_capacity"] = implicit_object_tracker.va_interval_capacity;
+	result["record_storage_bytes"] = implicit_object_tracker.record_capacity * sizeof(ImplicitDescriptorHeapRecord);
+	result["va_observation_storage_bytes"] = implicit_object_tracker.va_observation_capacity * sizeof(ImplicitDescriptorHeapVaObservation);
+	result["va_interval_storage_bytes"] = implicit_object_tracker.va_interval_capacity * sizeof(PhysicalMemoryVaInterval);
+	result["tracker_storage_bytes"] = sizeof(ImplicitObjectTracker) +
+			implicit_object_tracker.record_capacity * sizeof(ImplicitDescriptorHeapRecord) +
+			implicit_object_tracker.va_observation_capacity * sizeof(ImplicitDescriptorHeapVaObservation) +
+			implicit_object_tracker.va_interval_capacity * sizeof(PhysicalMemoryVaInterval);
+	result["observer_self_storage_semantics"] = "CPU-side tracker object plus allocated retained record and VirtualQuery interval capacities; excludes temporary before/after scan buffers, export Dictionary/Array containers, and descriptor-heap implementation storage.";
+	result["va_observation_requested"] = implicit_object_tracker.va_requested;
+	result["va_observation_enabled"] = implicit_object_tracker.va_enabled;
+	result["va_observation_enable_environment_variable"] = "ANTHROPOLIS_D3D12_IMPLICIT_VA_FAMILIES=descriptor_heap";
+	result["va_observation_scope_complete"] = implicit_object_tracker.va_enabled && implicit_object_tracker.va_scope_complete;
+	result["va_observation_incomplete_reasons"] = va_incomplete_reasons;
+	result["va_association_semantics"] = "temporal_native_create_window_only";
+	result["va_current_wc_snapshot_available"] = p_current_wc_snapshot_available;
+	result["va_current_wc_snapshot_source"] = p_current_wc_snapshot_available ? "physical_memory_tracking.current_private_wc_snapshot" : "";
+	result["va_current_wc_snapshot_unavailable_reason"] = p_current_wc_snapshot_available ? "" : (!physical_memory_tracker.va_enabled ? "physical_va_observation_disabled" : "current_physical_wc_scan_incomplete");
+	result["va_concurrency_note"] = "Observed descriptor-heap creates share the process-global D3D12 creation-observation guard. Other process threads and deferred driver work can still change virtual memory.";
+	result["va_attempt_count"] = implicit_object_tracker.va_attempt_count;
+	result["va_initialization_failure_count"] = implicit_object_tracker.va_initialization_failure_count;
+	result["va_nested_observation_count"] = implicit_object_tracker.va_nested_observation_count;
+	result["va_scan_failure_count"] = implicit_object_tracker.va_scan_failure_count;
+	result["va_storage_failure_count"] = implicit_object_tracker.va_storage_failure_count;
+	result["va_total_scan_usec"] = implicit_object_tracker.va_total_scan_usec;
+	result["va_max_scan_usec"] = implicit_object_tracker.va_max_scan_usec;
+	result["va_collected_observation_count"] = implicit_object_tracker.va_observation_count;
+	result["va_exported_observation_count"] = p_include_va_history ? implicit_object_tracker.va_observation_count : 0;
+	result["va_interval_record_count"] = implicit_object_tracker.va_interval_count;
+	result["va_history_included"] = p_include_va_history;
+	result["va_observations"] = va_observations;
+	return result;
+}
+
 Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics(bool p_include_va_history) {
 	D3D12MA::TotalStatistics statistics = {};
 	allocator->CalculateStatistics(&statistics);
@@ -7087,7 +7695,9 @@ Dictionary RenderingDeviceDriverD3D12::get_memory_diagnostics(bool p_include_va_
 	result["total"] = _d3d12ma_detailed_statistics_to_dictionary(statistics.Total);
 	result["heap_types"] = heap_types;
 	result["memory_segments"] = memory_segments;
-	result["physical_memory_tracking"] = _get_physical_memory_diagnostics(statistics.Total.Stats.BlockCount, statistics.Total.Stats.BlockBytes, p_include_va_history);
+	bool current_wc_snapshot_available = false;
+	result["physical_memory_tracking"] = _get_physical_memory_diagnostics(statistics.Total.Stats.BlockCount, statistics.Total.Stats.BlockBytes, p_include_va_history, current_wc_snapshot_available);
+	result["implicit_object_tracking"] = _get_implicit_object_diagnostics(p_include_va_history, current_wc_snapshot_available);
 	return result;
 }
 
@@ -7249,12 +7859,30 @@ RenderingDeviceDriverD3D12::~RenderingDeviceDriverD3D12() {
 			resource_descriptor_heap.free(alloc);
 		}
 	}
-
 	if (D3D12Hooks::get_singleton() != nullptr) {
 		D3D12Hooks::get_singleton()->cleanup_device();
 	}
 
 	glsl_type_singleton_decref();
+
+	// Keep the default-off destruction order unchanged. In the opt-in path, record each
+	// driver-owned reference drop only after the driver's existing cleanup is complete.
+	if (implicit_object_tracker.enabled) {
+		auto release_descriptor_heap_owner_reference = [this](DescriptorHeap &p_heap) {
+			if (p_heap.heap != nullptr) {
+				implicit_object_tracker.record_descriptor_heap_owner_release(p_heap.heap.Get());
+				p_heap.heap.Reset();
+			}
+		};
+		release_descriptor_heap_owner_reference(resource_descriptor_heap);
+		release_descriptor_heap_owner_reference(sampler_descriptor_heap);
+		CPUDescriptorHeapPool *descriptor_heap_pools[] = { &resource_descriptor_heap_pool, &rtv_descriptor_heap_pool, &dsv_descriptor_heap_pool };
+		for (CPUDescriptorHeapPool *pool : descriptor_heap_pools) {
+			for (DescriptorHeap &heap : pool->heaps) {
+				release_descriptor_heap_owner_reference(heap);
+			}
+		}
+	}
 }
 
 bool RenderingDeviceDriverD3D12::is_in_developer_mode() {
@@ -7603,6 +8231,7 @@ Error RenderingDeviceDriverD3D12::_get_device_limits() {
 }
 
 Error RenderingDeviceDriverD3D12::_initialize_allocator() {
+	implicit_object_tracker.initialize_from_environment(this, device.Get());
 	physical_memory_tracker.initialize_from_environment();
 	D3D12MA::PHYSICAL_MEMORY_CALLBACKS physical_memory_callbacks = {};
 	if (physical_memory_tracker.enabled) {
@@ -7655,15 +8284,15 @@ Error RenderingDeviceDriverD3D12::_initialize_frames(uint32_t p_frame_count) {
 	uint32_t num_resource_descriptors = GLOBAL_GET("rendering/rendering_device/d3d12/max_resource_descriptors");
 	uint32_t num_sampler_descriptors = GLOBAL_GET("rendering/rendering_device/d3d12/max_sampler_descriptors");
 
-	Error err = resource_descriptor_heap.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, num_resource_descriptors, true);
+	Error err = resource_descriptor_heap.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, num_resource_descriptors, true, &implicit_object_tracker);
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 
-	err = sampler_descriptor_heap.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, num_sampler_descriptors, true);
+	err = sampler_descriptor_heap.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, num_sampler_descriptors, true, &implicit_object_tracker);
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 
-	resource_descriptor_heap_pool.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	rtv_descriptor_heap_pool.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-	dsv_descriptor_heap_pool.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+	resource_descriptor_heap_pool.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, &implicit_object_tracker);
+	rtv_descriptor_heap_pool.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, &implicit_object_tracker);
+	dsv_descriptor_heap_pool.initialize(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, &implicit_object_tracker);
 
 	err = rtv_descriptor_heap_pool.allocate(1, device.Get(), null_rtv_alloc);
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);

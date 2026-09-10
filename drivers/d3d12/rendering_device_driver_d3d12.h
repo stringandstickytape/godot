@@ -129,6 +129,8 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	String pipeline_cache_id;
 	D3D12_HEAP_TYPE dynamic_persistent_upload_heap = D3D12_HEAP_TYPE_UPLOAD;
 
+	struct ImplicitObjectTracker;
+
 	struct DescriptorHeap {
 		struct Allocation {
 			uint64_t virtual_alloc_handle = {}; // This is the handle value in "D3D12MA::VirtualAllocation".
@@ -143,7 +145,7 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 
 		Microsoft::WRL::ComPtr<D3D12MA::VirtualBlock> virtual_block;
 
-		Error initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible);
+		Error initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, uint32_t p_num_descriptors, bool p_shader_visible, ImplicitObjectTracker *p_implicit_object_tracker);
 
 		Error allocate(uint32_t p_descriptor_count, Allocation &r_allocation);
 		void free(const Allocation &p_allocation);
@@ -157,11 +159,12 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 
 		BinaryMutex mutex;
 		LocalVector<DescriptorHeap> heaps;
+		ImplicitObjectTracker *implicit_object_tracker = nullptr;
 
 		D3D12_DESCRIPTOR_HEAP_TYPE type = {};
 		uint32_t increment_size = 0;
 
-		void initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type);
+		void initialize(ID3D12Device *p_device, D3D12_DESCRIPTOR_HEAP_TYPE p_type, ImplicitObjectTracker *p_implicit_object_tracker);
 
 		Error allocate(uint32_t p_descriptor_count, ID3D12Device *p_device, Allocation &r_allocation);
 		void free(const Allocation &p_allocation);
@@ -419,7 +422,120 @@ private:
 		static void free_snapshot(PhysicalMemoryTrackerSnapshot &r_snapshot);
 	};
 
+	struct ImplicitDescriptorHeapRecord {
+		void *native_object = nullptr;
+		void *canonical_iunknown_identity = nullptr;
+		const void *owner_driver = nullptr;
+		void *owner_device_identity = nullptr;
+		uint64_t generation = 0;
+		uint64_t creation_sequence = 0;
+		uint64_t creation_begin_unix_usec = 0;
+		uint64_t creation_end_unix_usec = 0;
+		uint64_t owner_release_sequence = 0;
+		uint64_t owner_release_unix_usec = 0;
+		uint64_t va_observation_index = UINT64_MAX;
+		int64_t native_create_result = 0;
+		uint32_t descriptor_capacity = 0;
+		D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		D3D12_DESCRIPTOR_HEAP_FLAGS descriptor_heap_flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		bool native_create_succeeded = false;
+		bool owner_reference_released = false;
+	};
+
+	struct ImplicitDescriptorHeapVaObservation {
+		uint64_t attempt_token = 0;
+		uint64_t object_generation = 0;
+		uint64_t creation_sequence = 0;
+		uint64_t begin_unix_usec = 0;
+		uint64_t end_unix_usec = 0;
+		uint64_t before_interval_offset = 0;
+		uint64_t before_interval_count = 0;
+		uint64_t after_interval_offset = 0;
+		uint64_t after_interval_count = 0;
+		uint64_t before_wc_bytes = 0;
+		uint64_t after_wc_bytes = 0;
+		uint64_t before_scan_usec = 0;
+		uint64_t after_scan_usec = 0;
+		void *native_object = nullptr;
+		void *canonical_iunknown_identity = nullptr;
+		int64_t native_create_result = 0;
+		uint32_t before_scan_error = 0;
+		uint32_t after_scan_error = 0;
+		uint32_t descriptor_capacity = 0;
+		D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		D3D12_DESCRIPTOR_HEAP_FLAGS descriptor_heap_flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		PhysicalMemoryProcessCounters before_create_counters;
+		PhysicalMemoryProcessCounters after_create_counters;
+		bool native_create_succeeded = false;
+		bool observation_mutex_acquired = false;
+		bool nested_observation_skipped = false;
+		bool before_scan_complete = false;
+		bool after_scan_complete = false;
+	};
+
+	struct ImplicitDescriptorHeapCreationAttempt {
+		uint64_t token = 0;
+		uint64_t begin_unix_usec = 0;
+		D3D12_DESCRIPTOR_HEAP_DESC descriptor = {};
+		PhysicalMemoryProcessCounters before_create_counters;
+		PhysicalMemoryVaScan before_scan;
+		bool tracking_enabled = false;
+		bool observation_mutex_acquired = false;
+		bool nested_observation_skipped = false;
+	};
+
+	struct ImplicitObjectTracker {
+		BinaryMutex mutex;
+		ImplicitDescriptorHeapRecord *records = nullptr;
+		uint64_t record_count = 0;
+		uint64_t record_capacity = 0;
+		ImplicitDescriptorHeapVaObservation *va_observations = nullptr;
+		uint64_t va_observation_count = 0;
+		uint64_t va_observation_capacity = 0;
+		PhysicalMemoryVaInterval *va_intervals = nullptr;
+		uint64_t va_interval_count = 0;
+		uint64_t va_interval_capacity = 0;
+		const void *owner_driver = nullptr;
+		void *owner_device_identity = nullptr;
+		uint64_t tracker_start_unix_usec = 0;
+		uint64_t total_creation_attempt_count = 0;
+		uint64_t native_success_count = 0;
+		uint64_t native_failure_count = 0;
+		uint64_t owner_release_count = 0;
+		uint64_t duplicate_live_identity_count = 0;
+		uint64_t unmatched_owner_release_count = 0;
+		uint64_t invalid_creation_count = 0;
+		uint64_t canonical_identity_failure_count = 0;
+		uint64_t record_storage_failure_count = 0;
+		uint64_t initialization_failure_count = 0;
+		uint64_t va_attempt_count = 0;
+		uint64_t va_initialization_failure_count = 0;
+		uint64_t va_nested_observation_count = 0;
+		uint64_t va_scan_failure_count = 0;
+		uint64_t va_storage_failure_count = 0;
+		uint64_t va_total_scan_usec = 0;
+		uint64_t va_max_scan_usec = 0;
+		bool initialized = false;
+		bool enabled = false;
+		bool va_requested = false;
+		bool va_enabled = false;
+		bool complete = true;
+		bool va_scope_complete = true;
+
+		bool _ensure_record_capacity(uint64_t p_required);
+		bool _ensure_va_observation_capacity(uint64_t p_required);
+		bool _ensure_va_interval_capacity(uint64_t p_required);
+		uint64_t _append_va_observation(const ImplicitDescriptorHeapVaObservation &p_observation, const PhysicalMemoryVaScan *p_before, const PhysicalMemoryVaScan *p_after);
+
+		~ImplicitObjectTracker();
+		void initialize_from_environment(const void *p_owner_driver, IUnknown *p_device);
+		void begin_descriptor_heap_creation(const D3D12_DESCRIPTOR_HEAP_DESC &p_descriptor, ImplicitDescriptorHeapCreationAttempt &r_attempt);
+		void end_descriptor_heap_creation(ImplicitDescriptorHeapCreationAttempt &r_attempt, HRESULT p_native_result, ID3D12DescriptorHeap *p_object);
+		void record_descriptor_heap_owner_release(ID3D12DescriptorHeap *p_object);
+	};
+
 	PhysicalMemoryTracker physical_memory_tracker;
+	ImplicitObjectTracker implicit_object_tracker;
 	Microsoft::WRL::ComPtr<D3D12MA::Allocator> allocator;
 
 	static void _physical_memory_created(UINT p_object_type, ID3D12Pageable *p_object, const D3D12_HEAP_PROPERTIES *p_heap_properties, D3D12_HEAP_FLAGS p_heap_flags, UINT64 p_size, void *p_private_data);
@@ -428,7 +544,8 @@ private:
 	static void _physical_memory_creation_end(UINT64 p_token, HRESULT p_native_result, ID3D12Pageable *p_object, void *p_private_data);
 	static void _physical_memory_creation_abandoned(UINT64 p_token, void *p_private_data);
 	void _add_physical_memory_identity(Dictionary &r_result, ID3D12Resource *p_resource, D3D12MA::Allocation *p_allocation);
-	Dictionary _get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes, bool p_include_va_history);
+	Dictionary _get_physical_memory_diagnostics(uint64_t p_d3d12ma_block_count, uint64_t p_d3d12ma_block_bytes, bool p_include_va_history, bool &r_current_wc_snapshot_available);
+	Dictionary _get_implicit_object_diagnostics(bool p_include_va_history, bool p_current_wc_snapshot_available);
 
 	/******************/
 	/**** RESOURCE ****/
