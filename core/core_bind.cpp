@@ -824,8 +824,8 @@ Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path)
 	const CharString main_image_path_json = ::OS::get_singleton()->get_executable_path().json_escape().utf8();
 	uint64_t output_bytes = 0;
 	int line_length = snprintf(line, LINE_CAPACITY,
-			"{\"record_type\":\"metadata\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"snapshot_copy_atomic\":true,\"cross_inventory_join_non_atomic\":true,\"inventory_capped\":false,\"tracker_inventory_complete\":%s,\"enabled\":%s,\"enable_requested\":%s,\"enable_failed\":%s,\"pre_enable_allocations_unknown\":true,\"process_allocation_coverage_complete\":false,\"active_requested_bytes\":%llu,\"active_raw_requested_bytes\":%llu,\"active_allocator_usable_bytes\":%llu,\"allocation_count\":%llu,\"reallocation_count\":%llu,\"failed_reallocation_count\":%llu,\"failed_reallocation_without_record_count\":%llu,\"free_count\":%llu,\"free_without_record_count\":%llu,\"adopted_reallocation_count\":%llu,\"duplicate_active_address_count\":%llu,\"dropped_record_count\":%llu,\"snapshot_failure_count\":%llu,\"instrumentation_failure_count\":%llu,\"tracker_storage_current_requested_bytes\":%llu,\"tracker_storage_peak_requested_bytes\":%llu,\"snapshot_copy_bytes\":%llu,\"allocator_usable_bytes_supported\":%s,\"caller_pc_requested\":%s,\"caller_pc_enabled\":%s,\"caller_pc_supported\":%s,\"caller_pc_requires_allocation_tracking\":true,\"caller_pc_identity_scope\":\"process-absolute-return-address\",\"caller_pc_values_are_raw_return_addresses\":true,\"caller_pc_symbolication_adjustment_bytes\":-1,\"caller_pc_capture_mode\":\"single-return-address-no-unwind\",\"caller_pc_fields_storage_bytes_per_record\":%llu,\"main_image_metadata_available\":%s,\"main_image_base\":\"0x%llx\",\"main_image_size_bytes\":%llu,\"main_image_size_source\":\"PE-OptionalHeader-SizeOfImage-on-Windows\",\"main_image_path\":\"%s\"}\n",
-			static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), stats.inventory_complete ? "true" : "false", stats.enabled ? "true" : "false", stats.enable_requested ? "true" : "false", stats.enable_failed ? "true" : "false", static_cast<unsigned long long>(stats.active_requested_bytes), static_cast<unsigned long long>(stats.active_raw_requested_bytes), static_cast<unsigned long long>(stats.active_allocator_usable_bytes), static_cast<unsigned long long>(stats.allocation_count), static_cast<unsigned long long>(stats.reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_without_record_count), static_cast<unsigned long long>(stats.free_count), static_cast<unsigned long long>(stats.free_without_record_count), static_cast<unsigned long long>(stats.adopted_reallocation_count), static_cast<unsigned long long>(stats.duplicate_active_address_count), static_cast<unsigned long long>(stats.dropped_record_count), static_cast<unsigned long long>(stats.snapshot_failure_count), static_cast<unsigned long long>(stats.instrumentation_failure_count), static_cast<unsigned long long>(stats.tracker_storage_current_bytes), static_cast<unsigned long long>(stats.tracker_storage_peak_bytes), static_cast<unsigned long long>(stats.snapshot_copy_bytes), stats.allocator_usable_bytes_supported ? "true" : "false", stats.caller_pc_requested ? "true" : "false", stats.caller_pc_enabled ? "true" : "false", stats.caller_pc_supported ? "true" : "false", static_cast<unsigned long long>(sizeof(uintptr_t) * 2), main_image.available ? "true" : "false", static_cast<unsigned long long>(main_image.base), static_cast<unsigned long long>(main_image.size_bytes), main_image_path_json.get_data());
+			"{\"record_type\":\"metadata\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"snapshot_copy_atomic\":true,\"cross_inventory_join_non_atomic\":true,\"inventory_capped\":false,\"tracker_inventory_complete\":%s,\"enabled\":%s,\"enable_requested\":%s,\"enable_failed\":%s,\"pre_enable_allocations_unknown\":true,\"process_allocation_coverage_complete\":false,\"active_allocation_count\":%llu,\"peak_active_allocation_count\":%llu,\"active_requested_bytes\":%llu,\"active_raw_requested_bytes\":%llu,\"active_allocator_usable_bytes\":%llu,\"allocation_count\":%llu,\"reallocation_count\":%llu,\"failed_reallocation_count\":%llu,\"failed_reallocation_without_record_count\":%llu,\"free_count\":%llu,\"free_without_record_count\":%llu,\"adopted_reallocation_count\":%llu,\"duplicate_active_address_count\":%llu,\"dropped_record_count\":%llu,\"snapshot_failure_count\":%llu,\"instrumentation_failure_count\":%llu,\"table_slot_count\":%llu,\"table_tombstone_count\":%llu,\"tracker_storage_current_requested_bytes\":%llu,\"tracker_storage_peak_requested_bytes\":%llu,\"snapshot_copy_bytes\":%llu,\"allocator_usable_bytes_supported\":%s,\"caller_pc_requested\":%s,\"caller_pc_enabled\":%s,\"caller_pc_supported\":%s,\"caller_pc_requires_allocation_tracking\":true,\"caller_pc_identity_scope\":\"process-absolute-return-address\",\"caller_pc_values_are_raw_return_addresses\":true,\"caller_pc_symbolication_adjustment_bytes\":-1,\"caller_pc_capture_mode\":\"single-return-address-no-unwind\",\"caller_pc_fields_storage_bytes_per_record\":%llu,\"main_image_metadata_available\":%s,\"main_image_base\":\"0x%llx\",\"main_image_size_bytes\":%llu,\"main_image_size_source\":\"PE-OptionalHeader-SizeOfImage-on-Windows\",\"main_image_path\":\"%s\"}\n",
+			static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), stats.inventory_complete ? "true" : "false", stats.enabled ? "true" : "false", stats.enable_requested ? "true" : "false", stats.enable_failed ? "true" : "false", static_cast<unsigned long long>(stats.active_allocation_count), static_cast<unsigned long long>(stats.peak_active_allocation_count), static_cast<unsigned long long>(stats.active_requested_bytes), static_cast<unsigned long long>(stats.active_raw_requested_bytes), static_cast<unsigned long long>(stats.active_allocator_usable_bytes), static_cast<unsigned long long>(stats.allocation_count), static_cast<unsigned long long>(stats.reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_count), static_cast<unsigned long long>(stats.failed_reallocation_without_record_count), static_cast<unsigned long long>(stats.free_count), static_cast<unsigned long long>(stats.free_without_record_count), static_cast<unsigned long long>(stats.adopted_reallocation_count), static_cast<unsigned long long>(stats.duplicate_active_address_count), static_cast<unsigned long long>(stats.dropped_record_count), static_cast<unsigned long long>(stats.snapshot_failure_count), static_cast<unsigned long long>(stats.instrumentation_failure_count), static_cast<unsigned long long>(stats.table_slot_count), static_cast<unsigned long long>(stats.table_tombstone_count), static_cast<unsigned long long>(stats.tracker_storage_current_bytes), static_cast<unsigned long long>(stats.tracker_storage_peak_bytes), static_cast<unsigned long long>(stats.snapshot_copy_bytes), stats.allocator_usable_bytes_supported ? "true" : "false", stats.caller_pc_requested ? "true" : "false", stats.caller_pc_enabled ? "true" : "false", stats.caller_pc_supported ? "true" : "false", static_cast<unsigned long long>(sizeof(uintptr_t) * 2), main_image.available ? "true" : "false", static_cast<unsigned long long>(main_image.base), static_cast<unsigned long long>(main_image.size_bytes), main_image_path_json.get_data());
 	bool stream_ok = line_length >= 0 && line_length < LINE_CAPACITY && _store_memory_inventory_line(file, line, line_length, output_bytes);
 	uint64_t records_written = 0;
 	for (uint64_t i = 0; i < snapshot.record_count && stream_ok; i++) {
@@ -844,8 +844,8 @@ Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path)
 
 	if (stream_ok) {
 		line_length = snprintf(line, LINE_CAPACITY,
-				"{\"record_type\":\"receipt\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"records_written\":%llu,\"enabled\":true,\"stream_complete\":true,\"tracker_inventory_complete\":%s}\n",
-				static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), static_cast<unsigned long long>(records_written), stats.inventory_complete ? "true" : "false");
+				"{\"record_type\":\"receipt\",\"schema_version\":1,\"format\":\"anthropolis-native-memory-allocation-jsonl-v1\",\"identity_scope\":\"process-memory-allocation-generation\",\"process_id\":%llu,\"tracker_start_unix_usec\":%llu,\"snapshot_sequence\":%llu,\"expected_record_count\":%llu,\"records_written\":%llu,\"enabled\":true,\"stream_complete\":true,\"tracker_inventory_complete\":%s,\"active_allocation_count\":%llu,\"peak_active_allocation_count\":%llu,\"table_slot_count\":%llu,\"table_tombstone_count\":%llu,\"tracker_storage_current_requested_bytes\":%llu,\"tracker_storage_peak_requested_bytes\":%llu}\n",
+				static_cast<unsigned long long>(process_id), static_cast<unsigned long long>(stats.tracker_start_unix_usec), static_cast<unsigned long long>(stats.snapshot_sequence), static_cast<unsigned long long>(snapshot.record_count), static_cast<unsigned long long>(records_written), stats.inventory_complete ? "true" : "false", static_cast<unsigned long long>(stats.active_allocation_count), static_cast<unsigned long long>(stats.peak_active_allocation_count), static_cast<unsigned long long>(stats.table_slot_count), static_cast<unsigned long long>(stats.table_tombstone_count), static_cast<unsigned long long>(stats.tracker_storage_current_bytes), static_cast<unsigned long long>(stats.tracker_storage_peak_bytes));
 		stream_ok = line_length >= 0 && line_length < LINE_CAPACITY && records_written == snapshot.record_count && _store_memory_inventory_line(file, line, line_length, output_bytes);
 	}
 	if (stream_ok) {
@@ -877,12 +877,92 @@ Dictionary OS::_write_memory_allocation_inventory(const String &p_absolute_path)
 	tracker_statistics["duplicate_active_address_count"] = stats.duplicate_active_address_count;
 	tracker_statistics["snapshot_failure_count"] = stats.snapshot_failure_count;
 	tracker_statistics["snapshot_copy_bytes"] = stats.snapshot_copy_bytes;
+	tracker_statistics["active_allocation_count"] = stats.active_allocation_count;
+	tracker_statistics["peak_active_allocation_count"] = stats.peak_active_allocation_count;
+	tracker_statistics["table_slot_count"] = stats.table_slot_count;
+	tracker_statistics["table_tombstone_count"] = stats.table_tombstone_count;
 	tracker_statistics["tracker_storage_current_requested_bytes"] = stats.tracker_storage_current_bytes;
 	tracker_statistics["tracker_storage_peak_requested_bytes"] = stats.tracker_storage_peak_bytes;
 	result["tracker_statistics"] = tracker_statistics;
 	if (!stream_ok) {
 		result["error"] = "The allocation inventory stream failed or a fixed-format line exceeded its checked buffer. The partial file has no guaranteed valid final receipt and must be rejected.";
 	}
+	return result;
+}
+
+static Dictionary _memory_tracker_compaction_statistics(const MemoryTracker::Statistics &p_statistics) {
+	Dictionary result;
+	result["snapshot_sequence"] = p_statistics.snapshot_sequence;
+	result["active_allocation_count"] = p_statistics.active_allocation_count;
+	result["peak_active_allocation_count"] = p_statistics.peak_active_allocation_count;
+	result["active_requested_bytes"] = p_statistics.active_requested_bytes;
+	result["active_raw_requested_bytes"] = p_statistics.active_raw_requested_bytes;
+	result["active_allocator_usable_bytes"] = p_statistics.active_allocator_usable_bytes;
+	result["allocation_count"] = p_statistics.allocation_count;
+	result["reallocation_count"] = p_statistics.reallocation_count;
+	result["failed_reallocation_count"] = p_statistics.failed_reallocation_count;
+	result["failed_reallocation_without_record_count"] = p_statistics.failed_reallocation_without_record_count;
+	result["free_count"] = p_statistics.free_count;
+	result["free_without_record_count"] = p_statistics.free_without_record_count;
+	result["adopted_reallocation_count"] = p_statistics.adopted_reallocation_count;
+	result["duplicate_active_address_count"] = p_statistics.duplicate_active_address_count;
+	result["dropped_record_count"] = p_statistics.dropped_record_count;
+	result["snapshot_failure_count"] = p_statistics.snapshot_failure_count;
+	result["instrumentation_failure_count"] = p_statistics.instrumentation_failure_count;
+	result["table_slot_count"] = p_statistics.table_slot_count;
+	result["table_tombstone_count"] = p_statistics.table_tombstone_count;
+	result["tracker_storage_current_requested_bytes"] = p_statistics.tracker_storage_current_bytes;
+	result["tracker_storage_peak_requested_bytes"] = p_statistics.tracker_storage_peak_bytes;
+	result["inventory_complete_for_enabled_memory_api_window"] = p_statistics.inventory_complete;
+	return result;
+}
+
+Dictionary OS::_compact_memory_allocation_tracker() const {
+	MemoryTracker::CompactionResult compact;
+	MemoryTracker::compact_storage(compact);
+
+	Dictionary result;
+	result["schema_version"] = 1;
+	result["success"] = compact.success;
+	result["enabled"] = compact.enabled;
+	result["attempted"] = compact.attempted;
+	result["no_op"] = compact.no_op;
+	result["storage_shrunk"] = compact.storage_shrunk;
+	result["status"] = !compact.enabled ? "disabled" : compact.no_op ? "no_op_already_compact" : !compact.attempted ? "capacity_calculation_failed" : compact.success ? "compacted" : "rehash_failed";
+	result["target_slot_count"] = compact.target_slot_count;
+	result["planned_transient_storage_requested_bytes"] = compact.planned_transient_storage_bytes;
+	result["elapsed_usec"] = compact.elapsed_usec;
+	result["before"] = _memory_tracker_compaction_statistics(compact.before);
+	result["after"] = _memory_tracker_compaction_statistics(compact.after);
+	result["reclaimed_tracker_storage_requested_bytes"] = compact.before.tracker_storage_current_bytes >= compact.after.tracker_storage_current_bytes ? compact.before.tracker_storage_current_bytes - compact.after.tracker_storage_current_bytes : uint64_t(0);
+	result["removed_tombstone_count"] = compact.before.table_tombstone_count >= compact.after.table_tombstone_count ? compact.before.table_tombstone_count - compact.after.table_tombstone_count : uint64_t(0);
+	const bool counters_preserved = compact.before.snapshot_sequence == compact.after.snapshot_sequence &&
+			compact.before.active_allocation_count == compact.after.active_allocation_count &&
+			compact.before.peak_active_allocation_count == compact.after.peak_active_allocation_count &&
+			compact.before.active_requested_bytes == compact.after.active_requested_bytes &&
+			compact.before.active_raw_requested_bytes == compact.after.active_raw_requested_bytes &&
+			compact.before.active_allocator_usable_bytes == compact.after.active_allocator_usable_bytes &&
+			compact.before.peak_active_requested_bytes == compact.after.peak_active_requested_bytes &&
+			compact.before.peak_active_raw_requested_bytes == compact.after.peak_active_raw_requested_bytes &&
+			compact.before.peak_active_allocator_usable_bytes == compact.after.peak_active_allocator_usable_bytes &&
+			compact.before.allocation_count == compact.after.allocation_count &&
+			compact.before.reallocation_count == compact.after.reallocation_count &&
+			compact.before.failed_reallocation_count == compact.after.failed_reallocation_count &&
+			compact.before.failed_reallocation_without_record_count == compact.after.failed_reallocation_without_record_count &&
+			compact.before.free_count == compact.after.free_count &&
+			compact.before.free_without_record_count == compact.after.free_without_record_count &&
+			compact.before.adopted_reallocation_count == compact.after.adopted_reallocation_count &&
+			compact.before.duplicate_active_address_count == compact.after.duplicate_active_address_count &&
+			compact.before.dropped_record_count == compact.after.dropped_record_count &&
+			compact.before.snapshot_failure_count == compact.after.snapshot_failure_count &&
+			compact.before.instrumentation_failure_count == compact.after.instrumentation_failure_count &&
+			compact.before.inventory_complete == compact.after.inventory_complete;
+	result["allocation_counters_preserved"] = counters_preserved;
+	result["identity_preserved"] = true;
+	result["identity_note"] = "Structural guarantee: compaction copies every live AllocationRecord verbatim. Allocation IDs, allocation/resize sequences, addresses, sizes, origins, and caller PCs are unchanged.";
+	result["counter_note"] = "Allocation, reallocation, free, sequence, aggregate live-byte, failure, and inventory-completeness counters are unchanged. Storage capacity, tombstones, and possibly the historical storage peak are the only tracker statistics affected.";
+	result["transient_storage_note"] = "The planned transient value is exact on a successful rehash: the old and replacement slot arrays coexist until all live records have been copied. A calloc failure can fail before reaching that value.";
+	result["failure_note"] = "A failed compaction leaves the original table and live inventory valid; it does not increment allocation-inventory instrumentation failures.";
 	return result;
 }
 
@@ -1123,6 +1203,7 @@ void OS::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_memory_info"), &OS::get_memory_info);
 	ClassDB::bind_method(D_METHOD("_get_memory_allocation_inventory"), &OS::_get_memory_allocation_inventory);
 	ClassDB::bind_method(D_METHOD("_write_memory_allocation_inventory", "absolute_path"), &OS::_write_memory_allocation_inventory);
+	ClassDB::bind_method(D_METHOD("_compact_memory_allocation_tracker"), &OS::_compact_memory_allocation_tracker);
 	ClassDB::bind_method(D_METHOD("_memory_allocation_tracker_self_check"), &OS::_memory_allocation_tracker_self_check);
 
 	ClassDB::bind_method(D_METHOD("move_to_trash", "path"), &OS::move_to_trash);

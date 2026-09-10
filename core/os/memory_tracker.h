@@ -107,6 +107,19 @@ struct Snapshot {
 	Statistics statistics;
 };
 
+struct CompactionResult {
+	Statistics before;
+	Statistics after;
+	uint64_t target_slot_count = 0;
+	uint64_t planned_transient_storage_bytes = 0;
+	uint64_t elapsed_usec = 0;
+	bool enabled = false;
+	bool attempted = false;
+	bool success = false;
+	bool no_op = false;
+	bool storage_shrunk = false;
+};
+
 struct ReallocationTransaction {
 	uintptr_t old_user_base = 0;
 	bool active = false;
@@ -156,6 +169,12 @@ uint64_t get_tracker_start_unix_usec();
 bool get_statistics(Statistics &r_statistics);
 bool capture_snapshot(Snapshot &r_snapshot);
 void release_snapshot(Snapshot &r_snapshot);
+
+// Explicit diagnostic operation. Rebuilds the table at the smallest power-of-two
+// capacity that keeps the current live set plus one insertion within the normal
+// 70% load limit.
+// Never called from allocation/free/snapshot paths.
+bool compact_storage(CompactionResult &r_result);
 
 // Exercises the CRT-backed table without touching the live tracker.
 SelfCheckResult run_self_check();

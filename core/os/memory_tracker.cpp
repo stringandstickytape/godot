@@ -152,6 +152,50 @@ static uint64_t _tracker_storage_bytes(const TrackerState &p_state) {
 	return sizeof(TrackerState) + p_state.slot_count * sizeof(Slot);
 }
 
+static size_t _maximum_active_for_slot_count(size_t p_slot_count) {
+	// floor(slot_count * 7 / 10), evaluated without overflowing the multiply.
+	return (p_slot_count / MAX_OCCUPANCY_DENOMINATOR) * MAX_OCCUPANCY_NUMERATOR +
+			((p_slot_count % MAX_OCCUPANCY_DENOMINATOR) * MAX_OCCUPANCY_NUMERATOR) / MAX_OCCUPANCY_DENOMINATOR;
+}
+
+static bool _smallest_compact_slot_count(size_t p_active_count, size_t &r_slot_count) {
+	if (p_active_count == SIZE_MAX) {
+		return false;
+	}
+	const size_t required_active_capacity = p_active_count + 1;
+	size_t slot_count = INITIAL_SLOT_COUNT;
+	while (required_active_capacity > _maximum_active_for_slot_count(slot_count)) {
+		if (slot_count > SIZE_MAX / 2) {
+			return false;
+		}
+		slot_count *= 2;
+		if (slot_count > SIZE_MAX / sizeof(Slot)) {
+			return false;
+		}
+	}
+	r_slot_count = slot_count;
+	return true;
+}
+
+static bool _combined_tracker_storage_bytes(size_t p_first_slot_count, size_t p_second_slot_count, uint64_t &r_bytes) {
+	if (p_first_slot_count > SIZE_MAX - p_second_slot_count) {
+		return false;
+	}
+	const size_t combined_slot_count = p_first_slot_count + p_second_slot_count;
+	if (combined_slot_count > (UINT64_MAX - sizeof(TrackerState)) / sizeof(Slot)) {
+		return false;
+	}
+	r_bytes = sizeof(TrackerState) + static_cast<uint64_t>(combined_slot_count) * sizeof(Slot);
+	return true;
+}
+
+static Statistics _statistics_locked(const TrackerState &p_state) {
+	Statistics statistics = p_state.statistics;
+	statistics.snapshot_sequence = p_state.sequence;
+	statistics.inventory_complete = p_state.statistics.instrumentation_failure_count == 0;
+	return statistics;
+}
+
 static void _update_tracker_storage_statistics(TrackerState &r_state) {
 	r_state.statistics.table_slot_count = r_state.slot_count;
 	r_state.statistics.table_tombstone_count = r_state.tombstone_count;
@@ -621,6 +665,62 @@ bool capture_snapshot(Snapshot &r_snapshot) {
 void release_snapshot(Snapshot &r_snapshot) {
 	free(r_snapshot.records);
 	r_snapshot = Snapshot{};
+}
+
+bool compact_storage(CompactionResult &r_result) {
+	r_result = CompactionResult{};
+	const auto started = std::chrono::steady_clock::now();
+	if (!is_enabled()) {
+		r_result.before.enable_requested = enable_requested.load(std::memory_order_acquire);
+		r_result.before.enable_failed = enable_failed.load(std::memory_order_acquire);
+		r_result.before.inventory_complete = false;
+		r_result.after = r_result.before;
+		r_result.success = true;
+		r_result.no_op = true;
+		r_result.elapsed_usec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+		return true;
+	}
+
+	ScopedSuppression suppression;
+	TrackerState &state = *tracker_state;
+	std::lock_guard<std::mutex> lock(state.mutex);
+	r_result.enabled = true;
+	r_result.before = _statistics_locked(state);
+
+	size_t target_slot_count = 0;
+	if (!_smallest_compact_slot_count(state.active_count, target_slot_count)) {
+		r_result.after = _statistics_locked(state);
+		r_result.elapsed_usec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+		return false;
+	}
+	r_result.target_slot_count = target_slot_count;
+
+	if (target_slot_count == state.slot_count) {
+		r_result.success = true;
+		r_result.no_op = true;
+		r_result.after = _statistics_locked(state);
+		r_result.elapsed_usec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+		return true;
+	}
+
+	if (!_combined_tracker_storage_bytes(state.slot_count, target_slot_count, r_result.planned_transient_storage_bytes)) {
+		r_result.after = _statistics_locked(state);
+		r_result.elapsed_usec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+		return false;
+	}
+	r_result.attempted = true;
+	const size_t previous_slot_count = state.slot_count;
+	if (!_rehash(state, target_slot_count)) {
+		r_result.after = _statistics_locked(state);
+		r_result.elapsed_usec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+		return false;
+	}
+
+	r_result.success = true;
+	r_result.storage_shrunk = state.slot_count < previous_slot_count;
+	r_result.after = _statistics_locked(state);
+	r_result.elapsed_usec = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+	return true;
 }
 
 SelfCheckResult run_self_check() {
