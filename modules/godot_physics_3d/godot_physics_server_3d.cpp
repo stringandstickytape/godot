@@ -39,7 +39,129 @@
 #include "joints/godot_slider_joint_3d.h"
 
 #include "core/debugger/engine_debugger.h"
+#include "core/os/memory_tracker.h"
 #include "core/os/os.h"
+#include "core/os/time.h"
+
+namespace {
+
+struct ShapeMemoryLinkCounters {
+	uint64_t allocation_lookup_attempt_count = 0;
+	uint64_t allocation_lookup_success_count = 0;
+	uint64_t allocation_lookup_unavailable_count = 0;
+	uint64_t empty_backing_count = 0;
+};
+
+String _shape_memory_address(const void *p_pointer) {
+	return "0x" + String::num_uint64(uint64_t(uintptr_t(p_pointer)), 16);
+}
+
+String _shape_type_name(PhysicsServer3D::ShapeType p_type) {
+	switch (p_type) {
+		case PhysicsServer3D::SHAPE_WORLD_BOUNDARY:
+			return "world_boundary";
+		case PhysicsServer3D::SHAPE_SEPARATION_RAY:
+			return "separation_ray";
+		case PhysicsServer3D::SHAPE_SPHERE:
+			return "sphere";
+		case PhysicsServer3D::SHAPE_BOX:
+			return "box";
+		case PhysicsServer3D::SHAPE_CAPSULE:
+			return "capsule";
+		case PhysicsServer3D::SHAPE_CYLINDER:
+			return "cylinder";
+		case PhysicsServer3D::SHAPE_CONVEX_POLYGON:
+			return "convex_polygon";
+		case PhysicsServer3D::SHAPE_CONCAVE_POLYGON:
+			return "concave_polygon";
+		case PhysicsServer3D::SHAPE_HEIGHTMAP:
+			return "heightmap";
+		case PhysicsServer3D::SHAPE_SOFT_BODY:
+			return "soft_body";
+		case PhysicsServer3D::SHAPE_CUSTOM:
+			return "custom";
+	}
+	return "unknown";
+}
+
+template <typename T>
+Dictionary _shape_vector_cpu_backing(const Vector<T> &p_vector, bool p_tracker_inventory_complete, ShapeMemoryLinkCounters &r_counters) {
+	const void *user_base = p_vector.get_memory_allocation_base();
+	const void *data_address = p_vector.ptr();
+	const uint64_t logical_bytes = uint64_t(p_vector.size()) * sizeof(T);
+	const uint64_t capacity_bytes = uint64_t(p_vector.capacity()) * sizeof(T);
+	MemoryTracker::AllocationRecord allocation;
+	const bool allocation_available = user_base != nullptr && MemoryTracker::query_allocation(user_base, allocation);
+
+	Dictionary result;
+	result["tracking_enabled"] = MemoryTracker::is_enabled();
+	result["tracker_start_unix_usec"] = MemoryTracker::get_tracker_start_unix_usec();
+	result["tracker_inventory_complete_for_enabled_memory_api_window"] = p_tracker_inventory_complete;
+	result["native_allocation_coverage_complete"] = false;
+	result["has_backing"] = user_base != nullptr;
+	result["allocation_available"] = allocation_available;
+	result["user_base"] = _shape_memory_address(user_base);
+	result["data_address"] = _shape_memory_address(data_address);
+	result["logical_bytes"] = logical_bytes;
+	result["container_capacity_bytes"] = capacity_bytes;
+	result["container_slack_bytes"] = capacity_bytes - logical_bytes;
+	result["shared_cow"] = true;
+	result["cow_refcount_observed"] = uint64_t(p_vector.get_memory_refcount());
+
+	if (user_base == nullptr) {
+		r_counters.empty_backing_count++;
+		result["unavailable_reason"] = "Container has no backing allocation.";
+		return result;
+	}
+
+	r_counters.allocation_lookup_attempt_count++;
+	if (!allocation_available) {
+		r_counters.allocation_lookup_unavailable_count++;
+		result["unavailable_reason"] = MemoryTracker::is_enabled() ? "Backing allocation is absent from the current tracker inventory; it may predate tracking or be excluded/incomplete. No identity inferred." : "Native allocation tracking is disabled. No identity inferred.";
+		return result;
+	}
+
+	r_counters.allocation_lookup_success_count++;
+	result["allocation_id"] = "memory-allocation:" + String::num_uint64(allocation.allocation_id);
+	result["identity_scope"] = "process-memory-allocation-generation";
+	result["requested_bytes"] = allocation.requested_bytes;
+	result["raw_requested_bytes"] = allocation.raw_requested_bytes;
+	result["raw_base"] = _shape_memory_address((const void *)allocation.raw_base);
+	result["allocator_usable_bytes_available"] = allocation.allocator_usable_bytes_available;
+	result["allocator_usable_bytes"] = allocation.allocator_usable_bytes;
+	result["created_sequence"] = allocation.created_sequence;
+	result["last_resize_sequence"] = allocation.last_resize_sequence;
+	result["origin"] = allocation.origin == MemoryTracker::AllocationOrigin::ALLOCATION ? "allocation" : "reallocation_of_pre_enable_allocation";
+	result["origin_caller_pc_available"] = allocation.origin_caller_pc != 0;
+	result["origin_caller_pc"] = _shape_memory_address((const void *)allocation.origin_caller_pc);
+	result["latest_successful_reallocation_caller_pc_available"] = allocation.last_reallocation_caller_pc != 0;
+	result["latest_successful_reallocation_caller_pc"] = _shape_memory_address((const void *)allocation.last_reallocation_caller_pc);
+	result["aligned"] = allocation.aligned;
+	result["prepad"] = allocation.prepad;
+	result["initial_allocation_zeroed"] = allocation.zeroed;
+	result["alignment_bytes"] = allocation.alignment;
+	return result;
+}
+
+template <typename T>
+void _append_shape_vector_row(Array &r_rows, const String &p_shape_rid, const String &p_logical_parent_key, const char *p_role, const char *p_element_type, const Vector<T> &p_vector, bool p_tracker_inventory_complete, ShapeMemoryLinkCounters &r_counters) {
+	Dictionary row;
+	row["shape_rid"] = p_shape_rid;
+	row["shape_type"] = int(PhysicsServer3D::SHAPE_CONCAVE_POLYGON);
+	row["shape_type_name"] = "concave_polygon";
+	row["logical_parent_key"] = p_logical_parent_key;
+	row["role"] = p_role;
+	row["element_type"] = p_element_type;
+	row["element_size_bytes"] = uint64_t(sizeof(T));
+	row["size_elements"] = uint64_t(p_vector.size());
+	row["capacity_elements"] = uint64_t(p_vector.capacity());
+	row["logical_bytes"] = uint64_t(p_vector.size()) * sizeof(T);
+	row["capacity_bytes"] = uint64_t(p_vector.capacity()) * sizeof(T);
+	row["cpu_backing"] = _shape_vector_cpu_backing(p_vector, p_tracker_inventory_complete, r_counters);
+	r_rows.push_back(row);
+}
+
+} // namespace
 
 #define FLUSH_QUERY_CHECK(m_object) \
 	ERR_FAIL_COND_MSG(m_object->get_space() && flushing_queries, "Can't change this state while flushing queries. Use call_deferred() or set_deferred() to change monitoring state instead.");
@@ -125,6 +247,144 @@ Variant GodotPhysicsServer3D::shape_get_data(RID p_shape) const {
 	ERR_FAIL_NULL_V(shape, Variant());
 	ERR_FAIL_COND_V(!shape->is_configured(), Variant());
 	return shape->get_data();
+}
+
+Dictionary GodotPhysicsServer3D::get_shape_memory_links() const {
+	const uint64_t capture_started_ticks_usec = OS::get_singleton()->get_ticks_usec();
+	const uint64_t capture_started_unix_usec = static_cast<uint64_t>(Time::get_singleton()->get_unix_time_from_system() * 1000000.0);
+	MemoryTracker::Statistics tracker_before;
+	MemoryTracker::get_statistics(tracker_before);
+
+	const uint64_t shape_owner_rid_count = shape_owner.get_rid_count();
+	const LocalVector<RID> owned_shape_rids = shape_owner.get_owned_list();
+	Array owned_shapes;
+	Array rows;
+	Array errors;
+	uint64_t lookup_error_count = 0;
+	uint64_t invalid_shape_count = 0;
+	uint64_t concave_shape_count = 0;
+	ShapeMemoryLinkCounters link_counters;
+
+	for (const RID &shape_rid : owned_shape_rids) {
+		const String shape_rid_string = String::num_uint64(shape_rid.get_id());
+		const String logical_parent_key = "physics-shape-3d/" + shape_rid_string;
+		const GodotShape3D *shape = shape_owner.get_or_null(shape_rid);
+		Dictionary shape_info;
+		shape_info["shape_rid"] = shape_rid_string;
+		shape_info["logical_parent_key"] = logical_parent_key;
+		shape_info["lookup_available"] = shape != nullptr;
+		if (shape == nullptr) {
+			lookup_error_count++;
+			shape_info["shape_type_available"] = false;
+			shape_info["shape_type"] = -1;
+			shape_info["shape_type_name"] = "unknown";
+			shape_info["error"] = "shape_owner.get_owned_list() returned a RID which shape_owner.get_or_null() could not resolve.";
+			owned_shapes.push_back(shape_info);
+			Dictionary error;
+			error["code"] = "shape_owner_lookup_failed";
+			error["shape_rid"] = shape_rid_string;
+			error["logical_parent_key"] = logical_parent_key;
+			error["message"] = shape_info["error"];
+			errors.push_back(error);
+			continue;
+		}
+
+		const ShapeType shape_type = shape->get_type();
+		shape_info["shape_type_available"] = true;
+		shape_info["shape_type"] = int(shape_type);
+		shape_info["shape_type_name"] = _shape_type_name(shape_type);
+		shape_info["configured"] = shape->is_configured();
+		shape_info["is_concave"] = shape->is_concave();
+		shape_info["aabb_position"] = shape->get_aabb().position;
+		shape_info["aabb_size"] = shape->get_aabb().size;
+
+		if (shape_type == SHAPE_CONCAVE_POLYGON) {
+			concave_shape_count++;
+			const GodotConcavePolygonShape3D *concave = static_cast<const GodotConcavePolygonShape3D *>(shape);
+			const uint64_t face_count = uint64_t(concave->faces.size());
+			const uint64_t vertex_count = uint64_t(concave->vertices.size());
+			const uint64_t bvh_count = uint64_t(concave->bvh.size());
+			const uint64_t expected_vertex_count = face_count * 3;
+			const uint64_t expected_bvh_count = face_count == 0 ? 0 : face_count * 2;
+			const bool vertex_count_consistent = vertex_count == expected_vertex_count;
+			const bool bvh_count_consistent = bvh_count == expected_bvh_count;
+			shape_info["face_count"] = face_count;
+			shape_info["vertex_count"] = vertex_count;
+			shape_info["bvh_storage_node_count"] = bvh_count;
+			shape_info["expected_vertex_count"] = expected_vertex_count;
+			shape_info["expected_bvh_storage_node_count"] = expected_bvh_count;
+			shape_info["vertex_count_consistent"] = vertex_count_consistent;
+			shape_info["bvh_count_consistent"] = bvh_count_consistent;
+			shape_info["storage_counts_consistent"] = vertex_count_consistent && bvh_count_consistent;
+
+			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, "faces", "GodotConcavePolygonShape3D::Face", concave->faces, tracker_before.inventory_complete, link_counters);
+			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, "vertices", "Vector3", concave->vertices, tracker_before.inventory_complete, link_counters);
+			_append_shape_vector_row(rows, shape_rid_string, logical_parent_key, "bvh", "GodotConcavePolygonShape3D::BVH", concave->bvh, tracker_before.inventory_complete, link_counters);
+
+			if (!vertex_count_consistent || !bvh_count_consistent) {
+				invalid_shape_count++;
+				Dictionary error;
+				error["code"] = "concave_storage_count_mismatch";
+				error["shape_rid"] = shape_rid_string;
+				error["logical_parent_key"] = logical_parent_key;
+				error["face_count"] = face_count;
+				error["vertex_count"] = vertex_count;
+				error["bvh_storage_node_count"] = bvh_count;
+				error["expected_vertex_count"] = expected_vertex_count;
+				error["expected_bvh_storage_node_count"] = expected_bvh_count;
+				error["message"] = "Concave shape storage counts differ from the current _setup layout; all observed rows are retained.";
+				errors.push_back(error);
+			}
+		}
+		owned_shapes.push_back(shape_info);
+	}
+
+	const bool shape_count_consistent = shape_owner_rid_count == uint64_t(owned_shape_rids.size()) && uint64_t(owned_shapes.size()) == uint64_t(owned_shape_rids.size());
+	const bool concave_row_count_consistent = uint64_t(rows.size()) == concave_shape_count * 3;
+	const bool metadata_inventory_complete = shape_count_consistent && concave_row_count_consistent && lookup_error_count == 0 && invalid_shape_count == 0;
+	MemoryTracker::Statistics tracker_after;
+	MemoryTracker::get_statistics(tracker_after);
+	const uint64_t capture_finished_unix_usec = static_cast<uint64_t>(Time::get_singleton()->get_unix_time_from_system() * 1000000.0);
+	const uint64_t capture_finished_ticks_usec = OS::get_singleton()->get_ticks_usec();
+
+	Dictionary result;
+	result["schema_version"] = 1;
+	result["format"] = "anthropolis-physics-shape-memory-links-v1";
+	result["supported"] = true;
+	result["backend"] = "GodotPhysics3D";
+	result["process_id"] = uint64_t(OS::get_singleton()->get_process_id());
+	result["capture_started_unix_usec"] = capture_started_unix_usec;
+	result["capture_finished_unix_usec"] = capture_finished_unix_usec;
+	result["capture_started_ticks_usec"] = capture_started_ticks_usec;
+	result["capture_finished_ticks_usec"] = capture_finished_ticks_usec;
+	result["tracker_start_unix_usec"] = tracker_before.tracker_start_unix_usec;
+	result["snapshot_sequence_before"] = tracker_before.snapshot_sequence;
+	result["snapshot_sequence_after"] = tracker_after.snapshot_sequence;
+	result["native_allocation_tracking_enabled"] = tracker_before.enabled && tracker_after.enabled;
+	result["native_allocation_inventory_complete_for_enabled_memory_api_window"] = tracker_before.inventory_complete && tracker_after.inventory_complete;
+	result["native_allocation_coverage_complete"] = false;
+	result["allocation_lookup_complete_for_backed_vectors"] = tracker_before.enabled && tracker_after.enabled && tracker_before.inventory_complete && tracker_after.inventory_complete && link_counters.allocation_lookup_attempt_count == link_counters.allocation_lookup_success_count;
+	result["inventory_capped"] = false;
+	result["cross_inventory_join_non_atomic"] = true;
+	result["shape_owner_rid_count"] = shape_owner_rid_count;
+	result["owned_shape_count"] = uint64_t(owned_shapes.size());
+	result["concave_shape_count"] = concave_shape_count;
+	result["row_count"] = uint64_t(rows.size());
+	result["lookup_error_count"] = lookup_error_count;
+	result["invalid_shape_count"] = invalid_shape_count;
+	result["error_count"] = lookup_error_count + invalid_shape_count;
+	result["allocation_lookup_attempt_count"] = link_counters.allocation_lookup_attempt_count;
+	result["allocation_lookup_success_count"] = link_counters.allocation_lookup_success_count;
+	result["allocation_lookup_unavailable_count"] = link_counters.allocation_lookup_unavailable_count;
+	result["empty_backing_count"] = link_counters.empty_backing_count;
+	result["shape_count_consistent"] = shape_count_consistent;
+	result["concave_row_count_consistent"] = concave_row_count_consistent;
+	result["metadata_inventory_complete"] = metadata_inventory_complete;
+	result["owned_shapes"] = owned_shapes;
+	result["rows"] = rows;
+	result["errors"] = errors;
+	result["coverage_note"] = "Uncapped metadata-only enumeration of GodotPhysics3D shape_owner. Exactly three direct Vector rows are emitted per resolved concave-polygon shape without calling shape_get_data/get_faces or copying shape storage. Empty and untracked backings remain explicit. Native allocation coverage is never declared complete because pre-enable and excluded allocations remain possible. Result-container and RID-list diagnostic storage is excluded.";
+	return result;
 }
 
 void GodotPhysicsServer3D::shape_set_margin(RID p_shape, real_t p_margin) {

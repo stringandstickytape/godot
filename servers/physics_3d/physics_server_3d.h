@@ -278,6 +278,7 @@ public:
 
 	virtual ShapeType shape_get_type(RID p_shape) const = 0;
 	virtual Variant shape_get_data(RID p_shape) const = 0;
+	virtual Dictionary get_shape_memory_links() const;
 
 	virtual void shape_set_margin(RID p_shape, real_t p_margin) = 0;
 	virtual real_t shape_get_margin(RID p_shape) const = 0;

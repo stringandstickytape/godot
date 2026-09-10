@@ -100,6 +100,7 @@ public:
 
 	FUNC1RC(ShapeType, shape_get_type, RID);
 	FUNC1RC(Variant, shape_get_data, RID);
+	FUNC0RC(Dictionary, get_shape_memory_links);
 	FUNC1RC(real_t, shape_get_custom_solver_bias, RID);
 #if 0
 	//these work well, but should be used from the main thread only

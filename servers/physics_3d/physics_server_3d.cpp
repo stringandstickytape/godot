@@ -32,6 +32,9 @@
 
 #include "core/config/project_settings.h"
 #include "core/object/class_db.h"
+#include "core/os/memory_tracker.h"
+#include "core/os/os.h"
+#include "core/os/time.h"
 #include "core/variant/typed_array.h"
 
 void PhysicsServer3DRenderingServerHandler::set_vertex(int p_vertex_id, const Vector3 &p_vertex) {
@@ -55,6 +58,65 @@ void PhysicsServer3DRenderingServerHandler::_bind_methods() {
 }
 
 PhysicsServer3D *PhysicsServer3D::singleton = nullptr;
+
+static uint64_t _physics_shape_memory_capture_unix_usec() {
+	return static_cast<uint64_t>(Time::get_singleton()->get_unix_time_from_system() * 1000000.0);
+}
+
+Dictionary PhysicsServer3D::get_shape_memory_links() const {
+	const uint64_t capture_started_ticks_usec = OS::get_singleton()->get_ticks_usec();
+	const uint64_t capture_started_unix_usec = _physics_shape_memory_capture_unix_usec();
+	MemoryTracker::Statistics before;
+	MemoryTracker::get_statistics(before);
+
+	Array errors;
+	Dictionary error;
+	error["code"] = "unsupported_backend";
+	error["message"] = "This PhysicsServer3D backend does not expose direct shape storage ownership metadata.";
+	errors.push_back(error);
+
+	MemoryTracker::Statistics after;
+	MemoryTracker::get_statistics(after);
+	Dictionary result;
+	result["schema_version"] = 1;
+	result["format"] = "anthropolis-physics-shape-memory-links-v1";
+	result["supported"] = false;
+	result["backend"] = String(get_class());
+	result["process_id"] = uint64_t(OS::get_singleton()->get_process_id());
+	result["capture_started_unix_usec"] = capture_started_unix_usec;
+	result["capture_finished_unix_usec"] = _physics_shape_memory_capture_unix_usec();
+	result["capture_started_ticks_usec"] = capture_started_ticks_usec;
+	result["capture_finished_ticks_usec"] = OS::get_singleton()->get_ticks_usec();
+	result["tracker_start_unix_usec"] = MemoryTracker::get_tracker_start_unix_usec();
+	result["snapshot_sequence_before"] = before.snapshot_sequence;
+	result["snapshot_sequence_after"] = after.snapshot_sequence;
+	result["native_allocation_tracking_enabled"] = before.enabled && after.enabled;
+	result["native_allocation_inventory_complete_for_enabled_memory_api_window"] = before.inventory_complete && after.inventory_complete;
+	result["native_allocation_coverage_complete"] = false;
+	result["allocation_lookup_complete_for_backed_vectors"] = false;
+	result["inventory_capped"] = false;
+	result["cross_inventory_join_non_atomic"] = true;
+	result["shape_owner_rid_count"] = uint64_t(0);
+	result["owned_shape_count"] = uint64_t(0);
+	result["concave_shape_count"] = uint64_t(0);
+	result["row_count"] = uint64_t(0);
+	result["lookup_error_count"] = uint64_t(0);
+	result["invalid_shape_count"] = uint64_t(0);
+	result["error_count"] = uint64_t(1);
+	result["allocation_lookup_attempt_count"] = uint64_t(0);
+	result["allocation_lookup_success_count"] = uint64_t(0);
+	result["allocation_lookup_unavailable_count"] = uint64_t(0);
+	result["empty_backing_count"] = uint64_t(0);
+	result["shape_count_consistent"] = true;
+	result["concave_row_count_consistent"] = true;
+	result["metadata_inventory_complete"] = false;
+	result["owned_shapes"] = Array();
+	result["rows"] = Array();
+	result["errors"] = errors;
+	result["unsupported_reason"] = "Backend has not implemented get_shape_memory_links().";
+	result["coverage_note"] = "Unsupported backend: no shape storage was enumerated and no native allocation identities were inferred.";
+	return result;
+}
 
 void PhysicsDirectBodyState3D::integrate_forces() {
 	real_t step = get_step();
@@ -714,6 +776,7 @@ void PhysicsServer3D::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("shape_get_type", "shape"), &PhysicsServer3D::shape_get_type);
 	ClassDB::bind_method(D_METHOD("shape_get_data", "shape"), &PhysicsServer3D::shape_get_data);
+	ClassDB::bind_method(D_METHOD("_get_shape_memory_links"), &PhysicsServer3D::get_shape_memory_links);
 	ClassDB::bind_method(D_METHOD("shape_get_margin", "shape"), &PhysicsServer3D::shape_get_margin);
 
 	ClassDB::bind_method(D_METHOD("space_create"), &PhysicsServer3D::space_create);
