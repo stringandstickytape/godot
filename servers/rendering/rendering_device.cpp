@@ -7408,7 +7408,9 @@ void RenderingDevice::_free_transfer_workers() {
 	for (uint32_t i = 0; i < transfer_worker_pool_size; i++) {
 		TransferWorker *worker = transfer_worker_pool[i];
 		driver->fence_free(worker->command_fence);
-		driver->buffer_free(worker->staging_buffer);
+		if (worker->staging_buffer) {
+			driver->buffer_free(worker->staging_buffer);
+		}
 		driver->command_pool_free(worker->command_pool);
 		memdelete(worker);
 	}
@@ -8296,6 +8298,128 @@ Dictionary RenderingDevice::get_memory_diagnostics() {
 		result["rd_texture_census_bytes_including_pending"] = active_texture_bytes + active_fallback_texture_bytes + pending_texture_bytes;
 		result["rd_texture_census_minus_accounted_bytes"] = int64_t(active_texture_bytes + active_fallback_texture_bytes + pending_texture_bytes) - int64_t(texture_memory);
 	}
+	return result;
+}
+
+Dictionary RenderingDevice::trim_transfer_worker_staging() {
+	ERR_RENDER_THREAD_GUARD_V(Dictionary());
+
+	Dictionary result;
+	result["trim_succeeded"] = false;
+	result["worker_count"] = 0;
+	result["recording_workers_submitted"] = 0;
+	result["already_submitted_workers"] = 0;
+	result["waited_workers"] = 0;
+	result["requested_free_bytes"] = uint64_t(0);
+	result["capacity_bytes_before"] = uint64_t(0);
+	result["capacity_bytes_after"] = uint64_t(0);
+
+	enum InvalidWorkerState {
+		INVALID_WORKER_NONE,
+		INVALID_WORKER_BUFFER_CAPACITY,
+		INVALID_WORKER_USED_CAPACITY,
+		INVALID_WORKER_RECORDING_AND_SUBMITTED,
+		INVALID_WORKER_IDLE_WITH_USED_BYTES,
+	};
+	InvalidWorkerState invalid_state = INVALID_WORKER_NONE;
+	uint32_t invalid_worker = 0;
+
+	uint32_t recording_workers_submitted = 0;
+	uint32_t already_submitted_workers = 0;
+	uint32_t waited_workers = 0;
+	uint64_t requested_free_bytes = 0;
+	uint64_t capacity_bytes_before = 0;
+
+	{
+		// Keep the same pool -> worker lock order as acquisition and submission. Once
+		// the pool is held, a caller that was already using a worker can release its
+		// worker mutex before waiting to return the index to the available list.
+		MutexLock pool_lock(transfer_worker_pool_mutex);
+		result["worker_count"] = transfer_worker_pool_size;
+
+		// Validate every worker before changing any of them. Releasing a worker lock
+		// between these passes is safe while the pool lock excludes acquisition and
+		// submission; it also avoids a partial trim on contradictory state.
+		for (uint32_t i = 0; i < transfer_worker_pool_size; i++) {
+			TransferWorker *worker = transfer_worker_pool[i];
+			MutexLock worker_lock(worker->thread_mutex);
+			const bool has_buffer = bool(worker->staging_buffer);
+			if (has_buffer != (worker->staging_buffer_size_allocated != 0)) {
+				invalid_state = INVALID_WORKER_BUFFER_CAPACITY;
+				invalid_worker = i;
+				break;
+			}
+			if (worker->staging_buffer_size_in_use > worker->staging_buffer_size_allocated) {
+				invalid_state = INVALID_WORKER_USED_CAPACITY;
+				invalid_worker = i;
+				break;
+			}
+			if (worker->recording && worker->submitted) {
+				invalid_state = INVALID_WORKER_RECORDING_AND_SUBMITTED;
+				invalid_worker = i;
+				break;
+			}
+			if (!worker->recording && !worker->submitted && worker->staging_buffer_size_in_use != 0) {
+				invalid_state = INVALID_WORKER_IDLE_WITH_USED_BYTES;
+				invalid_worker = i;
+				break;
+			}
+		}
+
+		if (invalid_state == INVALID_WORKER_NONE) {
+			for (uint32_t i = 0; i < transfer_worker_pool_size; i++) {
+				TransferWorker *worker = transfer_worker_pool[i];
+				MutexLock worker_lock(worker->thread_mutex);
+				capacity_bytes_before += worker->staging_buffer_size_allocated;
+				const bool was_submitted = worker->submitted;
+
+				if (worker->recording) {
+					_end_transfer_worker(worker);
+					_submit_transfer_worker(worker);
+					recording_workers_submitted++;
+				}
+				if (was_submitted) {
+					already_submitted_workers++;
+				}
+				if (worker->submitted) {
+					_wait_for_transfer_worker(worker);
+					waited_workers++;
+				}
+
+				if (worker->staging_buffer) {
+					requested_free_bytes += driver->buffer_get_allocation_size(worker->staging_buffer);
+					driver->buffer_free(worker->staging_buffer);
+					worker->staging_buffer = RDD::BufferID();
+				}
+				worker->staging_buffer_size_allocated = 0;
+				worker->staging_buffer_size_in_use = 0;
+				worker->max_transfer_size = 0;
+			}
+		}
+	}
+
+	if (invalid_state != INVALID_WORKER_NONE) {
+		static const char *invalid_state_names[] = {
+			"none",
+			"buffer handle and capacity disagree",
+			"used bytes exceed capacity",
+			"worker is both recording and submitted",
+			"idle worker retains used bytes",
+		};
+		const String error = vformat("Transfer worker %d has contradictory state: %s.", invalid_worker, invalid_state_names[invalid_state]);
+		result["error"] = error;
+		ERR_PRINT(error);
+		return result;
+	}
+
+	result["trim_succeeded"] = true;
+	result["recording_workers_submitted"] = recording_workers_submitted;
+	result["already_submitted_workers"] = already_submitted_workers;
+	result["waited_workers"] = waited_workers;
+	result["requested_free_bytes"] = requested_free_bytes;
+	result["capacity_bytes_before"] = capacity_bytes_before;
+	result["capacity_bytes_after"] = uint64_t(0);
+	result["note"] = "Requested free bytes describe resources passed to the driver for release; they do not prove immediate backing release.";
 	return result;
 }
 
@@ -9477,6 +9601,7 @@ void RenderingDevice::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
 	ClassDB::bind_method(D_METHOD("_get_native_memory_snapshot"), &RenderingDevice::get_memory_diagnostics);
+	ClassDB::bind_method(D_METHOD("_trim_transfer_worker_staging"), &RenderingDevice::trim_transfer_worker_staging);
 	ClassDB::bind_method(D_METHOD("_get_memory_resource_inventory"), &RenderingDevice::get_memory_resource_inventory);
 
 	ClassDB::bind_method(D_METHOD("get_driver_resource", "resource", "rid", "index"), &RenderingDevice::get_driver_resource);
