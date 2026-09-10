@@ -1613,9 +1613,9 @@ void GodotConcavePolygonShape3D::_setup(const Vector<Vector3> &p_faces, bool p_b
 	faces.resize(src_face_count);
 	Face *facesw = faces.ptrw();
 
-	vertices.resize(src_face_count * 3);
-
-	Vector3 *verticesw = vertices.ptrw();
+	// Collision queries only read these vertices. Share the resource's input
+	// storage; CowData isolates a later mutation of any caller's vector.
+	vertices = p_faces;
 
 	AABB _aabb;
 
@@ -1629,9 +1629,6 @@ void GodotConcavePolygonShape3D::_setup(const Vector<Vector3> &p_faces, bool p_b
 		facesw[i].indices[1] = i * 3 + 1;
 		facesw[i].indices[2] = i * 3 + 2;
 		facesw[i].normal = face.get_plane().normal;
-		verticesw[i * 3 + 0] = face.vertex[0];
-		verticesw[i * 3 + 1] = face.vertex[1];
-		verticesw[i * 3 + 2] = face.vertex[2];
 		if (i == 0) {
 			_aabb = bvh_arrayw[i].aabb;
 		} else {
