@@ -448,6 +448,7 @@ public:
 	virtual RID particles_allocate() override;
 	virtual void particles_initialize(RID p_rid) override;
 	virtual void particles_free(RID p_rid) override;
+	virtual Array get_memory_resource_links() const override;
 
 	virtual void particles_set_mode(RID p_particles, RSE::ParticlesMode p_mode) override;
 	virtual void particles_set_emitting(RID p_particles, bool p_emitting) override;

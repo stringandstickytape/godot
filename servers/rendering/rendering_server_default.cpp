@@ -331,6 +331,7 @@ Dictionary RenderingServerDefault::_get_resource_memory_links_render_thread() co
 
 	Array links = RSG::mesh_storage->get_memory_resource_links();
 	links.append_array(RSG::texture_storage->get_memory_resource_links());
+	links.append_array(RSG::particles_storage->get_memory_resource_links());
 	int64_t incomplete_row_count = 0;
 	for (int64_t i = 0; i < links.size(); i++) {
 		const Dictionary row = links[i];
@@ -349,10 +350,10 @@ Dictionary RenderingServerDefault::_get_resource_memory_links_render_thread() co
 	unsupported_families.push_back("RendererRD default mesh buffers without an RS mesh owner");
 	unsupported_families.push_back("vertex arrays, index arrays, uniform sets, descriptors, shaders, and pipelines");
 	unsupported_families.push_back("canvas-texture composites and render-target internal textures outside TextureStorage::texture_owner");
-	unsupported_families.push_back("materials, skeletons, particles, lightmaps, decals, and other renderer storage families");
+	unsupported_families.push_back("materials, skeletons, particle auxiliary buffers outside state/instance output, lightmaps, decals, and other renderer storage families");
 	unsupported_families.push_back("render-buffer custom data including SDFGI, fog, screen-space effects, and temporal buffers");
 	result["unsupported_families"] = unsupported_families;
-	result["unsupported_note"] = "These families remain visible where covered by the separate RD inventory, but this endpoint does not assign them an RS mesh, mesh-instance, MultiMesh, or texture owner.";
+	result["unsupported_note"] = "These families remain visible where covered by the separate RD inventory, but this endpoint does not assign them an RS mesh, mesh-instance, MultiMesh, texture, or particles owner.";
 
 	return result;
 }

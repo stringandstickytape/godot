@@ -2759,6 +2759,7 @@ void LightStorage::update_directional_shadow_atlas() {
 		tf.usage_bits = get_shadow_atlas_depth_usage_bits();
 
 		directional_shadow.depth = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		RD::get_singleton()->set_resource_name(directional_shadow.depth, "Directional Shadow Atlas");
 		Vector<RID> fb_tex;
 		fb_tex.push_back(directional_shadow.depth);
 		directional_shadow.fb = RD::get_singleton()->framebuffer_create(fb_tex);

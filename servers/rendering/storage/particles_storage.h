@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/math/math_defs.h" // real_t
+#include "core/variant/array.h"
 #include "servers/rendering/rendering_server_enums.h"
 
 class RID;
@@ -51,6 +52,7 @@ public:
 	virtual RID particles_allocate() = 0;
 	virtual void particles_initialize(RID p_rid) = 0;
 	virtual void particles_free(RID p_rid) = 0;
+	virtual Array get_memory_resource_links() const { return Array(); }
 
 	virtual void particles_set_mode(RID p_particles, RSE::ParticlesMode p_mode) = 0;
 

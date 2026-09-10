@@ -244,6 +244,53 @@ void ParticlesStorage::particles_free(RID p_rid) {
 	particles_owner.free(p_rid);
 }
 
+Array ParticlesStorage::get_memory_resource_links() const {
+	Array links;
+
+	auto rid_string = [](RID p_rid) -> String {
+		return p_rid.is_valid() ? String::num_uint64(p_rid.get_id()) : String("0");
+	};
+	auto make_row = [&](RID p_rs_rid, RID p_rd_rid, const String &p_role, const String &p_kind, const String &p_source, const String &p_retention, const String &p_parent_key) -> Dictionary {
+		Dictionary row;
+		row["rs_rid"] = rid_string(p_rs_rid);
+		row["rd_rid"] = rid_string(p_rd_rid);
+		row["role"] = p_role;
+		row["kind"] = p_kind;
+		row["source"] = p_source;
+		row["sizing"] = "Authoritative logical size is supplied by the joined RenderingDevice resource row; this ownership link carries no independent byte estimate.";
+		row["retention"] = p_retention;
+		row["logical_parent_key"] = p_parent_key;
+		row["inventory_complete"] = true;
+		return row;
+	};
+	auto append_buffer_link = [&](RID p_rs_rid, RID p_rd_rid, const String &p_role, const String &p_source, const String &p_retention, const String &p_parent_key) {
+		if (p_rd_rid.is_null()) {
+			return;
+		}
+		Dictionary row = make_row(p_rs_rid, p_rd_rid, p_role, "gpu_buffer_link", p_source, p_retention, p_parent_key);
+		row["rd_resource_available"] = true;
+		links.push_back(row);
+	};
+
+	for (const RID &particles_rid : particles_owner.get_owned_list()) {
+		Particles *particles = particles_owner.get_or_null(particles_rid);
+		const String particles_key = "particles/" + rid_string(particles_rid);
+		if (particles == nullptr) {
+			Dictionary row = make_row(particles_rid, RID(), "particles_owner_lookup_failed", "inventory_error", "RendererRD::ParticlesStorage::particles_owner", "The capture is incomplete; no ownership or lifetime conclusion should be drawn from this row.", particles_key);
+			row["inventory_complete"] = false;
+			row["error"] = "particles_owner.get_owned_list() returned a RID which particles_owner.get_or_null() could not resolve.";
+			row["rd_resource_available"] = false;
+			links.push_back(row);
+			continue;
+		}
+
+		append_buffer_link(particles_rid, particles->particle_buffer, "particle_state_buffer", "RendererRD::ParticlesStorage::Particles::particle_buffer", "Owned by the RS particles record until particle representation data is rebuilt or the particles RID is freed; RD destruction may be deferred.", particles_key);
+		append_buffer_link(particles_rid, particles->particle_instance_buffer, "particle_instance_output_buffer", "RendererRD::ParticlesStorage::Particles::particle_instance_buffer", "Owned by the RS particles record until particle representation data is rebuilt, motion-vector requirements recreate the output, or the particles RID is freed; RD destruction may be deferred.", particles_key);
+	}
+
+	return links;
+}
+
 void ParticlesStorage::particles_set_mode(RID p_particles, RSE::ParticlesMode p_mode) {
 	Particles *particles = particles_owner.get_or_null(p_particles);
 	ERR_FAIL_NULL(particles);

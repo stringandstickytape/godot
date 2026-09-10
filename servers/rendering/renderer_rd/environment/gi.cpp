@@ -607,9 +607,13 @@ void GI::SDFGI::create(RID p_env, const Vector3 &p_world_position, uint32_t p_re
 		/* Buffers */
 
 		cascade.solid_cell_buffer = RD::get_singleton()->storage_buffer_create(sizeof(SDFGI::Cascade::SolidCell) * solid_cell_count);
+		RD::get_singleton()->set_resource_name(cascade.solid_cell_buffer, "SDFGI Cascade Solid Cells");
 		cascade.solid_cell_dispatch_buffer_storage = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t) * 4, Vector<uint8_t>());
+		RD::get_singleton()->set_resource_name(cascade.solid_cell_dispatch_buffer_storage, "SDFGI Cascade Solid Cell Dispatch Storage");
 		cascade.solid_cell_dispatch_buffer_call = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t) * 4, Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+		RD::get_singleton()->set_resource_name(cascade.solid_cell_dispatch_buffer_call, "SDFGI Cascade Solid Cell Dispatch Arguments");
 		cascade.lights_buffer = RD::get_singleton()->storage_buffer_create(sizeof(SDFGIShader::Light) * MAX(SDFGI::MAX_STATIC_LIGHTS, SDFGI::MAX_DYNAMIC_LIGHTS));
+		RD::get_singleton()->set_resource_name(cascade.lights_buffer, "SDFGI Cascade Lights");
 		{
 			Vector<RD::Uniform> uniforms;
 			{
