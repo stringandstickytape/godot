@@ -88,6 +88,12 @@ struct Statistics {
 	uint64_t instrumentation_failure_count = 0;
 	uint64_t table_slot_count = 0;
 	uint64_t table_tombstone_count = 0;
+	uintptr_t tracker_state_base = 0;
+	uint64_t tracker_state_requested_bytes = 0;
+	uintptr_t tracker_table_base = 0;
+	uint64_t tracker_table_requested_bytes = 0;
+	uint64_t tracker_slot_size_bytes = 0;
+	uint64_t tracker_table_storage_generation = 0;
 	uint64_t tracker_storage_current_bytes = 0;
 	uint64_t tracker_storage_peak_bytes = 0;
 	uint64_t snapshot_copy_bytes = 0;
@@ -135,6 +141,8 @@ struct SelfCheckResult {
 	bool failed_reallocation_preserved_record = false;
 	bool free_removed_record = false;
 	bool address_reuse_changed_id = false;
+	bool tracker_storage_identity_consistent = false;
+	bool table_storage_generation_advanced = false;
 };
 
 extern std::atomic<bool> enabled;

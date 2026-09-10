@@ -59,6 +59,7 @@ struct TrackerState {
 	size_t slot_count = 0;
 	size_t active_count = 0;
 	size_t tombstone_count = 0;
+	uint64_t table_storage_generation = 0;
 	uint64_t next_allocation_id = 1;
 	uint64_t sequence = 0;
 	Statistics statistics;
@@ -192,6 +193,12 @@ static bool _combined_tracker_storage_bytes(size_t p_first_slot_count, size_t p_
 static Statistics _statistics_locked(const TrackerState &p_state) {
 	Statistics statistics = p_state.statistics;
 	statistics.snapshot_sequence = p_state.sequence;
+	statistics.tracker_state_base = reinterpret_cast<uintptr_t>(&p_state);
+	statistics.tracker_state_requested_bytes = sizeof(TrackerState);
+	statistics.tracker_table_base = reinterpret_cast<uintptr_t>(p_state.slots);
+	statistics.tracker_table_requested_bytes = static_cast<uint64_t>(p_state.slot_count) * sizeof(Slot);
+	statistics.tracker_slot_size_bytes = sizeof(Slot);
+	statistics.tracker_table_storage_generation = p_state.table_storage_generation;
 	statistics.inventory_complete = p_state.statistics.instrumentation_failure_count == 0;
 	return statistics;
 }
@@ -240,6 +247,7 @@ static bool _rehash(TrackerState &r_state, size_t p_new_slot_count) {
 		}
 	}
 	free(old_slots);
+	r_state.table_storage_generation++;
 	_update_tracker_storage_statistics(r_state);
 	return true;
 }
@@ -350,6 +358,14 @@ static bool _table_self_check(SelfCheckResult &r_result) {
 	if (!_rehash(state, 8)) {
 		return false;
 	}
+	const Statistics initial_statistics = _statistics_locked(state);
+	r_result.tracker_storage_identity_consistent = initial_statistics.tracker_state_base == reinterpret_cast<uintptr_t>(&state) &&
+			initial_statistics.tracker_state_requested_bytes == sizeof(TrackerState) &&
+			initial_statistics.tracker_table_base == reinterpret_cast<uintptr_t>(state.slots) &&
+			initial_statistics.tracker_table_requested_bytes == static_cast<uint64_t>(state.slot_count) * sizeof(Slot) &&
+			initial_statistics.tracker_slot_size_bytes == sizeof(Slot) &&
+			initial_statistics.tracker_storage_current_bytes == initial_statistics.tracker_state_requested_bytes + initial_statistics.tracker_table_requested_bytes &&
+			initial_statistics.tracker_table_storage_generation == 1;
 	AllocationRecord initial = _make_record(state, reinterpret_cast<void *>(uintptr_t(0x1000)), reinterpret_cast<void *>(uintptr_t(0x1000)), 16, 16, false, false, false, 0, 16, true, AllocationOrigin::ALLOCATION, uintptr_t(0x1110), 0);
 	r_result.allocation_inserted = _insert_new_record(state, initial) && _find_index(state, initial.user_base) != SIZE_MAX;
 	if (!r_result.allocation_inserted) {
@@ -394,7 +410,9 @@ static bool _table_self_check(SelfCheckResult &r_result) {
 	AllocationRecord reused = _make_record(state, reinterpret_cast<void *>(uintptr_t(0x2000)), reinterpret_cast<void *>(uintptr_t(0x2000)), 8, 8, false, false, false, 0, 8, true, AllocationOrigin::ALLOCATION, uintptr_t(0x3330), 0);
 	const bool reuse_inserted = _insert_new_record(state, reused);
 	r_result.address_reuse_changed_id = reuse_inserted && reused.allocation_id != original_id;
-	r_result.passed = r_result.allocation_inserted && r_result.reallocation_preserved_id && r_result.reallocation_preserved_origin_caller_pc && r_result.reallocation_updated_caller_pc && r_result.failed_reallocation_preserved_record && r_result.free_removed_record && r_result.address_reuse_changed_id;
+	const uint64_t generation_before_rehash = state.table_storage_generation;
+	r_result.table_storage_generation_advanced = _rehash(state, state.slot_count) && state.table_storage_generation == generation_before_rehash + 1;
+	r_result.passed = r_result.allocation_inserted && r_result.reallocation_preserved_id && r_result.reallocation_preserved_origin_caller_pc && r_result.reallocation_updated_caller_pc && r_result.failed_reallocation_preserved_record && r_result.free_removed_record && r_result.address_reuse_changed_id && r_result.tracker_storage_identity_consistent && r_result.table_storage_generation_advanced;
 	free(state.slots);
 	return r_result.passed;
 }
@@ -604,9 +622,7 @@ bool get_statistics(Statistics &r_statistics) {
 	ScopedSuppression suppression;
 	TrackerState &state = *tracker_state;
 	std::lock_guard<std::mutex> lock(state.mutex);
-	r_statistics = state.statistics;
-	r_statistics.snapshot_sequence = state.sequence;
-	r_statistics.inventory_complete = state.statistics.instrumentation_failure_count == 0;
+	r_statistics = _statistics_locked(state);
 	return true;
 }
 
@@ -632,7 +648,7 @@ bool capture_snapshot(Snapshot &r_snapshot) {
 		if (state.active_count > SIZE_MAX / sizeof(AllocationRecord) || state.active_count > UINT64_MAX / sizeof(AllocationRecord)) {
 			state.statistics.snapshot_failure_count++;
 			state.statistics.instrumentation_failure_count++;
-			r_snapshot.statistics = state.statistics;
+			r_snapshot.statistics = _statistics_locked(state);
 			r_snapshot.statistics.inventory_complete = false;
 			return false;
 		}
@@ -641,7 +657,7 @@ bool capture_snapshot(Snapshot &r_snapshot) {
 		if (records == nullptr) {
 			state.statistics.snapshot_failure_count++;
 			state.statistics.instrumentation_failure_count++;
-			r_snapshot.statistics = state.statistics;
+			r_snapshot.statistics = _statistics_locked(state);
 			r_snapshot.statistics.inventory_complete = false;
 			return false;
 		}
@@ -655,10 +671,8 @@ bool capture_snapshot(Snapshot &r_snapshot) {
 	}
 	r_snapshot.records = records;
 	r_snapshot.record_count = write_index;
-	r_snapshot.statistics = state.statistics;
-	r_snapshot.statistics.snapshot_sequence = state.sequence;
+	r_snapshot.statistics = _statistics_locked(state);
 	r_snapshot.statistics.snapshot_copy_bytes = copy_bytes;
-	r_snapshot.statistics.inventory_complete = state.statistics.instrumentation_failure_count == 0;
 	return true;
 }
 
