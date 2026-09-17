@@ -201,7 +201,7 @@ namespace Godot.Collections
         public void Dispose(bool disposing)
         {
             // Always dispose `NativeValue` even if disposing is true
-            NativeValue.DangerousSelfRef.Dispose();
+            NativeValue.DisposeNative();
 
             if (_weakReferenceToSelf != null)
             {
@@ -898,7 +898,7 @@ namespace Godot.Collections
         /// This is also known as the size or length of the array.
         /// </summary>
         /// <returns>The number of elements.</returns>
-        public int Count => NativeValue.DangerousSelfRef.Size;
+        public int Count => ((godot_array)NativeValue).Size;
 
         bool ICollection.IsSynchronized => false;
 
@@ -908,7 +908,7 @@ namespace Godot.Collections
         /// Returns <see langword="true"/> if the array is read-only.
         /// See <see cref="MakeReadOnly"/>.
         /// </summary>
-        public bool IsReadOnly => NativeValue.DangerousSelfRef.IsReadOnly;
+        public bool IsReadOnly => ((godot_array)NativeValue).IsReadOnly;
 
         /// <summary>
         /// Makes the <see cref="Array"/> read-only, i.e. disabled modying of the
@@ -965,7 +965,7 @@ namespace Godot.Collections
             {
                 for (int i = 0; i < count; i++)
                 {
-                    array[arrayIndex] = Variant.CreateCopyingBorrowed(NativeValue.DangerousSelfRef.Elements[i]);
+                    array[arrayIndex] = Variant.CreateCopyingBorrowed(((godot_array)NativeValue).Elements[i]);
                     arrayIndex++;
                 }
             }
@@ -994,7 +994,7 @@ namespace Godot.Collections
             {
                 for (int i = 0; i < count; i++)
                 {
-                    object boxedVariant = Variant.CreateCopyingBorrowed(NativeValue.DangerousSelfRef.Elements[i]);
+                    object boxedVariant = Variant.CreateCopyingBorrowed(((godot_array)NativeValue).Elements[i]);
                     array.SetValue(boxedVariant, index);
                     index++;
                 }
@@ -1049,7 +1049,7 @@ namespace Godot.Collections
         /// </summary>
         internal unsafe void GetVariantBorrowElementAtUnchecked(int index, out godot_variant elem)
         {
-            elem = NativeValue.DangerousSelfRef.Elements[index];
+            elem = ((godot_array)NativeValue).Elements[index];
         }
 
         private void ThrowIfReadOnly()

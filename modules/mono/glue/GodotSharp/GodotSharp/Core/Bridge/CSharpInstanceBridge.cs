@@ -59,7 +59,7 @@ namespace Godot.Bridge
                     return godot_bool.True;
                 }
 
-                if (!godotObject.HasGodotClassMethod(GodotObject.MethodName._Set.NativeValue.DangerousSelfRef))
+                if (!godotObject.HasGodotClassMethod((godot_string_name)GodotObject.MethodName._Set.NativeValue))
                 {
                     return godot_bool.False;
                 }
@@ -112,7 +112,7 @@ namespace Godot.Bridge
                     return godot_bool.True;
                 }
 
-                if (!godotObject.HasGodotClassMethod(GodotObject.MethodName._Get.NativeValue.DangerousSelfRef))
+                if (!godotObject.HasGodotClassMethod((godot_string_name)GodotObject.MethodName._Get.NativeValue))
                 {
                     return godot_bool.False;
                 }

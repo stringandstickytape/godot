@@ -40,7 +40,7 @@ public partial struct Variant : IDisposable
 
         private void Dispose(bool disposing)
         {
-            _native.DangerousSelfRef.Dispose();
+            _native.DisposeNative();
 
             if (_weakReferenceToSelf != null)
             {
@@ -106,12 +106,12 @@ public partial struct Variant : IDisposable
     }
 
     // TODO: Consider renaming Variant.Type to VariantType and this property to Type. VariantType would also avoid ambiguity with System.Type.
-    public Type VariantType => NativeVar.DangerousSelfRef.Type;
+    public Type VariantType => ((godot_variant)NativeVar).Type;
 
     public override string ToString() => AsString();
 
     public object? Obj =>
-        _obj ??= NativeVar.DangerousSelfRef.Type switch
+        _obj ??= ((godot_variant)NativeVar).Type switch
         {
             Type.Bool => AsBool(),
             Type.Int => AsInt64(),
@@ -153,7 +153,7 @@ public partial struct Variant : IDisposable
             Type.PackedColorArray => AsColorArray(),
             Type.Nil => null,
             Type.Max or _ =>
-                throw new InvalidOperationException($"Invalid Variant type: {NativeVar.DangerousSelfRef.Type}"),
+                throw new InvalidOperationException($"Invalid Variant type: {((godot_variant)NativeVar).Type}"),
         };
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -162,7 +162,7 @@ public partial struct Variant : IDisposable
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T As<[MustBeVariant] T>() =>
-        VariantUtils.ConvertTo<T>(NativeVar.DangerousSelfRef);
+        VariantUtils.ConvertTo<T>((godot_variant)NativeVar);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool AsBool() =>

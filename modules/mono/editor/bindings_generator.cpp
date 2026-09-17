@@ -2580,9 +2580,9 @@ Error BindingsGenerator::_generate_cs_type(const TypeInterface &itype, const Str
 			// generators take care of generating those override methods.
 			output << INDENT2 "if (method == MethodName." << imethod.proxy_name
 				   << ")\n" INDENT2 "{\n"
-				   << INDENT3 "if (" CS_METHOD_HAS_GODOT_CLASS_METHOD "("
+				   << INDENT3 "if (" CS_METHOD_HAS_GODOT_CLASS_METHOD "((godot_string_name)"
 				   << CS_STATIC_FIELD_METHOD_PROXY_NAME_PREFIX << imethod.name
-				   << ".NativeValue.DangerousSelfRef))\n" INDENT3 "{\n"
+				   << ".NativeValue))\n" INDENT3 "{\n"
 				   << INDENT4 "return true;\n"
 				   << INDENT3 "}\n" INDENT2 "}\n";
 		}
@@ -2615,9 +2615,9 @@ Error BindingsGenerator::_generate_cs_type(const TypeInterface &itype, const Str
 			// generators take care of generating those override methods.
 			output << INDENT2 "if (signal == SignalName." << isignal.proxy_name
 				   << ")\n" INDENT2 "{\n"
-				   << INDENT3 "if (" CS_METHOD_HAS_GODOT_CLASS_SIGNAL "("
+				   << INDENT3 "if (" CS_METHOD_HAS_GODOT_CLASS_SIGNAL "((godot_string_name)"
 				   << CS_STATIC_FIELD_SIGNAL_PROXY_NAME_PREFIX << isignal.name
-				   << ".NativeValue.DangerousSelfRef))\n" INDENT3 "{\n"
+				   << ".NativeValue))\n" INDENT3 "{\n"
 				   << INDENT4 "return true;\n"
 				   << INDENT3 "}\n" INDENT2 "}\n";
 		}
