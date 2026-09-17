@@ -65,7 +65,7 @@ namespace Godot
         public void Dispose(bool disposing)
         {
             // Always dispose `NativeValue` even if disposing is true
-            NativeValue.DangerousSelfRef.Dispose();
+            NativeValue.DisposeNative();
 
             if (_weakReferenceToSelf != null)
             {
@@ -291,7 +291,7 @@ namespace Godot
         /// Returns <see langword="true"/> if the node path is empty.
         /// </summary>
         /// <returns>If the <see cref="NodePath"/> is empty.</returns>
-        public bool IsEmpty => NativeValue.DangerousSelfRef.IsEmpty;
+        public bool IsEmpty => ((godot_node_path)NativeValue).IsEmpty;
 
         public static bool operator ==(NodePath? left, NodePath? right)
         {

@@ -506,8 +506,12 @@ namespace Godot.NativeInterop
             public static unsafe explicit operator godot_variant(movable value)
                 => *(godot_variant*)Unsafe.AsPointer(ref value);
 
-            public unsafe ref godot_variant DangerousSelfRef =>
-                ref CustomUnsafe.AsRef((godot_variant*)Unsafe.AsPointer(ref this));
+            public void DisposeNative()
+            {
+                var native = (godot_variant)this;
+                this = default;
+                native.Dispose();
+            }
         }
     }
 
@@ -610,8 +614,12 @@ namespace Godot.NativeInterop
             public static unsafe explicit operator godot_string_name(movable value)
                 => *(godot_string_name*)Unsafe.AsPointer(ref value);
 
-            public unsafe ref godot_string_name DangerousSelfRef =>
-                ref CustomUnsafe.AsRef((godot_string_name*)Unsafe.AsPointer(ref this));
+            public void DisposeNative()
+            {
+                var native = (godot_string_name)this;
+                this = default;
+                native.Dispose();
+            }
         }
     }
 
@@ -658,8 +666,12 @@ namespace Godot.NativeInterop
             public static unsafe explicit operator godot_node_path(movable value)
                 => *(godot_node_path*)Unsafe.AsPointer(ref value);
 
-            public unsafe ref godot_node_path DangerousSelfRef =>
-                ref CustomUnsafe.AsRef((godot_node_path*)Unsafe.AsPointer(ref this));
+            public void DisposeNative()
+            {
+                var native = (godot_node_path)this;
+                this = default;
+                native.Dispose();
+            }
         }
     }
 
@@ -823,8 +835,12 @@ namespace Godot.NativeInterop
             public static unsafe explicit operator godot_array(movable value)
                 => *(godot_array*)Unsafe.AsPointer(ref value);
 
-            public unsafe ref godot_array DangerousSelfRef =>
-                ref CustomUnsafe.AsRef((godot_array*)Unsafe.AsPointer(ref this));
+            public void DisposeNative()
+            {
+                var native = (godot_array)this;
+                this = default;
+                native.Dispose();
+            }
         }
     }
 
@@ -892,8 +908,12 @@ namespace Godot.NativeInterop
             public static unsafe explicit operator godot_dictionary(movable value)
                 => *(godot_dictionary*)Unsafe.AsPointer(ref value);
 
-            public unsafe ref godot_dictionary DangerousSelfRef =>
-                ref CustomUnsafe.AsRef((godot_dictionary*)Unsafe.AsPointer(ref this));
+            public void DisposeNative()
+            {
+                var native = (godot_dictionary)this;
+                this = default;
+                native.Dispose();
+            }
         }
     }
 

@@ -105,12 +105,12 @@ namespace Godot
                 stackalloc IntPtr[VarArgsSpanThreshold] :
                 new IntPtr[argc];
 
-            fixed (godot_variant* varargs = &MemoryMarshal.GetReference(argsStoreSpan).DangerousSelfRef)
+            fixed (godot_variant.movable* varargs = &MemoryMarshal.GetReference(argsStoreSpan))
             fixed (IntPtr* argsPtr = &MemoryMarshal.GetReference(argsSpan))
             {
                 for (int i = 0; i < argc; i++)
                 {
-                    varargs[i] = (godot_variant)args[i].NativeVar;
+                    varargs[i] = args[i].NativeVar;
                     argsPtr[i] = new IntPtr(&varargs[i]);
                 }
 
@@ -146,12 +146,12 @@ namespace Godot
                 stackalloc IntPtr[VarArgsSpanThreshold] :
                 new IntPtr[argc];
 
-            fixed (godot_variant* varargs = &MemoryMarshal.GetReference(argsStoreSpan).DangerousSelfRef)
+            fixed (godot_variant.movable* varargs = &MemoryMarshal.GetReference(argsStoreSpan))
             fixed (IntPtr* argsPtr = &MemoryMarshal.GetReference(argsSpan))
             {
                 for (int i = 0; i < argc; i++)
                 {
-                    varargs[i] = (godot_variant)args[i].NativeVar;
+                    varargs[i] = args[i].NativeVar;
                     argsPtr[i] = new IntPtr(&varargs[i]);
                 }
 

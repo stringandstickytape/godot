@@ -36,7 +36,7 @@ namespace Godot
         public void Dispose(bool disposing)
         {
             // Always dispose `NativeValue` even if disposing is true
-            NativeValue.DangerousSelfRef.Dispose();
+            NativeValue.DisposeNative();
 
             if (_weakReferenceToSelf != null)
             {
@@ -106,7 +106,7 @@ namespace Godot
         /// Check whether this <see cref="StringName"/> is empty.
         /// </summary>
         /// <returns>If the <see cref="StringName"/> is empty.</returns>
-        public bool IsEmpty => NativeValue.DangerousSelfRef.IsEmpty;
+        public bool IsEmpty => ((godot_string_name)NativeValue).IsEmpty;
 
         public static bool operator ==(StringName? left, StringName? right)
         {
@@ -124,7 +124,7 @@ namespace Godot
         {
             if (other is null)
                 return false;
-            return NativeValue.DangerousSelfRef == other.NativeValue.DangerousSelfRef;
+            return (godot_string_name)NativeValue == (godot_string_name)other.NativeValue;
         }
 
         public static bool operator ==(StringName? left, in godot_string_name right)
@@ -151,7 +151,7 @@ namespace Godot
 
         public bool Equals(in godot_string_name other)
         {
-            return NativeValue.DangerousSelfRef == other;
+            return (godot_string_name)NativeValue == other;
         }
 
         public override bool Equals([NotNullWhen(true)] object? obj)
@@ -161,7 +161,7 @@ namespace Godot
 
         public override int GetHashCode()
         {
-            return NativeValue.DangerousSelfRef.GetHashCode();
+            return ((godot_string_name)NativeValue).GetHashCode();
         }
     }
 }

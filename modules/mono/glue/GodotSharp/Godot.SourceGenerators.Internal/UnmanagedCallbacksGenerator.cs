@@ -105,6 +105,7 @@ internal class GenerateUnmanagedCallbacksAttribute : Attribute
         var methodSource = new StringBuilder();
         var methodCallArguments = new StringBuilder();
         var methodSourceAfterCall = new StringBuilder();
+        var fixedStatements = new StringBuilder();
 
         source.Append(
             @"using System;
@@ -155,6 +156,13 @@ using Godot.NativeInterop;
             methodSource.Clear();
             methodCallArguments.Clear();
             methodSourceAfterCall.Clear();
+            fixedStatements.Clear();
+
+            // By-ref interop structs are passed to native code as pointers. The referenced storage
+            // may be a field of a managed object, so it must stay pinned for the whole native call.
+            bool hasPinnedParameters = callback.Parameters
+                .Any(parameter => IsByRefParameter(parameter) && IsGodotInteropStruct(parameter.Type));
+            string callIndent = hasPinnedParameters ? "            " : "        ";
 
             source.Append("    [global::System.Runtime.CompilerServices.MethodImpl(global::System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]\n");
             source.Append($"    {SyntaxFacts.GetText(callback.DeclaredAccessibility)} ");
@@ -189,8 +197,8 @@ using Godot.NativeInterop;
                 {
                     if (IsGodotInteropStruct(parameter.Type))
                     {
-                        methodSource.Append("        ");
-                        AppendCustomUnsafeAsPointer(methodSource, parameter, out string varName);
+                        fixedStatements.Append("        ");
+                        AppendFixedPointer(fixedStatements, parameter, out string varName);
                         methodCallArguments.Append(varName);
                     }
                     else if (parameter.Type.IsValueType)
@@ -201,7 +209,7 @@ using Godot.NativeInterop;
 
                         if (parameter.RefKind is RefKind.Out or RefKind.Ref)
                         {
-                            methodSourceAfterCall.Append($"        {parameter.Name} = {varName};\n");
+                            methodSourceAfterCall.Append($"{callIndent}{parameter.Name} = {varName};\n");
                         }
                     }
                     else
@@ -229,7 +237,14 @@ using Godot.NativeInterop;
             source.Append("    {\n");
 
             source.Append(methodSource);
-            source.Append("        ");
+
+            if (hasPinnedParameters)
+            {
+                source.Append(fixedStatements);
+                source.Append("        {\n");
+            }
+
+            source.Append(callIndent);
 
             if (!callback.ReturnsVoid)
             {
@@ -248,8 +263,11 @@ using Godot.NativeInterop;
                 source.Append(methodSourceAfterCall);
 
                 if (!callback.ReturnsVoid)
-                    source.Append("        return ret;\n");
+                    source.Append($"{callIndent}return ret;\n");
             }
+
+            if (hasPinnedParameters)
+                source.Append("        }\n");
 
             source.Append("    }\n\n");
         }
@@ -411,28 +429,18 @@ using Godot.NativeInterop;
         source.Append('*');
     }
 
-    private static void AppendCustomUnsafeAsPointer(StringBuilder source, IParameterSymbol parameter,
+    private static void AppendFixedPointer(StringBuilder source, IParameterSymbol parameter,
         out string varName)
     {
         varName = $"{parameter.Name}_ptr";
 
+        source.Append("fixed (");
         AppendPointerType(source, parameter.Type);
         source.Append(' ');
         source.Append(varName);
-        source.Append(" = ");
-
-        source.Append('(');
-        AppendPointerType(source, parameter.Type);
-        source.Append(')');
-
-        if (parameter.RefKind == RefKind.In)
-            source.Append("CustomUnsafe.ReadOnlyRefAsPointer(in ");
-        else
-            source.Append("CustomUnsafe.AsPointer(ref ");
-
+        source.Append(" = &");
         source.Append(parameter.Name);
-
-        source.Append(");\n");
+        source.Append(")\n");
     }
 
     private static void AppendCopyToStackAndGetPointer(StringBuilder source, IParameterSymbol parameter,

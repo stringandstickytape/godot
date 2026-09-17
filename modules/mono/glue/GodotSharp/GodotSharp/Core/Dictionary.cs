@@ -64,7 +64,7 @@ namespace Godot.Collections
         public void Dispose(bool disposing)
         {
             // Always dispose `NativeValue` even if disposing is true
-            NativeValue.DangerousSelfRef.Dispose();
+            NativeValue.DisposeNative();
 
             if (_weakReferenceToSelf != null)
             {
@@ -348,7 +348,7 @@ namespace Godot.Collections
         /// Returns <see langword="true"/> if the dictionary is read-only.
         /// See <see cref="MakeReadOnly"/>.
         /// </summary>
-        public bool IsReadOnly => NativeValue.DangerousSelfRef.IsReadOnly;
+        public bool IsReadOnly => ((godot_dictionary)NativeValue).IsReadOnly;
 
         /// <summary>
         /// Makes the <see cref="Dictionary"/> read-only, i.e. disabled modying of the
