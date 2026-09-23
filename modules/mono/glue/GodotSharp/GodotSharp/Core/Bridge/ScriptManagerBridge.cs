@@ -285,6 +285,10 @@ namespace Godot.Bridge
         {
             try
             {
+                // Zero when a swap already released the handle (see SwapGCHandleForType): no target to update.
+                if (gcHandlePtr == IntPtr.Zero)
+                    return;
+
                 var target = (GodotObject?)GCHandle.FromIntPtr(gcHandlePtr).Target;
                 if (target != null)
                     target.NativePtr = newPtr;
@@ -1281,6 +1285,15 @@ namespace Godot.Bridge
         {
             try
             {
+                if (oldGCHandlePtr == IntPtr.Zero)
+                {
+                    // Already released by an earlier swap that found the managed side collected. The
+                    // refcount callback's increment branch doesn't check for a released handle, so a
+                    // second 1->2 reference before the finalizer runs lands here. Nothing to swap.
+                    *outNewGCHandlePtr = IntPtr.Zero;
+                    return godot_bool.False;
+                }
+
                 var oldGCHandle = GCHandle.FromIntPtr(oldGCHandlePtr);
 
                 object? target = oldGCHandle.Target;
