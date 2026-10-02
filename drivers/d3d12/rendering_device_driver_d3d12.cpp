@@ -2384,9 +2384,9 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 // copies undoes that visibility, so a later copy reads stale data. That includes a copy in the next list of the
 // same submission. A Dispatch in the ExecuteIndirect's place does not, shader reads after it are unaffected, and the
 // debug layer and GPU-based validation accept the sequence. An execution-only barrier after the ExecuteIndirect does
-// not restore the data; a barrier that flushes the writes again does. So before the first copy in a list, and the
-// first copy after each ExecuteIndirect, flush every write a copy can depend on, once. Not covered: the legacy
-// (non-enhanced) barrier path, and texture copies were not reproduced (only buffers were).
+// not restore the data; a barrier that flushes the writes again does. So before the first copy in a direct or
+// compute list, and the first copy after each ExecuteIndirect, flush every write a copy can depend on, once. Not
+// covered: the legacy (non-enhanced) barrier path, and texture copies were not reproduced (only buffers were).
 void RenderingDeviceDriverD3D12::_restore_copy_visibility_after_execute_indirect(CommandBufferInfo *p_command_buffer) {
 	if (!p_command_buffer->execute_indirect_since_copy_visibility) {
 		return;
@@ -2395,12 +2395,19 @@ void RenderingDeviceDriverD3D12::_restore_copy_visibility_after_execute_indirect
 	if (!barrier_capabilities.enhanced_barriers_supported) {
 		return;
 	}
+	const D3D12_COMMAND_LIST_TYPE list_type = p_command_buffer->cmd_list->GetType();
+	if (list_type == D3D12_COMMAND_LIST_TYPE_COPY) {
+		// A copy queue (the transfer workers) records no ExecuteIndirect, and it cannot take this barrier: UAV and
+		// render-target access are invalid there and the runtime rejects the list at Close. Work from other queues
+		// reaches it through a fence.
+		return;
+	}
 
 	D3D12_GLOBAL_BARRIER global_barrier = {};
 	global_barrier.SyncBefore = D3D12_BARRIER_SYNC_ALL;
 	global_barrier.SyncAfter = D3D12_BARRIER_SYNC_COPY;
 	global_barrier.AccessBefore = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST;
-	if (p_command_buffer->cmd_list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+	if (list_type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
 		// Depth-stencil writes cannot reach a copy without a layout change, which a global barrier cannot express
 		// (the runtime rejects the list at Close); the depth texture's own layout barrier carries them.
 		global_barrier.AccessBefore |= D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_RESOLVE_DEST;
@@ -2678,8 +2685,8 @@ bool RenderingDeviceDriverD3D12::command_buffer_begin_secondary(CommandBufferID 
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	res = cmd_buf_info->cmd_list->Reset(cmd_buf_info->cmd_allocator.Get(), nullptr);
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
-	// The defect crosses list boundaries, and lists can be submitted in any order, so a list starts unsafe.
-	cmd_buf_info->execute_indirect_since_copy_visibility = true;
+	// A bundle records no copy, so it starts clean; an ExecuteIndirect in it marks the list that executes it.
+	cmd_buf_info->execute_indirect_since_copy_visibility = false;
 	return true;
 }
 
