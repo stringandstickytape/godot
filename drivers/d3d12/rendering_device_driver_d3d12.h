@@ -242,6 +242,7 @@ private:
 
 	void _resource_transition_batch(CommandBufferInfo *p_command_buffer, ResourceInfo *p_resource, uint32_t p_subresource, uint32_t p_num_planes, D3D12_RESOURCE_STATES p_new_state);
 	void _resource_transitions_flush(CommandBufferInfo *p_command_buffer);
+	void _restore_copy_visibility_after_execute_indirect(CommandBufferInfo *p_command_buffer);
 
 	/*****************/
 	/**** BUFFERS ****/
@@ -502,6 +503,10 @@ private:
 
 		RenderPassState render_pass_state;
 		bool descriptor_heaps_set = false;
+
+		// Copies are not known to be safe: the list is new, or an ExecuteIndirect has been recorded since they
+		// were last made safe; see _restore_copy_visibility_after_execute_indirect().
+		bool execute_indirect_since_copy_visibility = false;
 
 		HashMap<ResourceInfo::States *, BarrierRequest> res_barriers_requests;
 		LocalVector<D3D12_RESOURCE_BARRIER> res_barriers;

@@ -2379,6 +2379,41 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 	}
 }
 
+// NVIDIA D3D12 driver defect (seen on an RTX 5090 with driver 610.74). In a list that has already had a barrier
+// waiting on indirect-argument reads, an ExecuteIndirect recorded after a barrier that makes writes visible to
+// copies undoes that visibility, so a later copy reads stale data. That includes a copy in the next list of the
+// same submission. A Dispatch in the ExecuteIndirect's place does not, shader reads after it are unaffected, and the
+// debug layer and GPU-based validation accept the sequence. An execution-only barrier after the ExecuteIndirect does
+// not restore the data; a barrier that flushes the writes again does. So before the first copy in a list, and the
+// first copy after each ExecuteIndirect, flush every write a copy can depend on, once. Not covered: the legacy
+// (non-enhanced) barrier path, and texture copies were not reproduced (only buffers were).
+void RenderingDeviceDriverD3D12::_restore_copy_visibility_after_execute_indirect(CommandBufferInfo *p_command_buffer) {
+	if (!p_command_buffer->execute_indirect_since_copy_visibility) {
+		return;
+	}
+	p_command_buffer->execute_indirect_since_copy_visibility = false;
+	if (!barrier_capabilities.enhanced_barriers_supported) {
+		return;
+	}
+
+	D3D12_GLOBAL_BARRIER global_barrier = {};
+	global_barrier.SyncBefore = D3D12_BARRIER_SYNC_ALL;
+	global_barrier.SyncAfter = D3D12_BARRIER_SYNC_COPY;
+	global_barrier.AccessBefore = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST;
+	if (p_command_buffer->cmd_list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+		// Depth-stencil writes cannot reach a copy without a layout change, which a global barrier cannot express
+		// (the runtime rejects the list at Close); the depth texture's own layout barrier carries them.
+		global_barrier.AccessBefore |= D3D12_BARRIER_ACCESS_RENDER_TARGET | D3D12_BARRIER_ACCESS_RESOLVE_DEST;
+	}
+	global_barrier.AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST;
+
+	D3D12_BARRIER_GROUP barrier_group = {};
+	barrier_group.Type = D3D12_BARRIER_TYPE_GLOBAL;
+	barrier_group.NumBarriers = 1;
+	barrier_group.pGlobalBarriers = &global_barrier;
+	p_command_buffer->cmd_list_7->Barrier(1, &barrier_group);
+}
+
 /****************/
 /**** FENCES ****/
 /****************/
@@ -2627,20 +2662,24 @@ RDD::CommandBufferID RenderingDeviceDriverD3D12::command_buffer_create(CommandPo
 }
 
 bool RenderingDeviceDriverD3D12::command_buffer_begin(CommandBufferID p_cmd_buffer) {
-	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	HRESULT res = cmd_buf_info->cmd_allocator->Reset();
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	res = cmd_buf_info->cmd_list->Reset(cmd_buf_info->cmd_allocator.Get(), nullptr);
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	// The defect crosses list boundaries, and lists can be submitted in any order, so a list starts unsafe.
+	cmd_buf_info->execute_indirect_since_copy_visibility = true;
 	return true;
 }
 
 bool RenderingDeviceDriverD3D12::command_buffer_begin_secondary(CommandBufferID p_cmd_buffer, RenderPassID p_render_pass, uint32_t p_subpass, FramebufferID p_framebuffer) {
-	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	HRESULT res = cmd_buf_info->cmd_allocator->Reset();
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	res = cmd_buf_info->cmd_list->Reset(cmd_buf_info->cmd_allocator.Get(), nullptr);
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), false, "Reset failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	// The defect crosses list boundaries, and lists can be submitted in any order, so a list starts unsafe.
+	cmd_buf_info->execute_indirect_since_copy_visibility = true;
 	return true;
 }
 
@@ -2658,10 +2697,11 @@ void RenderingDeviceDriverD3D12::command_buffer_end(CommandBufferID p_cmd_buffer
 }
 
 void RenderingDeviceDriverD3D12::command_buffer_execute_secondary(CommandBufferID p_cmd_buffer, VectorView<CommandBufferID> p_secondary_cmd_buffers) {
-	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
+	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 	for (uint32_t i = 0; i < p_secondary_cmd_buffers.size(); i++) {
 		const CommandBufferInfo *secondary_cb_info = (const CommandBufferInfo *)p_secondary_cmd_buffers[i].id;
 		cmd_buf_info->cmd_list->ExecuteBundle(secondary_cb_info->cmd_list.Get());
+		cmd_buf_info->execute_indirect_since_copy_visibility |= secondary_cb_info->execute_indirect_since_copy_visibility;
 	}
 }
 
@@ -3875,6 +3915,7 @@ void RenderingDeviceDriverD3D12::command_copy_buffer(CommandBufferID p_cmd_buffe
 		_resource_transition_batch(cmd_buf_info, buf_loc_info, 0, 1, D3D12_RESOURCE_STATE_COPY_DEST);
 		_resource_transitions_flush(cmd_buf_info);
 	}
+	_restore_copy_visibility_after_execute_indirect(cmd_buf_info);
 
 	for (uint32_t i = 0; i < p_regions.size(); i++) {
 		cmd_buf_info->cmd_list->CopyBufferRegion(buf_loc_info->resource, p_regions[i].dst_offset, src_buf_info->resource, p_regions[i].src_offset, p_regions[i].size);
@@ -3900,6 +3941,7 @@ void RenderingDeviceDriverD3D12::command_copy_texture(CommandBufferID p_cmd_buff
 
 		_resource_transitions_flush(cmd_buf_info);
 	}
+	_restore_copy_visibility_after_execute_indirect(cmd_buf_info);
 
 	CD3DX12_BOX src_box;
 	for (uint32_t i = 0; i < p_regions.size(); i++) {
@@ -4076,6 +4118,7 @@ void RenderingDeviceDriverD3D12::command_copy_buffer_to_texture(CommandBufferID 
 	if (!barrier_capabilities.enhanced_barriers_supported) {
 		_resource_transition_batch(cmd_buf_info, buf_info, 0, 1, D3D12_RESOURCE_STATE_COPY_SOURCE);
 	}
+	_restore_copy_visibility_after_execute_indirect(cmd_buf_info);
 
 	uint32_t block_w = 0, block_h = 0;
 	get_compressed_image_format_block_dimensions(tex_info->format, block_w, block_h);
@@ -4127,6 +4170,7 @@ void RenderingDeviceDriverD3D12::command_copy_texture_to_buffer(CommandBufferID 
 	if (!barrier_capabilities.enhanced_barriers_supported) {
 		_resource_transition_batch(cmd_buf_info, buf_info, 0, 1, D3D12_RESOURCE_STATE_COPY_DEST);
 	}
+	_restore_copy_visibility_after_execute_indirect(cmd_buf_info);
 
 	uint32_t block_w = 0, block_h = 0;
 	get_compressed_image_format_block_dimensions(tex_info->format, block_w, block_h);
@@ -4900,6 +4944,7 @@ void RenderingDeviceDriverD3D12::command_render_draw_indexed_indirect(CommandBuf
 	}
 
 	cmd_buf_info->cmd_list->ExecuteIndirect(indirect_cmd_signatures.draw_indexed.Get(), p_draw_count, indirect_buf_info->resource, p_offset, nullptr, 0);
+	cmd_buf_info->execute_indirect_since_copy_visibility = true;
 }
 
 void RenderingDeviceDriverD3D12::command_render_draw_indexed_indirect_count(CommandBufferID p_cmd_buffer, BufferID p_indirect_buffer, uint64_t p_offset, BufferID p_count_buffer, uint64_t p_count_buffer_offset, uint32_t p_max_draw_count, uint32_t p_stride) {
@@ -4914,6 +4959,7 @@ void RenderingDeviceDriverD3D12::command_render_draw_indexed_indirect_count(Comm
 	}
 
 	cmd_buf_info->cmd_list->ExecuteIndirect(indirect_cmd_signatures.draw_indexed.Get(), p_max_draw_count, indirect_buf_info->resource, p_offset, count_buf_info->resource, p_count_buffer_offset);
+	cmd_buf_info->execute_indirect_since_copy_visibility = true;
 }
 
 void RenderingDeviceDriverD3D12::command_render_draw_indirect(CommandBufferID p_cmd_buffer, BufferID p_indirect_buffer, uint64_t p_offset, uint32_t p_draw_count, uint32_t p_stride) {
@@ -4926,6 +4972,7 @@ void RenderingDeviceDriverD3D12::command_render_draw_indirect(CommandBufferID p_
 	}
 
 	cmd_buf_info->cmd_list->ExecuteIndirect(indirect_cmd_signatures.draw.Get(), p_draw_count, indirect_buf_info->resource, p_offset, nullptr, 0);
+	cmd_buf_info->execute_indirect_since_copy_visibility = true;
 }
 
 void RenderingDeviceDriverD3D12::command_render_draw_indirect_count(CommandBufferID p_cmd_buffer, BufferID p_indirect_buffer, uint64_t p_offset, BufferID p_count_buffer, uint64_t p_count_buffer_offset, uint32_t p_max_draw_count, uint32_t p_stride) {
@@ -4940,6 +4987,7 @@ void RenderingDeviceDriverD3D12::command_render_draw_indirect_count(CommandBuffe
 	}
 
 	cmd_buf_info->cmd_list->ExecuteIndirect(indirect_cmd_signatures.draw.Get(), p_max_draw_count, indirect_buf_info->resource, p_offset, count_buf_info->resource, p_count_buffer_offset);
+	cmd_buf_info->execute_indirect_since_copy_visibility = true;
 }
 
 void RenderingDeviceDriverD3D12::command_render_bind_vertex_buffers(CommandBufferID p_cmd_buffer, uint32_t p_binding_count, const BufferID *p_buffers, const uint64_t *p_offsets, uint64_t p_dynamic_offsets) {
@@ -5465,6 +5513,7 @@ void RenderingDeviceDriverD3D12::command_compute_dispatch_indirect(CommandBuffer
 	}
 
 	cmd_buf_info->cmd_list->ExecuteIndirect(indirect_cmd_signatures.dispatch.Get(), 1, indirect_buf_info->resource, p_offset, nullptr, 0);
+	cmd_buf_info->execute_indirect_since_copy_visibility = true;
 }
 
 // ----- PIPELINE -----
