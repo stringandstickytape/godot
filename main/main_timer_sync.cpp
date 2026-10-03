@@ -532,6 +532,12 @@ void MainTimerSync::set_cpu_ticks_usec(uint64_t p_cpu_ticks_usec) {
 }
 
 void MainTimerSync::set_fixed_fps(int p_fixed_fps) {
+	if (p_fixed_fps != fixed_fps) {
+		// Anthropolis: a runtime switch into or out of fixed-step frames starts the step clock afresh, so the
+		// first fixed frame carries neither the variable-rate deficit nor a partial physics step.
+		time_deficit = 0;
+		time_accum = 0;
+	}
 	fixed_fps = p_fixed_fps;
 }
 
