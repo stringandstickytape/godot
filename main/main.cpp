@@ -2253,6 +2253,9 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 	Engine::get_singleton()->set_max_physics_steps_per_frame(GLOBAL_DEF_BASIC(PropertyInfo(Variant::INT, "physics/common/max_physics_steps_per_frame", PROPERTY_HINT_RANGE, "1,100,1"), 8));
 	Engine::get_singleton()->set_physics_jitter_fix(GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "physics/common/physics_jitter_fix", PROPERTY_HINT_RANGE, "0,2,0.001,or_greater"), 0.5));
 	Engine::get_singleton()->set_max_fps(GLOBAL_DEF(PropertyInfo(Variant::INT, "application/run/max_fps", PROPERTY_HINT_RANGE, "0,1000,1"), 0));
+	// Anthropolis: a runtime fixed-fps switch for the game's recorder (render mode). 0 is off. A positive value
+	// behaves as --fixed-fps does, from the next iteration, unless --fixed-fps was given at launch.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "application/run/anthropolis_runtime_fixed_fps", PROPERTY_HINT_RANGE, "0,1000,1"), 0);
 	if (max_fps >= 0) {
 		Engine::get_singleton()->set_max_fps(max_fps);
 	}
@@ -4926,7 +4929,15 @@ bool Main::iteration() {
 	const uint64_t ticks = OS::get_singleton()->get_ticks_usec();
 	Engine::get_singleton()->_frame_ticks = ticks;
 	main_timer_sync.set_cpu_ticks_usec(ticks);
-	main_timer_sync.set_fixed_fps(fixed_fps);
+	// Anthropolis: --fixed-fps wins; otherwise the runtime setting (0 = off) selects fixed-step frames.
+	int effective_fixed_fps = fixed_fps;
+	if (effective_fixed_fps == -1) {
+		const int runtime_fixed_fps = GLOBAL_GET_CACHED(int, "application/run/anthropolis_runtime_fixed_fps");
+		if (runtime_fixed_fps > 0) {
+			effective_fixed_fps = runtime_fixed_fps;
+		}
+	}
+	main_timer_sync.set_fixed_fps(effective_fixed_fps);
 
 	const uint64_t ticks_elapsed = ticks - last_ticks;
 
@@ -4953,7 +4964,7 @@ bool Main::iteration() {
 	last_ticks = ticks;
 
 	const int max_physics_steps = Engine::get_singleton()->get_user_max_physics_steps_per_frame();
-	if (fixed_fps == -1 && advance.physics_steps > max_physics_steps) {
+	if (effective_fixed_fps == -1 && advance.physics_steps > max_physics_steps) {
 		process_step -= (advance.physics_steps - max_physics_steps) * physics_step;
 		advance.physics_steps = max_physics_steps;
 	}
@@ -5167,7 +5178,7 @@ bool Main::iteration() {
 	}
 #endif
 
-	if (fixed_fps != -1) {
+	if (effective_fixed_fps != -1) {
 		return exit;
 	}
 
