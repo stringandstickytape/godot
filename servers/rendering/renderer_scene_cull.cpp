@@ -3237,8 +3237,14 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 				}
 			}
 
+			// Anthropolis: an instance carrying any cascade route layer is drawn only into the cascades
+			// whose route layer it carries (layers L..L+3 for cascades 0..3).
+			const uint32_t cascade_route = cull_data.cascade_route_first_layer > 0 ? (idata.layer_mask >> (cull_data.cascade_route_first_layer - 1)) & 0xF : 0;
 			for (uint32_t j = 0; j < cull_data.cull->shadow_count; j++) {
 				for (uint32_t k = 0; k < cull_data.cull->shadows[j].cascade_count; k++) {
+					if (cascade_route != 0 && !(cascade_route & (1u << k))) {
+						continue;
+					}
 					if (!light_culler->cull_directional_light(cull_data.scenario->instance_aabbs[i], j, k)) { // pass the cascade index
 						continue;
 					}
@@ -3431,6 +3437,9 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 		cull_data.occlusion_buffer = RendererSceneOcclusionCull::get_singleton()->buffer_get_ptr(p_viewport);
 		cull_data.camera_matrix = &p_camera_data->main_projection;
 		cull_data.visibility_viewport_mask = scenario->viewport_visibility_masks.has(p_viewport) ? scenario->viewport_visibility_masks[p_viewport] : 0;
+		// Anthropolis: read every frame so the game can switch routing on at runtime; clamped so all
+		// four route layers exist (visual layers are 1..20).
+		cull_data.cascade_route_first_layer = (uint32_t)CLAMP(int(GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/anthropolis_cascade_route_first_layer")), 0, 17);
 #ifdef DEBUG_CULL_TIME
 		uint64_t time_from = OS::get_singleton()->get_ticks_usec();
 #endif
@@ -4522,6 +4531,8 @@ RendererSceneCull::RendererSceneCull() {
 	light_culler = memnew(RenderingLightCuller);
 
 	bool tighter_caster_culling = GLOBAL_DEF("rendering/lights_and_shadows/tighter_shadow_caster_culling", true);
+	// Anthropolis: registered here so a game can detect the patch with ProjectSettings.has_setting.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/anthropolis_cascade_route_first_layer", PROPERTY_HINT_RANGE, "0,17,1"), 0);
 	light_culler->set_caster_culling_active(tighter_caster_culling);
 	light_culler->set_light_culling_active(tighter_caster_culling);
 }

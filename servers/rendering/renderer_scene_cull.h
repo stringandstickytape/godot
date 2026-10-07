@@ -1148,6 +1148,9 @@ public:
 		const RendererSceneOcclusionCull::HZBuffer *occlusion_buffer;
 		const Projection *camera_matrix;
 		uint64_t visibility_viewport_mask;
+		// Anthropolis: first of four visual layers that route an instance to directional shadow
+		// cascades 0..3 (rendering/lights_and_shadows/anthropolis_cascade_route_first_layer; 0 = off).
+		uint32_t cascade_route_first_layer = 0;
 	};
 
 	void _scene_cull_threaded(uint32_t p_thread, CullData *cull_data);
