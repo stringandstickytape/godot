@@ -938,6 +938,9 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 				IID_PPV_ARGS(buffer.GetAddressOf()));
 	}
 
+	if (!SUCCEEDED(res)) {
+		_anthropolis_report_device_removed("buffer CreateResource", res);
+	}
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), BufferID(), "Can't create buffer of size: " + itos(p_size) + ", error " + vformat("0x%08ux", (uint64_t)res) + ".");
 
 	// Bookkeep.
@@ -946,6 +949,9 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 	if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
 		void *persistent_ptr = nullptr;
 		res = buffer->Map(0, &VOID_RANGE, &persistent_ptr);
+		if (!SUCCEEDED(res)) {
+			_anthropolis_report_device_removed("persistent buffer Map", res);
+		}
 		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), BufferID(), "Map failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 
 		BufferDynamicInfo *dyn_buffer = VersatileResource::allocate<BufferDynamicInfo>(resources_allocator);
@@ -995,6 +1001,9 @@ uint8_t *RenderingDeviceDriverD3D12::buffer_map(BufferID p_buffer) {
 	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
 	void *data_ptr = nullptr;
 	HRESULT res = buf_info->resource->Map(0, &VOID_RANGE, &data_ptr);
+	if (!SUCCEEDED(res)) {
+		_anthropolis_report_device_removed("buffer Map", res);
+	}
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), nullptr, "Map failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	return (uint8_t *)data_ptr;
 }
@@ -1400,6 +1409,9 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 					allocation.GetAddressOf(),
 					IID_PPV_ARGS(main_texture.GetAddressOf()));
 			initial_state = D3D12_RESOURCE_STATE_COPY_DEST;
+		}
+		if (!SUCCEEDED(res)) {
+			_anthropolis_report_device_removed("texture CreateResource", res);
 		}
 		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), TextureID(), "CreateResource failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 		texture = main_texture.Get();
@@ -2549,7 +2561,10 @@ Error RenderingDeviceDriverD3D12::command_queue_execute_and_present(CommandQueue
 		SwapChain *swap_chain = (SwapChain *)(p_swap_chains[i].id);
 		res = swap_chain->d3d_swap_chain->Present(swap_chain->sync_interval, swap_chain->present_flags);
 		if (!SUCCEEDED(res)) {
-			print_verbose(vformat("D3D12: Presenting swapchain failed with error 0x%08ux.", (uint64_t)res));
+			// Anthropolis: an error with the removed reason when the device is removed, else verbose as upstream.
+			if (!_anthropolis_report_device_removed("Present", res)) {
+				print_verbose(vformat("D3D12: Presenting swapchain failed with error 0x%08ux.", (uint64_t)res));
+			}
 			any_present_failed = true;
 		}
 	}
@@ -5757,6 +5772,44 @@ void RenderingDeviceDriverD3D12::_set_object_name(ID3D12Object *p_object, String
 	WCHAR *name_w = (WCHAR *)alloca(sizeof(WCHAR) * (name_len + 1));
 	MultiByteToWideChar(CP_UTF8, 0, p_object_name.utf8().get_data(), -1, name_w, name_len);
 	p_object->SetName(name_w);
+}
+
+// Anthropolis: a call that finds the device removed returns only DXGI_ERROR_DEVICE_REMOVED or an allocation error, and the
+// removal can go unseen for frames before it (fence waits and ExecuteCommandLists report nothing). Called only after a
+// failed call, so a healthy device prints nothing. Returns whether the device is removed.
+bool RenderingDeviceDriverD3D12::_anthropolis_report_device_removed(const char *p_call, HRESULT p_res) {
+	HRESULT reason = device->GetDeviceRemovedReason();
+	if (reason == S_OK) {
+		return false;
+	}
+	if (anthropolis_device_removed_reported.exchange(true)) {
+		return true;
+	}
+	const char *reason_name = "";
+	switch (reason) {
+		case DXGI_ERROR_DEVICE_HUNG:
+			reason_name = " DXGI_ERROR_DEVICE_HUNG (a GPU hang or page fault)";
+			break;
+		case DXGI_ERROR_DEVICE_RESET:
+			reason_name = " DXGI_ERROR_DEVICE_RESET";
+			break;
+		case DXGI_ERROR_DEVICE_REMOVED:
+			reason_name = " DXGI_ERROR_DEVICE_REMOVED (the adapter was removed or its driver updated)";
+			break;
+		case DXGI_ERROR_DRIVER_INTERNAL_ERROR:
+			reason_name = " DXGI_ERROR_DRIVER_INTERNAL_ERROR";
+			break;
+		case DXGI_ERROR_INVALID_CALL:
+			reason_name = " DXGI_ERROR_INVALID_CALL (the application made an invalid call)";
+			break;
+		case E_OUTOFMEMORY:
+			reason_name = " E_OUTOFMEMORY";
+			break;
+		default:
+			break;
+	}
+	ERR_PRINT(vformat("D3D12 device removed, found by %s (0x%08ux): GetDeviceRemovedReason 0x%08ux%s.", p_call, (uint64_t)p_res, (uint64_t)reason, reason_name));
+	return true;
 }
 
 void RenderingDeviceDriverD3D12::set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) {

@@ -40,6 +40,7 @@
 
 #include <drivers/d3d12/godot_d3dx12.h>
 #include <wrl/client.h>
+#include <atomic>
 
 #ifdef DEV_ENABLED
 #define CUSTOM_INFO_QUEUE_ENABLED 0
@@ -189,6 +190,10 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	Error _initialize_allocator();
 	Error _initialize_frames(uint32_t p_frame_count);
 	Error _initialize_command_signatures();
+
+	// Anthropolis: after a failed call, print once why the device was removed, if it was.
+	std::atomic<bool> anthropolis_device_removed_reported{ false };
+	bool _anthropolis_report_device_removed(const char *p_call, HRESULT p_res);
 
 public:
 	Error initialize(uint32_t p_device_index, uint32_t p_frame_count) override final;
