@@ -6475,6 +6475,8 @@ Error RenderingDeviceDriverD3D12::_initialize_allocator() {
 
 	HRESULT res = D3D12MA::CreateAllocator(&allocator_desc, &allocator);
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::CreateAllocator failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+	// Anthropolis: say on every machine whether D3D12 tight alignment (tier 1 or above) is in use for small buffers.
+	print_line(vformat("D3D12: tight alignment %s.", allocator->IsTightAlignmentSupported() ? "supported, in use" : "not supported"));
 
 	if (allocator->IsGPUUploadHeapSupported()) {
 		dynamic_persistent_upload_heap = D3D12_HEAP_TYPE_GPU_UPLOAD;
