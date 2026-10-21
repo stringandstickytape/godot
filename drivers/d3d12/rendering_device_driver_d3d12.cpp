@@ -2301,10 +2301,17 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 		global_barriers.push_back(global_barrier);
 	}
 
+	// Anthropolis: a global barrier applies to all buffer memory (buffers have no layout), and the render graph ORs
+	// every buffer barrier's accesses into the memory barrier it passes beside them, under the same stages. So with
+	// a memory barrier present the buffer barriers order nothing more; skipping them saves their conversion and the
+	// runtime's and the driver's per-barrier work. Off by default.
+	const bool buffer_barriers_covered = p_memory_barriers.size() > 0 &&
+			GLOBAL_GET_CACHED(bool, "rendering/rendering_device/d3d12/anthropolis_global_buffer_barriers");
+
 	D3D12_BUFFER_BARRIER buffer_barrier_d3d12 = {};
 	buffer_barrier_d3d12.Offset = 0;
 	buffer_barrier_d3d12.Size = UINT64_MAX; // The specification says this must be the size of the buffer barrier.
-	for (uint32_t i = 0; i < p_buffer_barriers.size(); i++) {
+	for (uint32_t i = 0; !buffer_barriers_covered && i < p_buffer_barriers.size(); i++) {
 		const BufferBarrier &buffer_barrier_rd = p_buffer_barriers[i];
 		const BufferInfo *buffer_info = (const BufferInfo *)(buffer_barrier_rd.buffer.id);
 		_rd_stages_and_access_to_d3d12(p_src_stages, RDD::TEXTURE_LAYOUT_MAX, buffer_barrier_rd.src_access, buffer_barrier_d3d12.SyncBefore, buffer_barrier_d3d12.AccessBefore);
@@ -6491,6 +6498,9 @@ Error RenderingDeviceDriverD3D12::_initialize_command_signatures() {
 
 Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p_frame_count) {
 	glsl_type_singleton_init_or_ref();
+
+	// Anthropolis: registered here so a game can detect the patch with ProjectSettings.has_setting.
+	GLOBAL_DEF("rendering/rendering_device/d3d12/anthropolis_global_buffer_barriers", false);
 
 	context_device = context_driver->device_get(p_device_index);
 	adapter.Attach(context_driver->create_adapter(p_device_index));
