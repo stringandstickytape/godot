@@ -32,6 +32,7 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/os/os.h"
 #include "core/string/ustring.h"
 #include "core/templates/local_vector.h"
 
@@ -55,6 +56,7 @@ using Microsoft::WRL::ComPtr;
 // GUID values from https://github.com/microsoft/DirectX-Headers/blob/7a9f4d06911d30eecb56a4956dab29dcca2709ed/include/directx/d3d12.idl#L5877-L5881
 const GUID CLSID_D3D12DebugGodot = { 0xf2352aeb, 0xdd84, 0x49fe, { 0xb9, 0x7b, 0xa9, 0xdc, 0xfd, 0xcc, 0x1b, 0x4f } };
 const GUID CLSID_D3D12SDKConfigurationGodot = { 0x7cda6aca, 0xa03e, 0x49c8, { 0x94, 0x58, 0x03, 0x34, 0xd2, 0x0e, 0x07, 0xce } };
+const GUID CLSID_D3D12DeviceRemovedExtendedDataGodot = { 0x4a75bbc4, 0x9ff4, 0x4ad8, { 0x9f, 0x18, 0xab, 0xae, 0x84, 0xdc, 0x5f, 0xf2 } };
 
 #ifdef PIX_ENABLED
 #if defined(__GNUC__)
@@ -139,6 +141,32 @@ Error RenderingContextDriverD3D12::_initialize_debug_layers() {
 	return OK;
 }
 
+// Anthropolis: Device Removed Extended Data, asked for with ANTHROPOLIS_D3D12_DRED=1 in the environment. It records
+// auto-breadcrumbs (with marker strings) and page faults for the device created after this, so a removed device can name
+// the operation and allocation at fault (RenderingDeviceDriverD3D12::_anthropolis_print_dred). It costs GPU and CPU time,
+// so it is off unless asked for, and it must be set before the device exists, so it is not a project setting.
+Error RenderingContextDriverD3D12::_anthropolis_initialize_dred() {
+	ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dred_settings;
+	HRESULT res;
+
+	if (device_factory) {
+		res = device_factory->GetConfigurationInterface(CLSID_D3D12DeviceRemovedExtendedDataGodot, IID_PPV_ARGS(&dred_settings));
+	} else {
+		PFN_D3D12_GET_DEBUG_INTERFACE d3d_D3D12GetDebugInterface = (PFN_D3D12_GET_DEBUG_INTERFACE)(void *)GetProcAddress(lib_d3d12, "D3D12GetDebugInterface");
+		ERR_FAIL_NULL_V(d3d_D3D12GetDebugInterface, ERR_CANT_CREATE);
+
+		res = d3d_D3D12GetDebugInterface(IID_PPV_ARGS(&dred_settings));
+	}
+
+	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, vformat("D3D12: DRED was asked for (ANTHROPOLIS_D3D12_DRED=1) but its settings are unavailable (0x%08ux).", (uint64_t)res));
+	dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+	dred_settings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+	dred_settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+	anthropolis_dred = true;
+	print_line(vformat("D3D12: DRED on (auto-breadcrumbs with marker strings, page faults), set through the %s.", device_factory ? "device factory" : "debug interface"));
+	return OK;
+}
+
 Error RenderingContextDriverD3D12::_create_dxgi_factory() {
 	const UINT dxgi_factory_flags = use_validation_layers() ? DXGI_CREATE_FACTORY_DEBUG : 0;
 
@@ -214,12 +242,21 @@ bool RenderingContextDriverD3D12::use_validation_layers() const {
 	return Engine::get_singleton()->is_validation_layers_enabled();
 }
 
+bool RenderingContextDriverD3D12::is_anthropolis_dred_enabled() const {
+	return anthropolis_dred;
+}
+
 Error RenderingContextDriverD3D12::initialize() {
 	Error err = _init_device_factory();
 	ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 
 	if (use_validation_layers()) {
 		err = _initialize_debug_layers();
+		ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
+	}
+
+	if (OS::get_singleton()->get_environment("ANTHROPOLIS_D3D12_DRED") == "1") {
+		err = _anthropolis_initialize_dred();
 		ERR_FAIL_COND_V(err != OK, ERR_CANT_CREATE);
 	}
 

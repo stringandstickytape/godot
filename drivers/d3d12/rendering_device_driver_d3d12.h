@@ -191,9 +191,11 @@ class RenderingDeviceDriverD3D12 : public RenderingDeviceDriver {
 	Error _initialize_frames(uint32_t p_frame_count);
 	Error _initialize_command_signatures();
 
-	// Anthropolis: after a failed call, print once why the device was removed, if it was.
+	// Anthropolis: after a failed call, print once why the device was removed, if it was, and with DRED on what it recorded.
 	std::atomic<bool> anthropolis_device_removed_reported{ false };
 	bool _anthropolis_report_device_removed(const char *p_call, HRESULT p_res);
+	void _anthropolis_print_dred();
+	void _anthropolis_print_dred_list(const D3D12_AUTO_BREADCRUMB_NODE1 *p_node, uint32_t p_completed);
 
 public:
 	Error initialize(uint32_t p_device_index, uint32_t p_frame_count) override final;
@@ -734,6 +736,8 @@ public:
 		Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
 		const ShaderInfo *shader_info = nullptr;
 		RenderPipelineInfo render_info;
+		// Anthropolis: the name set_object_name gave it, kept while DRED is on and marked at each compute bind.
+		Char16String anthropolis_dred_name;
 	};
 
 	virtual void pipeline_free(PipelineID p_pipeline) override final;

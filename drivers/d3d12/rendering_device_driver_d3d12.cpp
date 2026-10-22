@@ -5458,6 +5458,16 @@ void RenderingDeviceDriverD3D12::command_bind_compute_pipeline(CommandBufferID p
 	const PipelineInfo *pipeline_info = (const PipelineInfo *)p_pipeline.id;
 	const ShaderInfo *shader_info_in = pipeline_info->shader_info;
 
+	if (context_driver->is_anthropolis_dred_enabled()) {
+		// Anthropolis: DRED keeps a marker's string with its breadcrumb, so the dispatches that follow carry this
+		// pipeline's name into a removed device's record. Metadata 0 is a UTF-16 string.
+		static const char16_t unnamed[] = u"(unnamed compute pipeline)";
+		const Char16String &name = pipeline_info->anthropolis_dred_name;
+		const char16_t *text = name.length() > 0 ? name.get_data() : unnamed;
+		const UINT length = name.length() > 0 ? (UINT)name.length() : (UINT)(std::size(unnamed) - 1);
+		cmd_buf_info->cmd_list->SetMarker(0, text, (length + 1) * sizeof(char16_t));
+	}
+
 	if (cmd_buf_info->compute_pso != pipeline_info->pso.Get()) {
 		cmd_buf_info->cmd_list->SetPipelineState(pipeline_info->pso.Get());
 
@@ -5816,7 +5826,132 @@ bool RenderingDeviceDriverD3D12::_anthropolis_report_device_removed(const char *
 			break;
 	}
 	ERR_PRINT(vformat("D3D12 device removed, found by %s (0x%08ux): GetDeviceRemovedReason 0x%08ux%s.", p_call, (uint64_t)p_res, (uint64_t)reason, reason_name));
+	if (context_driver->is_anthropolis_dred_enabled()) {
+		_anthropolis_print_dred();
+	}
 	return true;
+}
+
+static const char *_anthropolis_dred_op_name(D3D12_AUTO_BREADCRUMB_OP p_op) {
+	static const char *names[] = {
+		"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch",
+		"CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
+		"ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+		"BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames", "AtomicCopyBufferUINT", "AtomicCopyBufferUINT64",
+		"ResolveSubresourceRegion", "WriteBufferImmediate", "DecodeFrame1", "SetProtectedResourceSession", "DecodeFrame2",
+		"ProcessFrames1", "BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
+		"CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion",
+		"ResolveMotionVectorHeap", "SetPipelineState1", "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh",
+		"EncodeFrame", "ResolveEncoderOutputMetadata", "Barrier", "BeginCommandList", "DispatchGraph", "SetProgram",
+		"EncodeFrame1", "ResolveEncoderOutputMetadata1"
+	};
+	static_assert(std::size(names) == D3D12_AUTO_BREADCRUMB_OP_RESOLVEENCODEROUTPUTMETADATA1 + 1);
+	return (uint32_t)p_op < std::size(names) ? names[p_op] : "(unknown operation)";
+}
+
+// Anthropolis: what DRED recorded for the removed device (ANTHROPOLIS_D3D12_DRED=1): each command list the GPU did not
+// finish, then the page fault, if any, with the allocations at its address.
+void RenderingDeviceDriverD3D12::_anthropolis_print_dred() {
+	ComPtr<ID3D12DeviceRemovedExtendedData1> dred;
+	HRESULT res = device.As(&dred);
+	if (!SUCCEEDED(res)) {
+		print_error(vformat("D3D12 DRED: the removed device has no DRED record (0x%08ux).", (uint64_t)res));
+		return;
+	}
+
+	static constexpr uint32_t max_lists = 8;
+	D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs = {};
+	res = dred->GetAutoBreadcrumbsOutput1(&breadcrumbs);
+	if (!SUCCEEDED(res)) {
+		print_error(vformat("D3D12 DRED: no breadcrumbs (GetAutoBreadcrumbsOutput1 0x%08ux).", (uint64_t)res));
+	} else {
+		uint32_t lists = 0;
+		uint32_t unfinished = 0;
+		for (const D3D12_AUTO_BREADCRUMB_NODE1 *node = breadcrumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
+			lists++;
+			if (node->pLastBreadcrumbValue && *node->pLastBreadcrumbValue < node->BreadcrumbCount) {
+				unfinished++;
+			}
+		}
+		print_error(vformat("D3D12 DRED: %d command lists recorded, %d not finished by the GPU%s.", lists, unfinished, unfinished > max_lists ? vformat(" (the first %d follow)", max_lists) : String()));
+		uint32_t printed = 0;
+		for (const D3D12_AUTO_BREADCRUMB_NODE1 *node = breadcrumbs.pHeadAutoBreadcrumbNode; node && printed < max_lists; node = node->pNext) {
+			if (node->pLastBreadcrumbValue && *node->pLastBreadcrumbValue < node->BreadcrumbCount) {
+				_anthropolis_print_dred_list(node, *node->pLastBreadcrumbValue);
+				printed++;
+			}
+		}
+	}
+
+	D3D12_DRED_PAGE_FAULT_OUTPUT1 fault = {};
+	res = dred->GetPageFaultAllocationOutput1(&fault);
+	if (!SUCCEEDED(res)) {
+		print_error(vformat("D3D12 DRED: no page fault record (GetPageFaultAllocationOutput1 0x%08ux).", (uint64_t)res));
+		return;
+	}
+	if (fault.PageFaultVA == 0) {
+		print_error("D3D12 DRED: no page fault recorded.");
+		return;
+	}
+	print_error(vformat("D3D12 DRED: page fault at GPU address 0x%x.", (uint64_t)fault.PageFaultVA));
+	auto print_allocations = [](const char *p_what, const D3D12_DRED_ALLOCATION_NODE1 *p_node) {
+		uint32_t count = 0;
+		for (; p_node; p_node = p_node->pNext) {
+			if (count++ < max_lists) {
+				String name = p_node->ObjectNameW ? String::utf16((const char16_t *)p_node->ObjectNameW) : (p_node->ObjectNameA ? String(p_node->ObjectNameA) : String("(unnamed)"));
+				print_error(vformat("D3D12 DRED:   %s: %s (allocation type %d).", p_what, name, (int)p_node->AllocationType));
+			}
+		}
+		if (count == 0) {
+			print_error(vformat("D3D12 DRED:   %s: none.", p_what));
+		} else if (count > max_lists) {
+			print_error(vformat("D3D12 DRED:   %s: %d more.", p_what, count - max_lists));
+		}
+	};
+	print_allocations("allocated there", fault.pHeadExistingAllocationNode);
+	print_allocations("freed there recently", fault.pHeadRecentFreedAllocationNode);
+}
+
+// Anthropolis: one unfinished command list. The value DRED reads back is the count of operations the GPU finished, so the
+// operation at that index is the first unfinished one, and the last marker before it names the compute pipeline it ran
+// under (command_bind_compute_pipeline marks every bind).
+void RenderingDeviceDriverD3D12::_anthropolis_print_dred_list(const D3D12_AUTO_BREADCRUMB_NODE1 *p_node, uint32_t p_completed) {
+	auto marker_at = [p_node](uint32_t p_index) {
+		for (uint32_t i = 0; i < p_node->BreadcrumbContextsCount; i++) {
+			const D3D12_DRED_BREADCRUMB_CONTEXT &context = p_node->pBreadcrumbContexts[i];
+			if (context.BreadcrumbIndex == p_index && context.pContextString) {
+				return String::utf16((const char16_t *)context.pContextString);
+			}
+		}
+		return String();
+	};
+	const String queue = p_node->pCommandQueueDebugNameW ? String::utf16((const char16_t *)p_node->pCommandQueueDebugNameW) : String("(unnamed)");
+	const String list = p_node->pCommandListDebugNameW ? String::utf16((const char16_t *)p_node->pCommandListDebugNameW) : String("(unnamed)");
+	if (p_completed == 0) {
+		print_error(vformat("D3D12 DRED: queue %s, list %s: not started (%d operations).", queue, list, p_node->BreadcrumbCount));
+		return;
+	}
+
+	String pipeline = "(none marked)";
+	uint32_t dispatches = 0;
+	for (uint32_t i = 0; i <= p_completed; i++) {
+		const D3D12_AUTO_BREADCRUMB_OP op = p_node->pCommandHistory[i];
+		if (op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER) {
+			const String marker = marker_at(i);
+			pipeline = marker.is_empty() ? String("(a marker without a string)") : marker;
+			dispatches = 0;
+		} else if (op == D3D12_AUTO_BREADCRUMB_OP_DISPATCH || op == D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT) {
+			dispatches++;
+		}
+	}
+	print_error(vformat("D3D12 DRED: queue %s, list %s: %d of %d operations finished. The first unfinished, [%d] %s, runs under pipeline %s, dispatch %d since its bind.",
+			queue, list, p_completed, p_node->BreadcrumbCount, p_completed, _anthropolis_dred_op_name(p_node->pCommandHistory[p_completed]), pipeline, dispatches));
+	const uint32_t from = p_completed > 6 ? p_completed - 6 : 0;
+	const uint32_t to = MIN(p_node->BreadcrumbCount, p_completed + 4);
+	for (uint32_t i = from; i < to; i++) {
+		const String marker = marker_at(i);
+		print_error(vformat("D3D12 DRED:   [%d] %s%s%s", i, _anthropolis_dred_op_name(p_node->pCommandHistory[i]), marker.is_empty() ? String() : " \"" + marker + "\"", i == p_completed ? "  <- first unfinished" : ""));
+	}
 }
 
 void RenderingDeviceDriverD3D12::set_object_name(ObjectType p_type, ID p_driver_id, const String &p_name) {
@@ -5841,8 +5976,11 @@ void RenderingDeviceDriverD3D12::set_object_name(ObjectType p_type, ID p_driver_
 			// Descriptor heaps are suballocated from bigger heaps and can therefore not be given unique names.
 		} break;
 		case OBJECT_TYPE_PIPELINE: {
-			const PipelineInfo *pipeline_info = (const PipelineInfo *)p_driver_id.id;
+			PipelineInfo *pipeline_info = (PipelineInfo *)p_driver_id.id;
 			_set_object_name(pipeline_info->pso.Get(), p_name);
+			if (context_driver->is_anthropolis_dred_enabled()) {
+				pipeline_info->anthropolis_dred_name = p_name.utf16();
+			}
 		} break;
 		default: {
 			DEV_ASSERT(false);

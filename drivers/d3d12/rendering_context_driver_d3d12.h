@@ -49,9 +49,11 @@ class RenderingContextDriverD3D12 : public RenderingContextDriver {
 	Microsoft::WRL::ComPtr<IDXGIFactory2> dxgi_factory;
 	TightLocalVector<Device> driver_devices;
 	bool tearing_supported = false;
+	bool anthropolis_dred = false;
 
 	Error _init_device_factory();
 	Error _initialize_debug_layers();
+	Error _anthropolis_initialize_dred();
 	Error _create_dxgi_factory();
 	Error _initialize_devices();
 
@@ -121,6 +123,7 @@ public:
 	IDXGIFactory2 *dxgi_factory_get();
 	bool get_tearing_supported() const;
 	bool use_validation_layers() const;
+	bool is_anthropolis_dred_enabled() const;
 
 	RenderingContextDriverD3D12();
 	virtual ~RenderingContextDriverD3D12() override;
