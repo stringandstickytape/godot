@@ -8,7 +8,10 @@
 
     <!-- To generate the .runtimeconfig.json file-->
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <RollForward>LatestMajor</RollForward>
+    <!-- Run on .NET 9, the runtime the game targets and its exports ship, not the newest major installed. The
+         TargetFramework stays net8.0, so GodotPlugins.dll is unchanged; only its .runtimeconfig.json names 9.0.0. -->
+    <RollForward>LatestMinor</RollForward>
+    <RuntimeFrameworkVersion>9.0.0</RuntimeFrameworkVersion>
   </PropertyGroup>
 
   <ItemGroup>
