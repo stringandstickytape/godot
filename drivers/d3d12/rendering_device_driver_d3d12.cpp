@@ -72,6 +72,11 @@ using Microsoft::WRL::ComPtr;
 
 static const D3D12_RANGE VOID_RANGE = {};
 
+// Anthropolis: defined in thirdparty/d3d12ma/D3D12MemAlloc.cpp; begin_segment copies the project setting into it.
+namespace D3D12MA {
+extern std::atomic<bool> anthropolis_tlsf_skip_futile_search;
+}
+
 static const uint32_t MAX_DYNAMIC_BUFFERS = 8u; // Minimum guaranteed by Vulkan.
 
 /*****************/
@@ -5754,6 +5759,11 @@ void RenderingDeviceDriverD3D12::begin_segment(uint32_t p_frame_index, uint32_t 
 	frames_drawn = p_frames_drawn;
 	allocator->SetCurrentFrameIndex(p_frames_drawn);
 
+	// Anthropolis: D3D12MA's TLSF search skips the futile full search when no free list can fit a request (VMA's fix
+	// for VulkanMemoryAllocator #343). Same placements, without checking every smaller free block. Off by default.
+	D3D12MA::anthropolis_tlsf_skip_futile_search.store(
+			GLOBAL_GET_CACHED(bool, "rendering/rendering_device/d3d12/anthropolis_tlsf_skip_futile_search"), std::memory_order_relaxed);
+
 	segment_begun = true;
 }
 
@@ -6556,6 +6566,7 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 
 	// Anthropolis: registered here so a game can detect the patch with ProjectSettings.has_setting.
 	GLOBAL_DEF("rendering/rendering_device/d3d12/anthropolis_global_buffer_barriers", false);
+	GLOBAL_DEF("rendering/rendering_device/d3d12/anthropolis_tlsf_skip_futile_search", false);
 
 	context_device = context_driver->device_get(p_device_index);
 	adapter.Attach(context_driver->create_adapter(p_device_index));

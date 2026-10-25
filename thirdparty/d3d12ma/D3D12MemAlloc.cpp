@@ -4658,6 +4658,10 @@ void BlockMetadata_TLSF::GetAllocationInfo(AllocHandle allocHandle, VIRTUAL_ALLO
     outInfo.pPrivateData = block->PrivateData();
 }
 
+// Anthropolis: set once a frame by RenderingDeviceDriverD3D12 from
+// rendering/rendering_device/d3d12/anthropolis_tlsf_skip_futile_search (default off).
+std::atomic<bool> anthropolis_tlsf_skip_futile_search{ false };
+
 bool BlockMetadata_TLSF::CreateAllocationRequest(
     UINT64 allocSize,
     UINT64 allocAlignment,
@@ -4691,8 +4695,11 @@ bool BlockMetadata_TLSF::CreateAllocationRequest(
     else
         sizeForNextList += smallSizeStep;
 
-    UINT32 nextListIndex = 0;
-    UINT32 prevListIndex = 0;
+    // Anthropolis: VMA's fix 59734bbc63 (VulkanMemoryAllocator #343). Starting both indices at m_ListsCount skips the
+    // worst-case full search when no list can fit the request, instead of checking every smaller free block.
+    const bool anthropolisSkipFutileSearch = anthropolis_tlsf_skip_futile_search.load(std::memory_order_relaxed);
+    UINT32 nextListIndex = anthropolisSkipFutileSearch ? m_ListsCount : 0;
+    UINT32 prevListIndex = anthropolisSkipFutileSearch ? m_ListsCount : 0;
     Block* nextListBlock = NULL;
     Block* prevListBlock = NULL;
 
