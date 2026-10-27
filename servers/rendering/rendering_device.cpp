@@ -8321,6 +8321,12 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph.begin");
 	draw_graph.begin();
 
+	// Anthropolis TEMP spike (never on the fork's mainline): mode 1 records its chain first in the frame's graph, ahead
+	// of every timestamp and synchronization point the frame records (D5's review).
+	if (is_main_instance) {
+		_anthropolis_spike_frame(true);
+	}
+
 	// Erase pending resources.
 	GodotProfileZoneGrouped(_profile_zone, "_free_pending_resources");
 	_free_pending_resources(frame);
@@ -8364,9 +8370,9 @@ void RenderingDevice::_end_frame() {
 	// The command buffer must be copied into a stack variable as the driver workarounds can change the command buffer in use.
 	RDD::CommandBufferID command_buffer = frames[frame].command_buffer;
 
-	// Anthropolis TEMP spike (never on the fork's mainline).
+	// Anthropolis TEMP spike (never on the fork's mainline): mode 2's submit and the report.
 	if (is_main_instance) {
-		_anthropolis_spike_frame(command_buffer);
+		_anthropolis_spike_frame(false);
 	}
 
 	GodotProfileZoneGroupedFirst(_profile_zone, "_submit_transfer_workers");
@@ -8466,11 +8472,36 @@ void RenderingDevice::_anthropolis_spike_init() {
 	print_line(vformat("[AnthropolisSpike] ready: side compute queue family %d, %d frames.", (int64_t)s.queue_family.id, frames.size()));
 }
 
-void RenderingDevice::_anthropolis_spike_frame(RDD::CommandBufferID p_main_command_buffer) {
+void RenderingDevice::_anthropolis_spike_frame(bool p_frame_start) {
 	AnthropolisSpike &s = anthropolis_spike;
 	const int mode = GLOBAL_GET_CACHED(int, "rendering/rendering_device/anthropolis_spike_queue_mode");
 	const uint32_t dispatches = MAX(1, GLOBAL_GET_CACHED(int, "rendering/rendering_device/anthropolis_spike_chain_dispatches"));
 	const uint32_t iterations = MAX(1, GLOBAL_GET_CACHED(int, "rendering/rendering_device/anthropolis_spike_chain_iterations"));
+	uint32_t push_constants[4] = { iterations, 0, 0, 0 };
+
+	if (p_frame_start) {
+		// Mode 1, through the graph like the minute hook today: each dispatch depends on the one before it.
+		if (mode != 1 || s.failed) {
+			return;
+		}
+		if (!s.initialized) {
+			_anthropolis_spike_init();
+			if (s.failed) {
+				return;
+			}
+		}
+		for (uint32_t i = 0; i < dispatches; i++) {
+			push_constants[1] = i;
+			ComputeListID list = compute_list_begin();
+			compute_list_bind_compute_pipeline(list, s.pipeline);
+			compute_list_bind_uniform_set(list, s.main_set, 0);
+			compute_list_set_push_constant(list, push_constants, sizeof(push_constants));
+			compute_list_dispatch(list, 1, 1, 1);
+			compute_list_end();
+		}
+		return;
+	}
+
 	const uint64_t now_usec = OS::get_singleton()->get_ticks_usec();
 
 	// One line every 5 s, and on every mode change, for the window just ended.
@@ -8492,30 +8523,19 @@ void RenderingDevice::_anthropolis_spike_frame(RDD::CommandBufferID p_main_comma
 		s.last_mode = mode;
 	}
 
-	if (mode == 0) {
+	// Every frame counts, mode 0's included (D5's review), so each window's fps compares across modes.
+	s.frames++;
+	if (mode != 2 || s.failed) {
 		return;
 	}
 	if (!s.initialized) {
 		_anthropolis_spike_init();
-	}
-	if (s.failed) {
-		return;
+		if (s.failed) {
+			return;
+		}
 	}
 
-	uint32_t push_constants[4] = { iterations, 0, 0, 0 };
-	if (mode == 1) {
-		// Through the graph, like the minute hook today: each dispatch depends on the one before it, so dispatch i
-		// lands in graph level i beside whatever else the frame recorded.
-		for (uint32_t i = 0; i < dispatches; i++) {
-			push_constants[1] = i;
-			ComputeListID list = compute_list_begin();
-			compute_list_bind_compute_pipeline(list, s.pipeline);
-			compute_list_bind_uniform_set(list, s.main_set, 0);
-			compute_list_set_push_constant(list, push_constants, sizeof(push_constants));
-			compute_list_dispatch(list, 1, 1, 1);
-			compute_list_end();
-		}
-	} else {
+	{
 		// On the second compute queue, with no semaphore either way, so the main queue's barriers never wait for it.
 		const uint32_t f = frame;
 		if (s.fence_signaled[f]) {
@@ -8554,7 +8574,6 @@ void RenderingDevice::_anthropolis_spike_frame(RDD::CommandBufferID p_main_comma
 		driver->command_queue_execute_and_present(s.queue, {}, command_buffer, {}, s.fences[f], {});
 		s.fence_signaled[f] = true;
 	}
-	s.frames++;
 }
 
 void RenderingDevice::_anthropolis_spike_finalize() {

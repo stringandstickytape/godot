@@ -1788,7 +1788,7 @@ private:
 	} anthropolis_spike;
 
 	void _anthropolis_spike_init();
-	void _anthropolis_spike_frame(RDD::CommandBufferID p_main_command_buffer);
+	void _anthropolis_spike_frame(bool p_frame_start);
 	void _anthropolis_spike_finalize();
 
 	/**************************/
