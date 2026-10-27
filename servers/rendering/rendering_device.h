@@ -1759,6 +1759,38 @@ private:
 	RDD::CommandQueueID transfer_queue;
 	RDD::CommandQueueID present_queue;
 
+	// Anthropolis TEMP spike, never on the fork's mainline (game repo docs/design/minute-work-fixed-latency.md §5 step 2):
+	// a synthetic latency-bound compute chain each frame, on the main queue's graph (mode 1) or on a second compute
+	// queue with no semaphore to the main queue (mode 2). Off (mode 0) unless the game sets
+	// rendering/rendering_device/anthropolis_spike_queue_mode.
+	struct AnthropolisSpike {
+		bool initialized = false;
+		bool failed = false;
+		RDD::CommandQueueFamilyID queue_family;
+		RDD::CommandQueueID queue;
+		LocalVector<RDD::CommandPoolID> pools;
+		LocalVector<RDD::CommandBufferID> buffers;
+		LocalVector<RDD::FenceID> fences;
+		LocalVector<bool> fence_signaled;
+		LocalVector<RDD::QueryPoolID> timestamp_pools;
+		RID shader;
+		RID pipeline;
+		RID main_buffer;
+		RID main_set;
+		RID side_buffer;
+		RID side_set;
+		int last_mode = 0;
+		uint64_t frames = 0;
+		uint64_t side_chains_timed = 0;
+		double side_chain_gpu_ms_sum = 0.0;
+		double fence_wait_ms_sum = 0.0;
+		uint64_t report_start_usec = 0;
+	} anthropolis_spike;
+
+	void _anthropolis_spike_init();
+	void _anthropolis_spike_frame(RDD::CommandBufferID p_main_command_buffer);
+	void _anthropolis_spike_finalize();
+
 	/**************************/
 	/**** FRAME MANAGEMENT ****/
 	/**************************/

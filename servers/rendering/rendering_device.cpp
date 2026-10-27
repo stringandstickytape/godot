@@ -8363,6 +8363,12 @@ void RenderingDevice::_end_frame() {
 
 	// The command buffer must be copied into a stack variable as the driver workarounds can change the command buffer in use.
 	RDD::CommandBufferID command_buffer = frames[frame].command_buffer;
+
+	// Anthropolis TEMP spike (never on the fork's mainline).
+	if (is_main_instance) {
+		_anthropolis_spike_frame(command_buffer);
+	}
+
 	GodotProfileZoneGroupedFirst(_profile_zone, "_submit_transfer_workers");
 	_submit_transfer_workers(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "_submit_transfer_barriers");
@@ -8374,6 +8380,212 @@ void RenderingDevice::_end_frame() {
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");
 	driver->end_segment();
+}
+
+// Anthropolis TEMP spike, never on the fork's mainline (game repo docs/design/minute-work-fixed-latency.md §5 step 2).
+// Each dispatch is one group of 64 threads running a dependent integer loop, and reads what the dispatch before it
+// wrote, so the chain is latency-bound like the minute hook's slow threads.
+static const char *ANTHROPOLIS_SPIKE_SHADER = R"(
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) restrict buffer Chain {
+	uint values[];
+} chain;
+layout(push_constant, std430) uniform Params {
+	uint iterations;
+	uint step;
+	uint pad0;
+	uint pad1;
+} params;
+void main() {
+	uint i = gl_LocalInvocationID.x;
+	uint v = chain.values[i] + params.step;
+	for (uint k = 0u; k < params.iterations; k++) {
+		v = v * 1664525u + 1013904223u;
+		v ^= v >> 13u;
+	}
+	chain.values[i] = v;
+}
+)";
+
+void RenderingDevice::_anthropolis_spike_init() {
+	AnthropolisSpike &s = anthropolis_spike;
+	s.initialized = true;
+	s.failed = true;
+
+	String error;
+	Vector<uint8_t> spirv = shader_compile_spirv_from_source(SHADER_STAGE_COMPUTE, ANTHROPOLIS_SPIKE_SHADER, SHADER_LANGUAGE_GLSL, &error, false);
+	ERR_FAIL_COND_MSG(spirv.is_empty(), "[AnthropolisSpike] shader compile failed: " + error);
+	Vector<ShaderStageSPIRVData> stages;
+	ShaderStageSPIRVData stage;
+	stage.shader_stage = SHADER_STAGE_COMPUTE;
+	stage.spirv = spirv;
+	stages.push_back(stage);
+	s.shader = shader_create_from_spirv(stages, "AnthropolisSpike");
+	ERR_FAIL_COND_MSG(s.shader.is_null(), "[AnthropolisSpike] shader create failed.");
+	s.pipeline = compute_pipeline_create(s.shader);
+	ERR_FAIL_COND_MSG(s.pipeline.is_null(), "[AnthropolisSpike] pipeline create failed.");
+
+	// The values are never read back, so the buffers need no initial data.
+	s.main_buffer = storage_buffer_create(256);
+	s.side_buffer = storage_buffer_create(256);
+	ERR_FAIL_COND_MSG(s.main_buffer.is_null() || s.side_buffer.is_null(), "[AnthropolisSpike] buffer create failed.");
+	Uniform main_uniform;
+	main_uniform.uniform_type = UNIFORM_TYPE_STORAGE_BUFFER;
+	main_uniform.binding = 0;
+	main_uniform.append_id(s.main_buffer);
+	s.main_set = uniform_set_create(main_uniform, s.shader, 0);
+	Uniform side_uniform;
+	side_uniform.uniform_type = UNIFORM_TYPE_STORAGE_BUFFER;
+	side_uniform.binding = 0;
+	side_uniform.append_id(s.side_buffer);
+	s.side_set = uniform_set_create(side_uniform, s.shader, 0);
+	ERR_FAIL_COND_MSG(s.main_set.is_null() || s.side_set.is_null(), "[AnthropolisSpike] uniform set create failed.");
+
+	s.queue_family = driver->command_queue_family_get(RDD::COMMAND_QUEUE_FAMILY_COMPUTE_BIT);
+	ERR_FAIL_COND_MSG(!s.queue_family, "[AnthropolisSpike] no compute queue family.");
+	s.queue = driver->command_queue_create(s.queue_family);
+	ERR_FAIL_COND_MSG(!s.queue, "[AnthropolisSpike] compute queue create failed.");
+	for (uint32_t i = 0; i < frames.size(); i++) {
+		RDD::CommandPoolID pool = driver->command_pool_create(s.queue_family, RDD::COMMAND_BUFFER_TYPE_PRIMARY);
+		ERR_FAIL_COND_MSG(!pool, "[AnthropolisSpike] command pool create failed.");
+		RDD::CommandBufferID buffer = driver->command_buffer_create(pool);
+		ERR_FAIL_COND_MSG(!buffer, "[AnthropolisSpike] command buffer create failed.");
+		RDD::FenceID fence = driver->fence_create();
+		ERR_FAIL_COND_MSG(!fence, "[AnthropolisSpike] fence create failed.");
+		RDD::QueryPoolID timestamps = driver->timestamp_query_pool_create(2);
+		ERR_FAIL_COND_MSG(!timestamps, "[AnthropolisSpike] timestamp pool create failed.");
+		s.pools.push_back(pool);
+		s.buffers.push_back(buffer);
+		s.fences.push_back(fence);
+		s.fence_signaled.push_back(false);
+		s.timestamp_pools.push_back(timestamps);
+	}
+
+	s.failed = false;
+	print_line(vformat("[AnthropolisSpike] ready: side compute queue family %d, %d frames.", (int64_t)s.queue_family.id, frames.size()));
+}
+
+void RenderingDevice::_anthropolis_spike_frame(RDD::CommandBufferID p_main_command_buffer) {
+	AnthropolisSpike &s = anthropolis_spike;
+	const int mode = GLOBAL_GET_CACHED(int, "rendering/rendering_device/anthropolis_spike_queue_mode");
+	const uint32_t dispatches = MAX(1, GLOBAL_GET_CACHED(int, "rendering/rendering_device/anthropolis_spike_chain_dispatches"));
+	const uint32_t iterations = MAX(1, GLOBAL_GET_CACHED(int, "rendering/rendering_device/anthropolis_spike_chain_iterations"));
+	const uint64_t now_usec = OS::get_singleton()->get_ticks_usec();
+
+	// One line every 5 s, and on every mode change, for the window just ended.
+	const bool mode_changed = mode != s.last_mode;
+	if (s.report_start_usec == 0) {
+		s.report_start_usec = now_usec;
+	}
+	if (mode_changed || now_usec - s.report_start_usec >= 5000000) {
+		const double seconds = MAX(1e-6, (now_usec - s.report_start_usec) / 1000000.0);
+		print_line(vformat("[AnthropolisSpike] window mode=%d dispatches=%d iterations=%d frames=%d fps=%.1f side_chain_gpu_ms=%.3f side_fence_wait_ms_per_frame=%.3f",
+				s.last_mode, dispatches, iterations, (int64_t)s.frames, s.frames / seconds,
+				s.side_chains_timed > 0 ? s.side_chain_gpu_ms_sum / s.side_chains_timed : 0.0,
+				s.frames > 0 ? s.fence_wait_ms_sum / s.frames : 0.0));
+		s.report_start_usec = now_usec;
+		s.frames = 0;
+		s.side_chains_timed = 0;
+		s.side_chain_gpu_ms_sum = 0.0;
+		s.fence_wait_ms_sum = 0.0;
+		s.last_mode = mode;
+	}
+
+	if (mode == 0) {
+		return;
+	}
+	if (!s.initialized) {
+		_anthropolis_spike_init();
+	}
+	if (s.failed) {
+		return;
+	}
+
+	uint32_t push_constants[4] = { iterations, 0, 0, 0 };
+	if (mode == 1) {
+		// Through the graph, like the minute hook today: each dispatch depends on the one before it, so dispatch i
+		// lands in graph level i beside whatever else the frame recorded.
+		for (uint32_t i = 0; i < dispatches; i++) {
+			push_constants[1] = i;
+			ComputeListID list = compute_list_begin();
+			compute_list_bind_compute_pipeline(list, s.pipeline);
+			compute_list_bind_uniform_set(list, s.main_set, 0);
+			compute_list_set_push_constant(list, push_constants, sizeof(push_constants));
+			compute_list_dispatch(list, 1, 1, 1);
+			compute_list_end();
+		}
+	} else {
+		// On the second compute queue, with no semaphore either way, so the main queue's barriers never wait for it.
+		const uint32_t f = frame;
+		if (s.fence_signaled[f]) {
+			const uint64_t wait_start_usec = OS::get_singleton()->get_ticks_usec();
+			driver->fence_wait(s.fences[f]);
+			s.fence_wait_ms_sum += (OS::get_singleton()->get_ticks_usec() - wait_start_usec) / 1000.0;
+			uint64_t timestamps[2] = {};
+			driver->timestamp_query_pool_get_results(s.timestamp_pools[f], 2, timestamps);
+			s.side_chain_gpu_ms_sum += (driver->timestamp_query_result_to_time(timestamps[1]) - driver->timestamp_query_result_to_time(timestamps[0])) / 1000000.0;
+			s.side_chains_timed++;
+			s.fence_signaled[f] = false;
+		}
+
+		const ComputePipeline *pipeline = compute_pipeline_owner.get_or_null(s.pipeline);
+		const UniformSet *uniform_set = uniform_set_owner.get_or_null(s.side_set);
+		const Shader *shader = shader_owner.get_or_null(s.shader);
+		ERR_FAIL_COND(pipeline == nullptr || uniform_set == nullptr || shader == nullptr);
+
+		RDD::CommandBufferID command_buffer = s.buffers[f];
+		ERR_FAIL_COND(!driver->command_buffer_begin(command_buffer));
+		driver->command_timestamp_query_pool_reset(command_buffer, s.timestamp_pools[f], 2);
+		driver->command_timestamp_write(command_buffer, s.timestamp_pools[f], 0);
+		driver->command_bind_compute_pipeline(command_buffer, pipeline->driver_id);
+		RDD::MemoryAccessBarrier barrier;
+		barrier.src_access = RDD::BARRIER_ACCESS_SHADER_WRITE_BIT;
+		barrier.dst_access = BitField<RDD::BarrierAccessBits>(RDD::BARRIER_ACCESS_SHADER_READ_BIT | RDD::BARRIER_ACCESS_SHADER_WRITE_BIT);
+		for (uint32_t i = 0; i < dispatches; i++) {
+			push_constants[1] = i;
+			driver->command_bind_compute_uniform_sets(command_buffer, uniform_set->driver_id, shader->driver_id, 0, 1, 0);
+			driver->command_bind_push_constants(command_buffer, shader->driver_id, 0, VectorView<uint32_t>(push_constants, 4));
+			driver->command_compute_dispatch(command_buffer, 1, 1, 1);
+			driver->command_pipeline_barrier(command_buffer, RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT, RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT, barrier, {}, {}, {});
+		}
+		driver->command_timestamp_write(command_buffer, s.timestamp_pools[f], 1);
+		driver->command_buffer_end(command_buffer);
+		driver->command_queue_execute_and_present(s.queue, {}, command_buffer, {}, s.fences[f], {});
+		s.fence_signaled[f] = true;
+	}
+	s.frames++;
+}
+
+void RenderingDevice::_anthropolis_spike_finalize() {
+	AnthropolisSpike &s = anthropolis_spike;
+	if (!s.initialized) {
+		return;
+	}
+	// The frame flush in finalize runs _end_frame again; the spike must not record after this.
+	s.failed = true;
+	for (uint32_t i = 0; i < s.fences.size(); i++) {
+		if (s.fence_signaled[i]) {
+			driver->fence_wait(s.fences[i]);
+		}
+		driver->fence_free(s.fences[i]);
+		driver->timestamp_query_pool_free(s.timestamp_pools[i]);
+		driver->command_pool_free(s.pools[i]);
+	}
+	s.fences.clear();
+	s.timestamp_pools.clear();
+	s.pools.clear();
+	s.buffers.clear();
+	if (s.queue) {
+		driver->command_queue_free(s.queue);
+		s.queue = RDD::CommandQueueID();
+	}
+	// The graph's RIDs go with the owners in finalize; free them first so they do not read as leaks.
+	for (RID rid : { s.main_set, s.side_set, s.pipeline, s.main_buffer, s.side_buffer, s.shader }) {
+		if (rid.is_valid()) {
+			free_rid(rid);
+		}
+	}
 }
 
 void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingDeviceDriver::FenceID p_draw_fence,
@@ -8671,6 +8883,11 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	// Create the transfer queue.
 	transfer_queue = driver->command_queue_create(transfer_queue_family);
 	ERR_FAIL_COND_V(!transfer_queue, FAILED);
+
+	// Anthropolis TEMP spike (never on the fork's mainline): off by default; the queue and chain are made on first use.
+	GLOBAL_DEF("rendering/rendering_device/anthropolis_spike_queue_mode", 0);
+	GLOBAL_DEF("rendering/rendering_device/anthropolis_spike_chain_dispatches", 64);
+	GLOBAL_DEF("rendering/rendering_device/anthropolis_spike_chain_iterations", 4096);
 
 	if (present_queue_family) {
 		// Create the present queue.
@@ -9109,6 +9326,9 @@ uint64_t RenderingDevice::limit_get(Limit p_limit) const {
 
 void RenderingDevice::finalize() {
 	ERR_RENDER_THREAD_GUARD();
+
+	// Anthropolis TEMP spike (never on the fork's mainline).
+	_anthropolis_spike_finalize();
 
 	if (!frames.is_empty()) {
 		// Wait for all frames to have finished rendering.
