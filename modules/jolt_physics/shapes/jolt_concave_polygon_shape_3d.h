@@ -32,16 +32,38 @@
 
 #include "jolt_shape_3d.h"
 
+#include "core/object/worker_thread_pool.h"
+
 class JoltConcavePolygonShape3D final : public JoltShape3D {
+	// Anthropolis: with `physics/jolt_physics_3d/anthropolis_build_concave_shapes_async` on, `set_data` starts
+	// building the mesh on a worker, and `_build` waits for it and takes it.
+	struct PendingBuild;
+
 	AABB aabb;
 	PackedVector3Array faces;
 	bool back_face_collision = false;
 
+	mutable PendingBuild *pending_build = nullptr;
+	mutable WorkerThreadPool::TaskID pending_build_task = WorkerThreadPool::INVALID_TASK_ID;
+
 	virtual JPH::ShapeRefC _build() const override;
+
+	static JPH::ShapeRefC _build_mesh(const PackedVector3Array &p_faces, float p_active_edge_threshold_cos, bool p_per_triangle_user_data, String &r_error);
+	static void _run_pending_build(void *p_pending_build);
+	static void _reclaim_abandoned_builds(bool p_wait);
+	void _start_pending_build();
+	bool _take_pending_build(JPH::ShapeRefC &r_mesh, String &r_error) const;
+	void _abandon_pending_build() const;
 
 	AABB _calculate_aabb() const;
 
 public:
+	virtual ~JoltConcavePolygonShape3D() override;
+
+	// Waits for the builds that a change or a free abandoned; called before Jolt shuts down. A shape still alive then
+	// (a leaked RID) keeps its own build, which the pool finishes before it exits.
+	static void finish_abandoned_builds() { _reclaim_abandoned_builds(true); }
+
 	virtual ShapeType get_type() const override { return ShapeType::SHAPE_CONCAVE_POLYGON; }
 	virtual bool is_convex() const override { return false; }
 

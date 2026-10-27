@@ -62,6 +62,9 @@ void JoltProjectSettings::register_settings() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "physics/jolt_physics_3d/collisions/collision_margin_fraction", PROPERTY_HINT_RANGE, U"0,1,0.00001"), 0.08f);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "physics/jolt_physics_3d/collisions/active_edge_threshold", PROPERTY_HINT_RANGE, U"0,90,0.01,radians_as_degrees"), Math::deg_to_rad(50.0f));
 
+	// Anthropolis: off by default; read when a concave polygon shape's data is set.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "physics/jolt_physics_3d/anthropolis_build_concave_shapes_async"), false);
+
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "physics/jolt_physics_3d/joints/world_node", PROPERTY_HINT_ENUM, U"Node A,Node B"), JOLT_JOINT_WORLD_NODE_A);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "physics/jolt_physics_3d/limits/temporary_memory_buffer_size", PROPERTY_HINT_RANGE, U"1,32,or_greater,suffix:MiB"), 32);

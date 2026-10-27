@@ -33,6 +33,7 @@
 #include "jolt_globals.h"
 #include "jolt_physics_server_3d.h"
 #include "jolt_project_settings.h"
+#include "shapes/jolt_concave_polygon_shape_3d.h"
 
 #include "core/config/project_settings.h"
 #include "core/object/callable_mp.h"
@@ -65,5 +66,6 @@ void uninitialize_jolt_physics_module(ModuleInitializationLevel p_level) {
 		return;
 	}
 
+	JoltConcavePolygonShape3D::finish_abandoned_builds();
 	jolt_deinitialize();
 }
