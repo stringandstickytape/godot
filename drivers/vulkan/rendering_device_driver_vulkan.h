@@ -168,6 +168,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	bool pipeline_cache_control_support = false;
 	bool device_fault_support = false;
 	bool framebuffer_depth_resolve = false;
+	bool sampler_ycbcr_conversion_support = false;
 #if defined(VK_TRACK_DEVICE_MEMORY)
 	bool device_memory_report_support = false;
 #endif
@@ -212,6 +213,10 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 
 public:
 	Error initialize(uint32_t p_device_index, uint32_t p_frame_count) override final;
+
+	// For engine code that creates Vulkan objects directly and hands them to texture_create_from_extension().
+	bool is_device_extension_enabled(const CharString &p_extension_name) const { return enabled_device_extension_names.has(p_extension_name); }
+	bool is_sampler_ycbcr_conversion_enabled() const { return sampler_ycbcr_conversion_support; }
 
 private:
 	/****************/
@@ -294,7 +299,7 @@ public:
 
 public:
 	virtual TextureID texture_create(const TextureFormat &p_format, const TextureView &p_view) override final;
-	virtual TextureID texture_create_from_extension(uint64_t p_native_texture, TextureType p_type, DataFormat p_format, uint32_t p_array_layers, bool p_depth_stencil, uint32_t p_mipmaps) override final;
+	virtual TextureID texture_create_from_extension(uint64_t p_native_texture, TextureType p_type, DataFormat p_format, uint32_t p_array_layers, bool p_depth_stencil, uint32_t p_mipmaps, int32_t p_plane) override final;
 	virtual TextureID texture_create_shared(TextureID p_original_texture, const TextureView &p_view) override final;
 	virtual TextureID texture_create_shared_from_slice(TextureID p_original_texture, const TextureView &p_view, TextureSliceType p_slice_type, uint32_t p_layer, uint32_t p_layers, uint32_t p_mipmap, uint32_t p_mipmaps) override final;
 	virtual void texture_free(TextureID p_texture) override final;
@@ -338,6 +343,12 @@ public:
 			VectorView<BufferBarrier> p_buffer_barriers,
 			VectorView<TextureBarrier> p_texture_barriers,
 			VectorView<AccelerationStructureBarrier> p_acceleration_structure_barriers) override final;
+
+	virtual void command_texture_external_acquire(CommandBufferID p_cmd_buffer, TextureID p_texture) override final;
+	virtual void command_texture_external_release(CommandBufferID p_cmd_buffer, TextureID p_texture) override final;
+
+private:
+	void _command_texture_external_transfer(CommandBufferID p_cmd_buffer, TextureID p_texture, bool p_acquire);
 
 	/****************/
 	/**** FENCES ****/
@@ -393,6 +404,7 @@ private:
 	struct CommandPool {
 		VkCommandPool vk_command_pool = VK_NULL_HANDLE;
 		CommandBufferType buffer_type = COMMAND_BUFFER_TYPE_PRIMARY;
+		uint32_t queue_family_index = VK_QUEUE_FAMILY_IGNORED;
 		LocalVector<CommandBufferInfo *> command_buffers_created;
 	};
 
@@ -406,6 +418,7 @@ private:
 
 	struct CommandBufferInfo {
 		VkCommandBuffer vk_command_buffer = VK_NULL_HANDLE;
+		uint32_t queue_family_index = VK_QUEUE_FAMILY_IGNORED;
 		Framebuffer *active_framebuffer = nullptr;
 		RenderPassInfo *active_render_pass = nullptr;
 	};

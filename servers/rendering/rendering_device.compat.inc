@@ -167,6 +167,10 @@ RID RenderingDevice::_texture_create_from_extension_compat_105570(TextureType p_
 	return texture_create_from_extension(p_type, p_format, p_samples, p_usage, p_image, p_width, p_height, p_depth, p_layers, 1);
 }
 
+RID RenderingDevice::_texture_create_from_extension_bind_compat_15116(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps) {
+	return texture_create_from_extension(p_type, p_format, p_samples, p_usage, p_image, p_width, p_height, p_depth, p_layers, p_mipmaps);
+}
+
 void RenderingDevice::_bind_compatibility_methods() {
 	ClassDB::bind_compatibility_method(D_METHOD("shader_create_from_bytecode", "binary_data"), &RenderingDevice::_shader_create_from_bytecode_bind_compat_79606);
 
@@ -197,6 +201,7 @@ void RenderingDevice::_bind_compatibility_methods() {
 	ClassDB::bind_compatibility_method(D_METHOD("index_buffer_create", "size_indices", "format", "data", "use_restart_indices"), &RenderingDevice::_index_buffer_create_bind_compat_101561, DEFVAL(Vector<uint8_t>()), DEFVAL(false));
 
 	ClassDB::bind_compatibility_method(D_METHOD("texture_create_from_extension", "type", "format", "samples", "usage_flags", "image", "width", "height", "depth", "layers"), &RenderingDevice::_texture_create_from_extension_compat_105570);
+	ClassDB::bind_compatibility_method(D_METHOD("texture_create_from_extension", "type", "format", "samples", "usage_flags", "image", "width", "height", "depth", "layers", "mipmaps"), &RenderingDevice::_texture_create_from_extension_bind_compat_15116, DEFVAL(1));
 }
 
 #endif // DISABLE_DEPRECATED

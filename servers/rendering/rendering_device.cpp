@@ -1851,8 +1851,10 @@ RID RenderingDevice::texture_create_shared(const TextureView &p_view, RID p_with
 	return id;
 }
 
-RID RenderingDevice::texture_create_from_extension(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps) {
+RID RenderingDevice::texture_create_from_extension(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps, int32_t p_plane) {
 	// This method creates a texture object using a VkImage created by an extension, module or other external source (OpenXR uses this).
+	// With p_plane >= 0, the texture is a view of that plane of a multi-planar image (e.g. NV12): p_format and the size must be the plane's.
+	ERR_FAIL_COND_V_MSG(p_plane < -1 || p_plane > 2, RID(), "Plane must be -1 (whole image), 0, 1 or 2.");
 
 	Texture texture;
 	texture.type = p_type;
@@ -1880,7 +1882,7 @@ RID RenderingDevice::texture_create_from_extension(TextureType p_type, DataForma
 		texture.barrier_aspect_flags.set_flag(RDD::TEXTURE_ASPECT_COLOR_BIT);
 	}
 
-	texture.driver_id = driver->texture_create_from_extension(p_image, p_type, p_format, p_layers, (texture.usage_flags & (TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | TEXTURE_USAGE_DEPTH_RESOLVE_ATTACHMENT_BIT)), p_mipmaps);
+	texture.driver_id = driver->texture_create_from_extension(p_image, p_type, p_format, p_layers, (texture.usage_flags & (TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | TEXTURE_USAGE_DEPTH_RESOLVE_ATTACHMENT_BIT)), p_mipmaps, p_plane);
 	ERR_FAIL_COND_V(!texture.driver_id, RID());
 
 	_texture_make_mutable(&texture, RID());
@@ -3114,6 +3116,63 @@ bool RenderingDevice::texture_is_discardable(RID p_texture) {
 	ERR_FAIL_NULL_V(texture, false);
 
 	return texture->is_discardable;
+}
+
+Error RenderingDevice::texture_external_acquire(RID p_texture, VectorView<RID> p_aliases) {
+	return _texture_external_transfer(p_texture, p_aliases, true);
+}
+
+Error RenderingDevice::texture_external_release(RID p_texture, VectorView<RID> p_aliases) {
+	return _texture_external_transfer(p_texture, p_aliases, false);
+}
+
+Error RenderingDevice::_texture_external_transfer(RID p_texture, VectorView<RID> p_aliases, bool p_acquire) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER,
+			"External texture transfers are forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER,
+			"External texture transfers are forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER,
+			"External texture transfers are forbidden during creation of a raytracing list.");
+
+	Texture *texture = texture_owner.get_or_null(p_texture);
+	ERR_FAIL_NULL_V_MSG(texture, ERR_INVALID_PARAMETER, "Texture argument is not a valid texture.");
+	const uint64_t native_image = driver->get_resource_native_handle(RDD::DRIVER_RESOURCE_TEXTURE, texture->driver_id);
+
+	thread_local LocalVector<RDG::ResourceTracker *> trackers;
+	trackers.clear();
+	for (int64_t i = -1; i < int64_t(p_aliases.size()); i++) {
+		const RID texture_rid = i < 0 ? p_texture : p_aliases[uint32_t(i)];
+		Texture *alias = i < 0 ? texture : texture_owner.get_or_null(texture_rid);
+		ERR_FAIL_NULL_V_MSG(alias, ERR_INVALID_PARAMETER, vformat("Alias %d is not a valid texture.", i));
+		ERR_FAIL_COND_V_MSG(alias->slice_type != TEXTURE_SLICE_MAX, ERR_INVALID_PARAMETER, "Texture slices can't be used, use the texture they were created from.");
+		ERR_FAIL_COND_V_MSG(driver->get_resource_native_handle(RDD::DRIVER_RESOURCE_TEXTURE, alias->driver_id) != native_image, ERR_INVALID_PARAMETER, vformat("Alias %d is not a view of the same image as the texture.", i));
+
+		if (_texture_make_mutable(alias, texture_rid)) {
+			draw_graph.add_synchronization();
+		}
+
+		// Shared textures use the tracker of their owner.
+		if (!trackers.has(alias->draw_tracker)) {
+			trackers.push_back(alias->draw_tracker);
+		}
+	}
+
+	// While the producer owns the image, its trackers are left in the GENERAL usage (or NONE if never acquired).
+	for (const RDG::ResourceTracker *tracker : trackers) {
+		if (p_acquire) {
+			ERR_FAIL_COND_V_MSG(tracker->usage != RDG::RESOURCE_USAGE_NONE && tracker->usage != RDG::RESOURCE_USAGE_GENERAL, ERR_INVALID_PARAMETER,
+					"The texture is already acquired, or was used by the RenderingDevice in another way. Release it before acquiring it again.");
+		} else {
+			ERR_FAIL_COND_V_MSG(tracker->usage != RDG::RESOURCE_USAGE_TEXTURE_SAMPLE, ERR_INVALID_PARAMETER,
+					"The texture must be acquired, and only sampled since, before it can be released.");
+		}
+	}
+
+	draw_graph.add_texture_external_transfer(texture->driver_id, trackers, p_acquire);
+
+	return OK;
 }
 
 Error RenderingDevice::texture_clear(RID p_texture, const Color &p_color, uint32_t p_base_mipmap, uint32_t p_mipmaps, uint32_t p_base_layer, uint32_t p_layers) {
@@ -9053,7 +9112,7 @@ void RenderingDevice::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("texture_create", "format", "view", "data"), &RenderingDevice::_texture_create, DEFVAL(Array()));
 	ClassDB::bind_method(D_METHOD("texture_create_shared", "view", "with_texture"), &RenderingDevice::_texture_create_shared);
 	ClassDB::bind_method(D_METHOD("texture_create_shared_from_slice", "view", "with_texture", "layer", "mipmap", "mipmaps", "slice_type"), &RenderingDevice::_texture_create_shared_from_slice, DEFVAL(1), DEFVAL(TEXTURE_SLICE_2D));
-	ClassDB::bind_method(D_METHOD("texture_create_from_extension", "type", "format", "samples", "usage_flags", "image", "width", "height", "depth", "layers", "mipmaps"), &RenderingDevice::texture_create_from_extension, DEFVAL(1));
+	ClassDB::bind_method(D_METHOD("texture_create_from_extension", "type", "format", "samples", "usage_flags", "image", "width", "height", "depth", "layers", "mipmaps", "plane"), &RenderingDevice::texture_create_from_extension, DEFVAL(1), DEFVAL(-1));
 
 	ClassDB::bind_method(D_METHOD("texture_update", "texture", "layer", "data"), &RenderingDevice::texture_update);
 	ClassDB::bind_method(D_METHOD("texture_get_data", "texture", "layer"), &RenderingDevice::texture_get_data);
@@ -9066,6 +9125,8 @@ void RenderingDevice::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("texture_set_discardable", "texture", "discardable"), &RenderingDevice::texture_set_discardable);
 	ClassDB::bind_method(D_METHOD("texture_is_discardable", "texture"), &RenderingDevice::texture_is_discardable);
+	ClassDB::bind_method(D_METHOD("texture_external_acquire", "texture", "aliases"), &RenderingDevice::_texture_external_acquire_bind, DEFVAL(TypedArray<RID>()));
+	ClassDB::bind_method(D_METHOD("texture_external_release", "texture", "aliases"), &RenderingDevice::_texture_external_release_bind, DEFVAL(TypedArray<RID>()));
 
 	ClassDB::bind_method(D_METHOD("texture_copy", "from_texture", "to_texture", "from_pos", "to_pos", "size", "src_mipmap", "dst_mipmap", "src_layer", "dst_layer"), &RenderingDevice::texture_copy);
 	ClassDB::bind_method(D_METHOD("texture_clear", "texture", "color", "base_mipmap", "mipmap_count", "base_layer", "layer_count"), &RenderingDevice::texture_clear);
@@ -9947,6 +10008,16 @@ RenderingDevice::FramebufferFormatID RenderingDevice::_framebuffer_format_create
 	}
 
 	return framebuffer_format_create_multipass(attachments, passes, p_view_count);
+}
+
+Error RenderingDevice::_texture_external_acquire_bind(RID p_texture, const TypedArray<RID> &p_aliases) {
+	Vector<RID> aliases = Variant(p_aliases);
+	return texture_external_acquire(p_texture, aliases);
+}
+
+Error RenderingDevice::_texture_external_release_bind(RID p_texture, const TypedArray<RID> &p_aliases) {
+	Vector<RID> aliases = Variant(p_aliases);
+	return texture_external_release(p_texture, aliases);
 }
 
 RID RenderingDevice::_framebuffer_create(const TypedArray<RID> &p_textures, FramebufferFormatID p_format_check, uint32_t p_view_count) {

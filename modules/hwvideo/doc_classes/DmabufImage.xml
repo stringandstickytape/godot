@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="DmabufImage" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A Linux dmabuf imported as a Vulkan image, sampled without copies.
+	</brief_description>
+	<description>
+		Imports an NV12 dmabuf (for example a frame from a hardware video decoder) once, as a multi-planar Vulkan image, and makes one [RenderingDevice] texture per plane: Y as [constant RenderingDevice.DATA_FORMAT_R8_UNORM] and interleaved CbCr as [constant RenderingDevice.DATA_FORMAT_R8G8_UNORM] at half size. Wrap them in [Texture2DRD] to use them in materials.
+		The producer and the GPU take turns with the memory: call [method acquire] after the producer has finished writing a frame and before the planes are sampled, and [method release] before the producer writes to the buffer again.
+		Only available with the Vulkan rendering driver on Linux. Call the methods on the rendering thread.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="acquire">
+			<return type="int" enum="Error" />
+			<description>
+				Takes the image from the producer: records a queue family ownership transfer from the foreign queue family, from the GENERAL layout to the shader read-only layout. Does nothing if the image is already acquired.
+			</description>
+		</method>
+		<method name="free_image">
+			<return type="void" />
+			<description>
+				Frees the plane textures. The Vulkan image and memory are destroyed once the GPU can no longer use them, the next time any [DmabufImage] is imported, acquired, released or freed; at engine shutdown they are left to the process exit. Free any [Texture2DRD] that wraps the planes first.
+			</description>
+		</method>
+		<method name="get_drm_modifier" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the DRM format modifier of the imported image.
+			</description>
+		</method>
+		<method name="get_plane_rid" qualifiers="const">
+			<return type="RID" />
+			<param index="0" name="plane" type="int" />
+			<description>
+				Returns the [RenderingDevice] texture of the plane: 0 for Y, 1 for CbCr.
+			</description>
+		</method>
+		<method name="get_size" qualifiers="const">
+			<return type="Vector2i" />
+			<description>
+				Returns the size of the image (the size of the Y plane).
+			</description>
+		</method>
+		<method name="get_supported_nv12_modifiers" qualifiers="static">
+			<return type="PackedInt64Array" />
+			<description>
+				Returns the DRM format modifiers with which the device can sample NV12 images. Run with [code]--verbose[/code] to also print the memory plane count and features of each.
+			</description>
+		</method>
+		<method name="import_nv12">
+			<return type="int" enum="Error" />
+			<param index="0" name="fd" type="int" />
+			<param index="1" name="width" type="int" />
+			<param index="2" name="height" type="int" />
+			<param index="3" name="drm_modifier" type="int" />
+			<param index="4" name="plane_offsets" type="PackedInt64Array" />
+			<param index="5" name="plane_pitches" type="PackedInt64Array" />
+			<description>
+				Imports the dmabuf [param fd] as an NV12 image. Give one offset and one row pitch per memory plane of the modifier (2 for [code]DRM_FORMAT_MOD_LINEAR[/code]). The fd is duplicated, so the caller still owns it.
+			</description>
+		</method>
+		<method name="import_test_pattern">
+			<return type="int" enum="Error" />
+			<param index="0" name="width" type="int" />
+			<param index="1" name="height" type="int" />
+			<param index="2" name="device" type="String" default="&quot;/dev/dri/card0&quot;" />
+			<description>
+				Creates a linear NV12 dmabuf filled with a test pattern and imports it with [method import_nv12]. The buffer is a DRM dumb buffer on [param device], or comes from [code]/dev/udmabuf[/code] if that fails. With [param device] set to [code]"host"[/code], no dmabuf is used: the pattern goes into a linear image in host-visible Vulkan memory, which tests the plane views, ownership transfers and shader on any Vulkan driver (e.g. lavapipe). Luma rises from left to right with a white grid every eighth of the size; Cb rises from top to bottom and Cr from left to right.
+			</description>
+		</method>
+		<method name="is_acquired" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] between [method acquire] and [method release].
+			</description>
+		</method>
+		<method name="is_imported" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if an image is imported.
+			</description>
+		</method>
+		<method name="release">
+			<return type="int" enum="Error" />
+			<description>
+				Gives the image back to the producer: records a queue family ownership transfer to the foreign queue family, from the shader read-only layout to the GENERAL layout. The producer must not write to the buffer until the GPU has finished the frame in which this was recorded. Does nothing if the image is not acquired.
+			</description>
+		</method>
+	</methods>
+</class>

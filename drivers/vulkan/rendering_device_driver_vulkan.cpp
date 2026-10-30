@@ -591,6 +591,15 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	// can and will fill the validation layers with useless info otherwise if not enabled.
 	_register_requested_device_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, false);
 
+#ifdef LINUXBSD_ENABLED
+	// Importing dmabufs written outside of Vulkan (e.g. by a hardware video decoder) as images.
+	// See RenderingDevice::texture_create_from_extension() and texture_external_acquire().
+	_register_requested_device_extension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME, false);
+#endif
+
 	if (Engine::get_singleton()->is_generate_spirv_debug_info_enabled()) {
 		_register_requested_device_extension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME, true);
 	}
@@ -1006,6 +1015,13 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			next_features = &sync_2_features;
 		}
 
+		VkPhysicalDeviceSamplerYcbcrConversionFeatures sampler_ycbcr_conversion_features = {};
+		if (physical_device_properties.apiVersion >= VK_API_VERSION_1_1) {
+			sampler_ycbcr_conversion_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+			sampler_ycbcr_conversion_features.pNext = next_features;
+			next_features = &sampler_ycbcr_conversion_features;
+		}
+
 		VkPhysicalDeviceFeatures2 device_features_2 = {};
 		device_features_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 		device_features_2.pNext = next_features;
@@ -1039,6 +1055,9 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 				vulkan_memory_model_device_scope_support = vulkan_memory_model_features.vulkanMemoryModelDeviceScope;
 			}
 		}
+
+		// Required to create multi-planar (YCbCr) images, such as imported video frames.
+		sampler_ycbcr_conversion_support = sampler_ycbcr_conversion_features.samplerYcbcrConversion;
 
 		if (enabled_device_extension_names.has(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME)) {
 			fsr_capabilities.pipeline_supported = fsr_features.pipelineFragmentShadingRate;
@@ -1444,6 +1463,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
 	VkPhysicalDevice16BitStorageFeaturesKHR storage_features = {};
 	VkPhysicalDeviceMultiviewFeatures multiview_features = {};
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures sampler_ycbcr_conversion_features = {};
 	const bool enable_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 	if (enable_1_2_features) {
 		// In Vulkan 1.2 and newer we use a newer struct to enable various features.
@@ -1459,7 +1479,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		vulkan_1_1_features.variablePointersStorageBuffer = 0;
 		vulkan_1_1_features.variablePointers = 0;
 		vulkan_1_1_features.protectedMemory = 0;
-		vulkan_1_1_features.samplerYcbcrConversion = 0;
+		vulkan_1_1_features.samplerYcbcrConversion = sampler_ycbcr_conversion_support;
 		vulkan_1_1_features.shaderDrawParameters = 0;
 		create_info_next = &vulkan_1_1_features;
 	} else {
@@ -1480,6 +1500,13 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 			multiview_features.multiviewGeometryShader = multiview_capabilities.geometry_shader_is_supported;
 			multiview_features.multiviewTessellationShader = multiview_capabilities.tessellation_shader_is_supported;
 			create_info_next = &multiview_features;
+
+			if (sampler_ycbcr_conversion_support) {
+				sampler_ycbcr_conversion_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
+				sampler_ycbcr_conversion_features.pNext = create_info_next;
+				sampler_ycbcr_conversion_features.samplerYcbcrConversion = VK_TRUE;
+				create_info_next = &sampler_ycbcr_conversion_features;
+			}
 		}
 	}
 
@@ -2442,7 +2469,10 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create(const TextureFormat &
 	return TextureID(tex_info);
 }
 
-RDD::TextureID RenderingDeviceDriverVulkan::texture_create_from_extension(uint64_t p_native_texture, TextureType p_type, DataFormat p_format, uint32_t p_array_layers, bool p_depth_stencil, uint32_t p_mipmaps) {
+RDD::TextureID RenderingDeviceDriverVulkan::texture_create_from_extension(uint64_t p_native_texture, TextureType p_type, DataFormat p_format, uint32_t p_array_layers, bool p_depth_stencil, uint32_t p_mipmaps, int32_t p_plane) {
+	ERR_FAIL_COND_V_MSG(p_plane < -1 || p_plane > 2, TextureID(), "Plane must be -1 (whole image), 0, 1 or 2.");
+	ERR_FAIL_COND_V_MSG(p_plane >= 0 && p_depth_stencil, TextureID(), "Plane views can't be used with depth/stencil textures.");
+
 	VkImage vk_image = (VkImage)p_native_texture;
 
 	// We only need to create a view into the already existing natively-provided texture.
@@ -2459,7 +2489,13 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_from_extension(uint64
 	image_view_create_info.subresourceRange.baseMipLevel = 0;
 	image_view_create_info.subresourceRange.levelCount = p_mipmaps;
 	image_view_create_info.subresourceRange.layerCount = p_array_layers;
-	image_view_create_info.subresourceRange.aspectMask = p_depth_stencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+	if (p_plane >= 0) {
+		// View of a single plane of a multi-planar image (e.g. Y or CbCr of NV12). The image must have been created with
+		// VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT and the format must be compatible with that plane.
+		image_view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT << p_plane;
+	} else {
+		image_view_create_info.subresourceRange.aspectMask = p_depth_stencil ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+	}
 
 	VkImageView vk_image_view = VK_NULL_HANDLE;
 	VkResult err = vkCreateImageView(vk_device, &image_view_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_IMAGE_VIEW), &vk_image_view);
@@ -2470,6 +2506,7 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create_from_extension(uint64
 	// Bookkeep.
 
 	TextureInfo *tex_info = VersatileResource::allocate<TextureInfo>(resources_allocator);
+	tex_info->vk_image = vk_image; // Not owned: texture_free() only destroys it when there's an allocation.
 	tex_info->vk_view = vk_image_view;
 	tex_info->rd_format = p_format;
 	tex_info->vk_view_create_info = image_view_create_info;
@@ -3030,6 +3067,63 @@ void RenderingDeviceDriverVulkan::command_pipeline_barrier(
 	}
 }
 
+void RenderingDeviceDriverVulkan::_command_texture_external_transfer(CommandBufferID p_cmd_buffer, TextureID p_texture, bool p_acquire) {
+	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
+	const TextureInfo *tex_info = (const TextureInfo *)p_texture.id;
+	DEV_ASSERT(command_buffer->queue_family_index != VK_QUEUE_FAMILY_IGNORED);
+
+	// While the image is outside of our control (e.g. being written by a video decoder through a dmabuf), it's owned by the
+	// foreign queue family and kept in the GENERAL layout.
+	const uint32_t external_queue_family = enabled_device_extension_names.has(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
+	const VkPipelineStageFlags shader_stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+
+	VkImageMemoryBarrier vk_image_barrier = {};
+	vk_image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	vk_image_barrier.image = tex_info->vk_view_create_info.image;
+	// The whole image. For a non-disjoint multi-planar image the color aspect covers every plane, even if this texture is a plane view.
+	vk_image_barrier.subresourceRange.aspectMask = (tex_info->vk_view_create_info.subresourceRange.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+	vk_image_barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+	vk_image_barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+	VkPipelineStageFlags src_stages;
+	VkPipelineStageFlags dst_stages;
+	if (p_acquire) {
+		// The producer's writes are already complete (synchronized on the CPU or with a semaphore), so there's nothing to wait for.
+		vk_image_barrier.srcAccessMask = 0;
+		vk_image_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vk_image_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+		vk_image_barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		vk_image_barrier.srcQueueFamilyIndex = external_queue_family;
+		vk_image_barrier.dstQueueFamilyIndex = command_buffer->queue_family_index;
+		src_stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		dst_stages = shader_stages;
+	} else {
+		// Wait for every shader that sampled the image. The producer must not write to it until this submission has completed.
+		vk_image_barrier.srcAccessMask = 0;
+		vk_image_barrier.dstAccessMask = 0;
+		vk_image_barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		vk_image_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		vk_image_barrier.srcQueueFamilyIndex = command_buffer->queue_family_index;
+		vk_image_barrier.dstQueueFamilyIndex = external_queue_family;
+		src_stages = shader_stages;
+		dst_stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+	}
+
+#if PRINT_NATIVE_COMMANDS
+	print_line(vformat("vkCmdPipelineBarrier EXTERNAL %s image 0x%ux", p_acquire ? "ACQUIRE" : "RELEASE", uint64_t(vk_image_barrier.image)));
+#endif
+
+	vkCmdPipelineBarrier(command_buffer->vk_command_buffer, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &vk_image_barrier);
+}
+
+void RenderingDeviceDriverVulkan::command_texture_external_acquire(CommandBufferID p_cmd_buffer, TextureID p_texture) {
+	_command_texture_external_transfer(p_cmd_buffer, p_texture, true);
+}
+
+void RenderingDeviceDriverVulkan::command_texture_external_release(CommandBufferID p_cmd_buffer, TextureID p_texture) {
+	_command_texture_external_transfer(p_cmd_buffer, p_texture, false);
+}
+
 /****************/
 /**** FENCES ****/
 /****************/
@@ -3406,6 +3500,7 @@ RDD::CommandPoolID RenderingDeviceDriverVulkan::command_pool_create(CommandQueue
 	CommandPool *command_pool = memnew(CommandPool);
 	command_pool->vk_command_pool = vk_command_pool;
 	command_pool->buffer_type = p_cmd_buffer_type;
+	command_pool->queue_family_index = family_index;
 	return CommandPoolID(command_pool);
 }
 
@@ -3454,6 +3549,7 @@ RDD::CommandBufferID RenderingDeviceDriverVulkan::command_buffer_create(CommandP
 
 	CommandBufferInfo *command_buffer = VersatileResource::allocate<CommandBufferInfo>(resources_allocator);
 	command_buffer->vk_command_buffer = vk_command_buffer;
+	command_buffer->queue_family_index = command_pool->queue_family_index;
 	command_pool->command_buffers_created.push_back(command_buffer);
 	return CommandBufferID(command_buffer);
 }

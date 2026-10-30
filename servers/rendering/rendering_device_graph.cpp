@@ -563,7 +563,8 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		ResourceTracker *search_tracker = resource_has_parent ? resource_tracker->parent : resource_tracker;
 		bool different_usage = resource_tracker->usage != new_resource_usage;
 		bool write_usage_after_write = (write_usage && search_tracker->write_command_or_list_index >= 0);
-		if (different_usage || write_usage_after_write) {
+		bool command_transitions_itself = r_command->type == RecordedCommand::TYPE_TEXTURE_EXTERNAL_TRANSFER;
+		if ((different_usage || write_usage_after_write) && !command_transitions_itself) {
 			// A barrier must be pushed if the usage is different of it's a write usage and there was already a command that wrote to this resource previously.
 			if (resource_tracker->texture_driver_id.id != 0) {
 				if (resource_tracker->usage_access.is_empty()) {
@@ -1112,6 +1113,14 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				const RecordedDriverCallbackCommand *driver_callback_command = reinterpret_cast<const RecordedDriverCallbackCommand *>(command);
 				driver_callback_command->callback(driver, r_command_buffer, driver_callback_command->userdata);
 			} break;
+			case RecordedCommand::TYPE_TEXTURE_EXTERNAL_TRANSFER: {
+				const RecordedTextureExternalTransferCommand *transfer_command = reinterpret_cast<const RecordedTextureExternalTransferCommand *>(command);
+				if (transfer_command->acquire) {
+					driver->command_texture_external_acquire(r_command_buffer, transfer_command->texture);
+				} else {
+					driver->command_texture_external_release(r_command_buffer, transfer_command->texture);
+				}
+			} break;
 			case RecordedCommand::TYPE_RAYTRACING_LIST: {
 				const RecordedRaytracingListCommand *raytracing_list_command = reinterpret_cast<const RecordedRaytracingListCommand *>(command);
 				_run_raytracing_list_command(r_command_buffer, raytracing_list_command->instruction_data(), raytracing_list_command->instruction_data_size);
@@ -1286,7 +1295,8 @@ void RenderingDeviceGraph::_run_label_command_change(RDD::CommandBufferID p_comm
 					case RecordedCommand::TYPE_DRAW_LIST: {
 						draw_commands = true;
 					} break;
-					case RecordedCommand::TYPE_DRIVER_CALLBACK: {
+					case RecordedCommand::TYPE_DRIVER_CALLBACK:
+					case RecordedCommand::TYPE_TEXTURE_EXTERNAL_TRANSFER: {
 						custom_commands = true;
 					} break;
 					default: {
@@ -1472,6 +1482,10 @@ void RenderingDeviceGraph::_print_render_commands(const RecordedCommandSort *p_s
 			} break;
 			case RecordedCommand::TYPE_DRIVER_CALLBACK: {
 				print_line(command_index, "LEVEL", command_level, "DRIVER CALLBACK");
+			} break;
+			case RecordedCommand::TYPE_TEXTURE_EXTERNAL_TRANSFER: {
+				const RecordedTextureExternalTransferCommand *transfer_command = reinterpret_cast<const RecordedTextureExternalTransferCommand *>(command);
+				print_line(command_index, "LEVEL", command_level, transfer_command->acquire ? "TEXTURE EXTERNAL ACQUIRE" : "TEXTURE EXTERNAL RELEASE", itos(transfer_command->texture.id));
 			} break;
 			case RecordedCommand::TYPE_COMPUTE_LIST: {
 				const RecordedComputeListCommand *compute_list_command = reinterpret_cast<const RecordedComputeListCommand *>(command);
@@ -2547,6 +2561,32 @@ void RenderingDeviceGraph::add_texture_update(RDD::TextureID p_dst, ResourceTrac
 	}
 }
 
+void RenderingDeviceGraph::add_texture_external_transfer(RDD::TextureID p_texture, VectorView<ResourceTracker *> p_trackers, bool p_acquire) {
+	DEV_ASSERT(p_trackers.size() > 0);
+
+	int32_t command_index;
+	RecordedTextureExternalTransferCommand *command = static_cast<RecordedTextureExternalTransferCommand *>(_allocate_command(sizeof(RecordedTextureExternalTransferCommand), command_index));
+	command->type = RecordedCommand::TYPE_TEXTURE_EXTERNAL_TRANSFER;
+	command->texture = p_texture;
+	command->acquire = p_acquire;
+	command->self_stages.set_flag(RDD::PIPELINE_STAGE_VERTEX_SHADER_BIT);
+	command->self_stages.set_flag(RDD::PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	command->self_stages.set_flag(RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+	// The driver emits the layout transition itself (see _add_command_to_graph()). The usage recorded here is the one the image is
+	// left in, and it always differs from the previous one, so the command counts as a write: it's ordered after every earlier
+	// command that used the trackers and before every later one. All trackers are views of the same image.
+	thread_local LocalVector<ResourceUsage> usages;
+	usages.resize(p_trackers.size());
+	for (uint32_t i = 0; i < p_trackers.size(); i++) {
+		DEV_ASSERT(p_trackers[i]->parent == nullptr);
+		DEV_ASSERT(p_trackers[i]->usage != (p_acquire ? RESOURCE_USAGE_TEXTURE_SAMPLE : RESOURCE_USAGE_GENERAL));
+		usages[i] = p_acquire ? RESOURCE_USAGE_TEXTURE_SAMPLE : RESOURCE_USAGE_GENERAL;
+	}
+
+	_add_command_to_graph((ResourceTracker **)p_trackers.ptr(), usages.ptr(), p_trackers.size(), command_index, command);
+}
+
 void RenderingDeviceGraph::add_capture_timestamp(RDD::QueryPoolID p_query_pool, uint32_t p_index) {
 	int32_t command_index;
 	RecordedCaptureTimestampCommand *command = static_cast<RecordedCaptureTimestampCommand *>(_allocate_command(sizeof(RecordedCaptureTimestampCommand), command_index));
@@ -2662,6 +2702,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 			2, // TYPE_TEXTURE_UPDATE
 			2, // TYPE_CAPTURE_TIMESTAMP
 			5, // TYPE_DRIVER_CALLBACK
+			2, // TYPE_TEXTURE_EXTERNAL_TRANSFER
 		};
 		static_assert(std_size(PriorityTable) == RecordedCommand::TYPE_MAX, "PriorityTable must have one entry per RecordedCommand::Type");
 

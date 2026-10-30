@@ -44,6 +44,44 @@
 
 #include <vk_enum_string_helper.h>
 
+#ifdef LINUXBSD_ENABLED
+#include <dlfcn.h>
+#include <link.h>
+
+static int _collect_loaded_library(struct dl_phdr_info *p_info, size_t p_size, void *p_data) {
+	if (p_info->dlpi_name != nullptr && p_info->dlpi_name[0] != '\0') {
+		static_cast<LocalVector<CharString> *>(p_data)->push_back(CharString(p_info->dlpi_name));
+	}
+	return 0;
+}
+
+// The Vulkan loader unloads the drivers (ICDs) and layers when the instance is destroyed. Driver code that ran on worker
+// threads (e.g. pipeline compilation) may have registered thread-specific data destructors there, and the worker threads
+// exit only after the instance is gone: glibc would then call into unmapped code. Keep the loaded drivers and layers
+// mapped until the process exits.
+static void _keep_vulkan_drivers_loaded() {
+	LocalVector<CharString> libraries;
+	dl_iterate_phdr(_collect_loaded_library, &libraries);
+	for (const CharString &library : libraries) {
+		void *handle = dlopen(library.get_data(), RTLD_NOW | RTLD_NOLOAD);
+		if (handle == nullptr) {
+			continue;
+		}
+		// Every ICD exports vk_icdGetInstanceProcAddr; every layer exports vkNegotiateLoaderLayerInterfaceVersion.
+		const bool is_vulkan_driver = dlsym(handle, "vk_icdGetInstanceProcAddr") != nullptr || dlsym(handle, "vkNegotiateLoaderLayerInterfaceVersion") != nullptr;
+		if (is_vulkan_driver) {
+			// Promotes the already loaded library to RTLD_NODELETE.
+			void *pinned_handle = dlopen(library.get_data(), RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+			if (pinned_handle != nullptr) {
+				print_verbose(vformat("Vulkan: keeping %s loaded until exit.", String::utf8(library.get_data())));
+				dlclose(pinned_handle);
+			}
+		}
+		dlclose(handle);
+	}
+}
+#endif
+
 #if defined(VK_TRACK_DRIVER_MEMORY)
 /*************************************************/
 // Driver memory tracking
@@ -748,6 +786,10 @@ Error RenderingContextDriverVulkan::_initialize_instance() {
 
 	err = _create_vulkan_instance(&instance_info, &instance);
 	ERR_FAIL_COND_V(err != OK, err);
+
+#ifdef LINUXBSD_ENABLED
+	_keep_vulkan_drivers_loaded();
+#endif
 
 #ifdef USE_VOLK
 	volkLoadInstance(instance);

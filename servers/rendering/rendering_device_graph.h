@@ -120,6 +120,7 @@ public:
 			TYPE_TEXTURE_UPDATE,
 			TYPE_CAPTURE_TIMESTAMP,
 			TYPE_DRIVER_CALLBACK,
+			TYPE_TEXTURE_EXTERNAL_TRANSFER,
 			TYPE_MAX
 		};
 
@@ -535,6 +536,11 @@ private:
 		}
 	};
 
+	struct RecordedTextureExternalTransferCommand : RecordedCommand {
+		RDD::TextureID texture;
+		bool acquire = false;
+	};
+
 	struct RecordedCaptureTimestampCommand : RecordedCommand {
 		RDD::QueryPoolID pool;
 		uint32_t index = 0;
@@ -946,6 +952,7 @@ public:
 	void add_texture_get_data(RDD::TextureID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, VectorView<RDD::BufferTextureCopyRegion> p_buffer_texture_copy_regions, ResourceTracker *p_dst_tracker = nullptr);
 	void add_texture_resolve(RDD::TextureID p_src, ResourceTracker *p_src_tracker, RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_src_layer, uint32_t p_src_mipmap, uint32_t p_dst_layer, uint32_t p_dst_mipmap);
 	void add_texture_update(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, VectorView<RecordedBufferToTextureCopy> p_buffer_copies, VectorView<ResourceTracker *> p_buffer_trackers = VectorView<ResourceTracker *>());
+	void add_texture_external_transfer(RDD::TextureID p_texture, VectorView<ResourceTracker *> p_trackers, bool p_acquire);
 	void add_capture_timestamp(RDD::QueryPoolID p_query_pool, uint32_t p_index);
 	void add_synchronization();
 	void begin_label(const Span<char> &p_label_name, const Color &p_color);

@@ -1149,8 +1149,10 @@
 			<param index="7" name="depth" type="int" />
 			<param index="8" name="layers" type="int" />
 			<param index="9" name="mipmaps" type="int" default="1" />
+			<param index="10" name="plane" type="int" default="-1" />
 			<description>
 				Returns an RID for an existing [param image] ([code]VkImage[/code]) with the given [param type], [param format], [param samples], [param usage_flags], [param width], [param height], [param depth], [param layers], and [param mipmaps]. This can be used to allow Godot to render onto foreign images.
+				If [param plane] is [code]0[/code], [code]1[/code] or [code]2[/code], the texture is a view of that plane of a multi-planar image (for example the Y or CbCr plane of NV12), and [param format], [param width] and [param height] must be those of the plane. The image must have been created with [code]VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT[/code]. Vulkan only.
 			</description>
 		</method>
 		<method name="texture_create_shared">
@@ -1205,6 +1207,23 @@
 
 				rd.texture_get_data_async(texture, 0, _texture_get_data_callback)
 				[/codeblock]
+			</description>
+		</method>
+		<method name="texture_external_acquire">
+			<return type="int" enum="Error" />
+			<param index="0" name="texture" type="RID" />
+			<param index="1" name="aliases" type="RID[]" default="[]" />
+			<description>
+				For a texture created with [method texture_create_from_extension] whose memory is written outside of the [RenderingDevice] (for example a dmabuf from a video decoder). Records a queue family ownership transfer from the foreign queue family, from the GENERAL layout to the shader read-only layout, over the whole image. Call it after the producer has finished writing and before the texture is sampled. [param aliases] are other textures that view the same image (for example the other planes); their tracking is updated without another barrier.
+				The texture must not be acquired already. Vulkan only; does nothing on other drivers.
+			</description>
+		</method>
+		<method name="texture_external_release">
+			<return type="int" enum="Error" />
+			<param index="0" name="texture" type="RID" />
+			<param index="1" name="aliases" type="RID[]" default="[]" />
+			<description>
+				The reverse of [method texture_external_acquire]: records a queue family ownership transfer to the foreign queue family, from the shader read-only layout to the GENERAL layout. The producer must not write to the image until the GPU has completed the frame in which this was recorded.
 			</description>
 		</method>
 		<method name="texture_get_format">

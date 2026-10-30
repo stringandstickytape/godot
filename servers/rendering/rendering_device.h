@@ -95,6 +95,7 @@ protected:
 #ifndef DISABLE_DEPRECATED
 	RID _shader_create_from_bytecode_bind_compat_79606(const Vector<uint8_t> &p_shader_binary);
 	RID _texture_create_from_extension_compat_105570(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers);
+	RID _texture_create_from_extension_bind_compat_15116(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps);
 	static void _bind_compatibility_methods();
 #endif
 
@@ -462,7 +463,7 @@ public:
 
 	RID texture_create(const TextureFormat &p_format, const TextureView &p_view, const Vector<Vector<uint8_t>> &p_data = Vector<Vector<uint8_t>>());
 	RID texture_create_shared(const TextureView &p_view, RID p_with_texture);
-	RID texture_create_from_extension(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps = 1);
+	RID texture_create_from_extension(TextureType p_type, DataFormat p_format, TextureSamples p_samples, BitField<RenderingDevice::TextureUsageBits> p_usage, uint64_t p_image, uint64_t p_width, uint64_t p_height, uint64_t p_depth, uint64_t p_layers, uint64_t p_mipmaps = 1, int32_t p_plane = -1);
 	RID texture_create_shared_from_slice(const TextureView &p_view, RID p_with_texture, uint32_t p_layer, uint32_t p_mipmap, uint32_t p_mipmaps = 1, TextureSliceType p_slice_type = TEXTURE_SLICE_2D, uint32_t p_layers = 0);
 	Error texture_update(RID p_texture, uint32_t p_layer, const Vector<uint8_t> &p_data);
 	Vector<uint8_t> texture_get_data(RID p_texture, uint32_t p_layer); // CPU textures will return immediately, while GPU textures will most likely force a flush
@@ -483,6 +484,16 @@ public:
 
 	void texture_set_discardable(RID p_texture, bool p_discardable);
 	bool texture_is_discardable(RID p_texture);
+
+	// For textures created from extension whose memory is written outside of the RenderingDevice (e.g. a dmabuf from a video decoder).
+	// Acquire once the producer has finished writing and before sampling; release before the producer writes again.
+	// p_aliases: other textures that view the same image (e.g. the other planes of a multi-planar image). The barrier is
+	// recorded once, for the whole image, and the tracking of every texture is updated.
+	Error texture_external_acquire(RID p_texture, VectorView<RID> p_aliases = VectorView<RID>());
+	Error texture_external_release(RID p_texture, VectorView<RID> p_aliases = VectorView<RID>());
+
+private:
+	Error _texture_external_transfer(RID p_texture, VectorView<RID> p_aliases, bool p_acquire);
 
 public:
 	/*************/
@@ -1990,6 +2001,9 @@ private:
 
 	FramebufferFormatID _framebuffer_format_create(const TypedArray<RDAttachmentFormat> &p_attachments, uint32_t p_view_count);
 	FramebufferFormatID _framebuffer_format_create_multipass(const TypedArray<RDAttachmentFormat> &p_attachments, const TypedArray<RDFramebufferPass> &p_passes, uint32_t p_view_count);
+	Error _texture_external_acquire_bind(RID p_texture, const TypedArray<RID> &p_aliases);
+	Error _texture_external_release_bind(RID p_texture, const TypedArray<RID> &p_aliases);
+
 	RID _framebuffer_create(const TypedArray<RID> &p_textures, FramebufferFormatID p_format_check = INVALID_ID, uint32_t p_view_count = 1);
 	RID _framebuffer_create_multipass(const TypedArray<RID> &p_textures, const TypedArray<RDFramebufferPass> &p_passes, FramebufferFormatID p_format_check = INVALID_ID, uint32_t p_view_count = 1);
 
