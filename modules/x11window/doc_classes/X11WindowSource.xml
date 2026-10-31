@@ -1,0 +1,369 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="X11WindowSource" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Shows an X11 window of the desktop as a texture and sends it input.
+	</brief_description>
+	<description>
+		Connects to the X server ([code]DISPLAY[/code]) with its own connection. A captured window is read through Composite: its pixmap is exported as a dmabuf with DRI3 ([code]BuffersFromPixmap[/code], with the DRM format modifier) and imported once per distinct buffer as a Vulkan image (zero copy). DAMAGE events say when the window changed: an idle window costs one non-blocking read per [method update]. Without DRI3, or if the import fails, the window is copied with MIT-SHM (or plain GetImage) into a texture instead; [method get_stats] says which path is in use.
+		Input goes to the captured window either as synthetic events ([constant INPUT_SEND_EVENT], no focus needed) or through XTEST ([constant INPUT_XTEST], real events that follow the X pointer and keyboard focus).
+		libxcb and its extension libraries are loaded at run time. Call [method update] once per frame from the main thread.
+		[codeblock]
+		var source := X11WindowSource.new()
+		source.open()
+		for w in source.list_windows():
+		    if "Chromium" in w["title"]:
+		        source.capture(w["id"])
+		material.set_shader_parameter("window_tex", source.get_texture())
+		# Every frame:
+		source.update()
+		source.send_pointer(x, y)
+		[/codeblock]
+		The texture holds the window's sRGB-encoded values in a UNORM format; decode them in the shader for 3D use.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="capture">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<description>
+				Starts showing [param window] (an X window id, e.g. [code]id[/code] from [method list_windows]) in [method get_texture].
+			</description>
+		</method>
+		<method name="close">
+			<return type="void" />
+			<description>
+				Stops the capture and closes the X connection.
+			</description>
+		</method>
+		<method name="close_window">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<description>
+				Asks the window to close (ICCCM [code]WM_DELETE_WINDOW[/code]), as a window manager's close button does.
+			</description>
+		</method>
+		<method name="get_atom">
+			<return type="int" />
+			<param index="0" name="name" type="String" />
+			<description>
+				The X atom for [param name] (created if needed), e.g. for [method send_client_message] data.
+			</description>
+		</method>
+		<method name="delete_window_property">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<param index="1" name="name" type="String" />
+			<description>
+				Deletes a property of any window.
+			</description>
+		</method>
+		<method name="gamescope_focus">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<param index="1" name="app_id" type="int" default="0" />
+			<description>
+				Asks gamescope (in Steam-controlled focus mode) to show [param window]: gives its toplevel a [code]STEAM_GAME[/code] id if it has none (or [param app_id]), and names it in the root's [code]GAMESCOPECTRL_BASELAYER_WINDOW[/code].
+			</description>
+		</method>
+		<method name="gamescope_release_focus">
+			<return type="int" enum="Error" />
+			<description>
+				Deletes [code]GAMESCOPECTRL_BASELAYER_WINDOW[/code] again if [method gamescope_focus] set it.
+			</description>
+		</method>
+		<method name="get_capture_mode" qualifiers="const">
+			<return type="int" enum="X11WindowSource.CaptureMode" />
+			<description>
+				The path in use for the captured window.
+			</description>
+		</method>
+		<method name="get_extensions" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Versions of the X extensions used (Composite, DAMAGE, XFixes, XTEST, DRI3, MIT-SHM).
+			</description>
+		</method>
+		<method name="get_focus_info">
+			<return type="Dictionary" />
+			<description>
+				The focus state: gamescope's root properties ([code]GAMESCOPE_FOCUSED_WINDOW[/code], [code]GAMESCOPE_FOCUSED_APP[/code], [code]GAMESCOPE_FOCUSABLE_WINDOWS[/code], [code]GAMESCOPECTRL_BASELAYER_WINDOW[/code], [code]GAMESCOPECTRL_BASELAYER_APPID[/code]...), [code]_NET_ACTIVE_WINDOW[/code], the X input focus and our own window.
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+			</description>
+		</method>
+		<method name="get_input_method" qualifiers="const">
+			<return type="int" enum="X11WindowSource.InputMethod" />
+			<description>
+			</description>
+		</method>
+		<method name="get_own_window" qualifiers="const">
+			<return type="int" />
+			<description>
+				The X window id of this program's main window (0 if the display server isn't X11).
+			</description>
+		</method>
+		<method name="get_preferred_mode" qualifiers="const">
+			<return type="int" enum="X11WindowSource.CaptureMode" />
+			<description>
+			</description>
+		</method>
+		<method name="get_size" qualifiers="const">
+			<return type="Vector2i" />
+			<description>
+				The captured window's size in pixels.
+			</description>
+		</method>
+		<method name="get_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Counters: [code]mode[/code], [code]zero_copy[/code], [code]format[/code], [code]modifier[/code], [code]damage_events[/code], [code]frames_updated[/code], [code]frames_deferred[/code], [code]imports[/code], [code]buffers_cached[/code], [code]buffer_switches[/code], [code]copies[/code], [code]bytes_copied[/code], [code]fetch_ms_avg[/code], [code]fetch_ms_max[/code], [code]x_errors[/code], [code]input_events[/code], [code]dmabuf_error[/code], [code]last_error[/code].
+			</description>
+		</method>
+		<method name="get_texture" qualifiers="const">
+			<return type="Texture2D" />
+			<description>
+				The window's picture. The same texture stays valid across resizes and recaptures; it is opaque black while nothing is captured.
+			</description>
+		</method>
+		<method name="get_toplevel">
+			<return type="int" />
+			<param index="0" name="window" type="int" />
+			<description>
+				The ancestor of [param window] that is a child of the root window.
+			</description>
+		</method>
+		<method name="get_window" qualifiers="const">
+			<return type="int" />
+			<description>
+				The captured window's id, or 0.
+			</description>
+		</method>
+		<method name="get_window_info">
+			<return type="Dictionary" />
+			<param index="0" name="window" type="int" />
+			<description>
+				The same fields as one entry of [method list_windows].
+			</description>
+		</method>
+		<method name="get_window_property">
+			<return type="Variant" />
+			<param index="0" name="window" type="int" />
+			<param index="1" name="name" type="String" />
+			<description>
+				A property of any window: a [PackedInt64Array] for 32- and 16-bit types, a [String] for 8-bit ones, [code]null[/code] if it isn't set.
+			</description>
+		</method>
+		<method name="has_alpha" qualifiers="const">
+			<return type="bool" />
+			<description>
+				True for 32-bit (ARGB, premultiplied) windows.
+			</description>
+		</method>
+		<method name="is_capturing" qualifiers="const">
+			<return type="bool" />
+			<description>
+			</description>
+		</method>
+		<method name="is_open" qualifiers="const">
+			<return type="bool" />
+			<description>
+			</description>
+		</method>
+		<method name="is_window_mapped" qualifiers="const">
+			<return type="bool" />
+			<description>
+			</description>
+		</method>
+		<method name="list_windows">
+			<return type="Dictionary[]" />
+			<param index="0" name="include_unmapped" type="bool" default="false" />
+			<description>
+				The toplevel windows, bottom to top. Each: [code]id[/code] (the client window), [code]frame[/code] (its toplevel ancestor), [code]title[/code], [code]class[/code], [code]instance[/code], [code]pid[/code], [code]x[/code], [code]y[/code], [code]width[/code], [code]height[/code], [code]depth[/code], [code]mapped[/code], [code]override_redirect[/code], [code]steam_game[/code].
+			</description>
+		</method>
+		<method name="open">
+			<return type="int" enum="Error" />
+			<param index="0" name="display" type="String" default="&quot;&quot;" />
+			<description>
+				Connects to the X server ([code]DISPLAY[/code] if [param display] is empty).
+			</description>
+		</method>
+		<method name="raise_window">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<description>
+				Raises the window's toplevel in the X stacking order and sends [code]_NET_ACTIVE_WINDOW[/code] to the window manager.
+			</description>
+		</method>
+		<method name="remap_window">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<description>
+				Unmaps and maps the window's toplevel again. gamescope prefers the most recently mapped window.
+			</description>
+		</method>
+		<method name="send_button">
+			<return type="void" />
+			<param index="0" name="button" type="int" />
+			<param index="1" name="pressed" type="bool" />
+			<description>
+				An X button: 1 left, 2 middle, 3 right, 4-7 wheel, 8 back, 9 forward.
+			</description>
+		</method>
+		<method name="send_client_message">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<param index="1" name="type" type="String" />
+			<param index="2" name="data" type="PackedInt64Array" />
+			<param index="3" name="destination" type="int" default="0" />
+			<description>
+				A 32-bit ClientMessage about [param window], sent to the root (with the substructure masks, for the window manager) unless [param destination] is given.
+			</description>
+		</method>
+		<method name="send_focus_in">
+			<return type="void" />
+			<description>
+				A synthetic FocusIn event to the captured window.
+			</description>
+		</method>
+		<method name="send_godot_key">
+			<return type="void" />
+			<param index="0" name="key" type="int" enum="Key" />
+			<param index="1" name="pressed" type="bool" />
+			<description>
+				A Godot [enum Key] mapped to an X keysym (letters as their lowercase keysym).
+			</description>
+		</method>
+		<method name="send_key">
+			<return type="void" />
+			<param index="0" name="keysym" type="int" />
+			<param index="1" name="pressed" type="bool" />
+			<description>
+				An X keysym. Keysyms that no key produces are put on a spare keycode for the time they are used.
+			</description>
+		</method>
+		<method name="send_pointer">
+			<return type="void" />
+			<param index="0" name="x" type="float" />
+			<param index="1" name="y" type="float" />
+			<description>
+				Moves the pointer to window pixel ([param x], [param y]).
+			</description>
+		</method>
+		<method name="send_scroll">
+			<return type="void" />
+			<param index="0" name="dx" type="float" />
+			<param index="1" name="dy" type="float" />
+			<description>
+				Wheel notches (fractions accumulate). Positive [param dy] scrolls down, positive [param dx] right.
+			</description>
+		</method>
+		<method name="send_text">
+			<return type="void" />
+			<param index="0" name="text" type="String" />
+			<description>
+				Presses and releases a key for every character.
+			</description>
+		</method>
+		<method name="send_unicode">
+			<return type="void" />
+			<param index="0" name="codepoint" type="int" />
+			<param index="1" name="pressed" type="bool" />
+			<description>
+			</description>
+		</method>
+		<method name="set_input_focus">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<description>
+				Sets the X keyboard focus (what XTEST key events follow).
+			</description>
+		</method>
+		<method name="set_input_method">
+			<return type="void" />
+			<param index="0" name="method" type="int" enum="X11WindowSource.InputMethod" />
+			<description>
+			</description>
+		</method>
+		<method name="set_input_passthrough">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<param index="1" name="enabled" type="bool" />
+			<description>
+				Gives the window an empty input shape, so pointer events go to the window below it (e.g. our own window, so XTEST clicks reach the captured window under it).
+			</description>
+		</method>
+		<method name="set_preferred_mode">
+			<return type="void" />
+			<param index="0" name="mode" type="int" enum="X11WindowSource.CaptureMode" />
+			<description>
+				[constant CAPTURE_DMABUF] (default), or a copy path, used by the next [method capture].
+			</description>
+		</method>
+		<method name="set_window_property">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<param index="1" name="name" type="String" />
+			<param index="2" name="type" type="String" />
+			<param index="3" name="values" type="PackedInt64Array" />
+			<description>
+				Sets a 32-bit property ([code]CARDINAL[/code], [code]WINDOW[/code], [code]ATOM[/code] or any type name) of any window.
+			</description>
+		</method>
+		<method name="stop_capture">
+			<return type="void" />
+			<description>
+			</description>
+		</method>
+		<method name="update">
+			<return type="bool" />
+			<description>
+				Processes X events and refreshes the texture if the window changed. Returns [code]true[/code] when the texture got new content.
+			</description>
+		</method>
+	</methods>
+	<signals>
+		<signal name="mapped_changed">
+			<param index="0" name="mapped" type="bool" />
+			<description>
+			</description>
+		</signal>
+		<signal name="size_changed">
+			<param index="0" name="size" type="Vector2i" />
+			<description>
+			</description>
+		</signal>
+		<signal name="title_changed">
+			<description>
+			</description>
+		</signal>
+		<signal name="window_closed">
+			<description>
+				The captured window was destroyed (or the X connection was lost).
+			</description>
+		</signal>
+	</signals>
+	<constants>
+		<constant name="CAPTURE_NONE" value="0" enum="CaptureMode">
+		</constant>
+		<constant name="CAPTURE_DMABUF" value="1" enum="CaptureMode">
+			Zero copy: the window's pixmap imported as a Vulkan image.
+		</constant>
+		<constant name="CAPTURE_SHM" value="2" enum="CaptureMode">
+			MIT-SHM GetImage into shared memory, then an upload (CPU copy).
+		</constant>
+		<constant name="CAPTURE_GET_IMAGE" value="3" enum="CaptureMode">
+			GetImage through the X socket, then an upload (CPU copy).
+		</constant>
+		<constant name="INPUT_SEND_EVENT" value="0" enum="InputMethod">
+			Synthetic events (SendEvent) to the captured window; no focus or stacking needed. Some programs ignore them.
+		</constant>
+		<constant name="INPUT_XTEST" value="1" enum="InputMethod">
+			XTEST fake input: real events, delivered to the window under the X pointer and to the X keyboard focus.
+		</constant>
+	</constants>
+</class>
