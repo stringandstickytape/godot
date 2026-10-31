@@ -117,6 +117,19 @@ public:
 		double projection_roll = 0.0;
 		double projection_bounds[4] = {}; // Equirectangular crop: left, top, right, bottom, as fractions of the full sphere.
 		AnnexBSplitter::SPSInfo sps; // H.264/HEVC: the first SPS (coded size, cropped size, bit depth).
+		// HDR10 static metadata (SMPTE ST 2086, CTA-861.3): from the container, or else from the SEI of the first keyframe
+		// (most rips carry it only there).
+		bool mastering_primaries = false;
+		double mastering_display[8] = {}; // CIE 1931 x, y of red, green, blue and the white point.
+		bool mastering_luminance = false;
+		double mastering_min_nits = 0.0;
+		double mastering_max_nits = 0.0;
+		bool light_level = false;
+		int max_cll = 0; // Brightest pixel of the film in nits (0: not given).
+		int max_fall = 0; // Brightest frame average in nits (0: not given).
+		String hdr_metadata_source; // "container", "sei", "container+sei" or "".
+		int dolby_vision_profile = -1; // From the container's configuration record; -1: none.
+		bool hdr10plus = false; // HDR10+ dynamic metadata in the first keyframe's SEI.
 	};
 
 	// One access unit. Annex-B for H.264 and HEVC, with the parameter sets in band before the first picture after open()
@@ -388,6 +401,7 @@ private:
 	LocalVector<uint8_t> inband_parameter_sets; // The latest in-band VPS/SPS/PPS.
 	LocalVector<uint8_t> scan_parameter_sets;
 	double next_video_pts = 0.0;
+	bool hdr_sei_pending = false; // open(): HDR video without full metadata in the container; read the first keyframe's SEI.
 	double audio_trim_until = -1.0;
 	double audio_next_time = -1.0;
 	// Compressed audio packets read while the ring is full (audio not played yet, or ahead of the video in the file), so the
@@ -417,6 +431,8 @@ private:
 	static String _subtitle_file_to_utf8(const PackedByteArray &p_bytes, String &r_charset);
 	static Error _read_whole_file(const String &p_path, int64_t p_max_bytes, PackedByteArray &r_bytes, String &r_error);
 	void _read_stream_metadata(const AVStream *p_stream);
+	void _read_hdr_side_data(const AVStream *p_stream);
+	void _parse_hdr_sei(const uint8_t *p_data, uint64_t p_size, bool p_hevc);
 	void _read_chapters();
 	uint32_t _subtitle_video_target() const;
 	void _count_video_bytes_locked(double p_pts, uint32_t p_bytes);
@@ -513,6 +529,13 @@ public:
 	// The parts of an ASS event line an app can draw without libass (SubtitleStyle): runs of styled text, alignment,
 	// position, margins, script resolution. p_header: get_subtitle_header().
 	static Dictionary parse_ass_event(const String &p_line, const String &p_header);
+
+	// HDR to SDR: what a shader needs to show PQ or HLG video on an SDR display of p_target_nits peak (see the class
+	// reference): the gamut matrix to BT.709, the PQ and HLG constants, and the BT.2390 EETF parameters.
+	static Dictionary get_tone_mapping(const Dictionary &p_video_info, double p_target_nits = 203.0);
+	// The same on the CPU, for one R'G'B' value (non-linear, as decoded): linear BT.709 RGB, 1.0 = the target peak.
+	// For tests and to check a shader against; far too slow for pictures.
+	static Color tone_map_color(const Color &p_rgb, const Dictionary &p_tone_mapping);
 
 	// Language memory: "ger", "deu", "de" and "German" -> "de" (see MediaLanguages), and the track that fits a list of
 	// preferred languages best (-1: none of them).

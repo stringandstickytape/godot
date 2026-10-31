@@ -44,6 +44,8 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/dovi_meta.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/spherical.h>
 #include <libavutil/stereo3d.h>
 }
@@ -740,4 +742,282 @@ int MediaSource::pick_subtitle_track(const PackedStringArray &p_languages, bool 
 		consider(external_subtitles[i].track, (int)(subtitle_tracks.size() + i), true);
 	}
 	return best;
+}
+
+/* HDR */
+
+// Container side data: Matroska's Colour element and MP4's mdcv/clli boxes, and Dolby Vision's configuration record.
+void MediaSource::_read_hdr_side_data(const AVStream *p_stream) {
+	const AVCodecParameters *par = p_stream->codecpar;
+	const AVPacketSideData *data = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+	if (data && data->size >= (size_t)sizeof(AVMasteringDisplayMetadata)) {
+		const AVMasteringDisplayMetadata *m = (const AVMasteringDisplayMetadata *)data->data;
+		if (m->has_primaries) {
+			video.mastering_primaries = true;
+			for (int i = 0; i < 3; i++) {
+				video.mastering_display[i * 2] = av_q2d(m->display_primaries[i][0]);
+				video.mastering_display[i * 2 + 1] = av_q2d(m->display_primaries[i][1]);
+			}
+			video.mastering_display[6] = av_q2d(m->white_point[0]);
+			video.mastering_display[7] = av_q2d(m->white_point[1]);
+		}
+		if (m->has_luminance) {
+			video.mastering_luminance = true;
+			video.mastering_min_nits = av_q2d(m->min_luminance);
+			video.mastering_max_nits = av_q2d(m->max_luminance);
+		}
+		video.hdr_metadata_source = "container";
+	}
+	data = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+	if (data && data->size >= (size_t)sizeof(AVContentLightMetadata)) {
+		const AVContentLightMetadata *c = (const AVContentLightMetadata *)data->data;
+		video.light_level = true;
+		video.max_cll = (int)c->MaxCLL;
+		video.max_fall = (int)c->MaxFALL;
+		video.hdr_metadata_source = "container";
+	}
+	data = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
+	if (data && data->size >= (size_t)sizeof(AVDOVIDecoderConfigurationRecord)) {
+		video.dolby_vision_profile = ((const AVDOVIDecoderConfigurationRecord *)data->data)->dv_profile;
+	}
+}
+
+// The HDR SEI messages of an Annex-B access unit (H.264 or HEVC), before its first picture: mastering display colour
+// volume (137), content light level (144), and HDR10+ (ITU-T T.35, 4). Fills only what the container didn't give.
+void MediaSource::_parse_hdr_sei(const uint8_t *p_data, uint64_t p_size, bool p_hevc) {
+	const auto find_start_code = [p_data, p_size](uint64_t p_from) -> uint64_t {
+		for (uint64_t k = p_from; k + 2 < p_size; k++) {
+			if (p_data[k + 2] > 1) {
+				k += 2;
+			} else if (p_data[k] == 0 && p_data[k + 1] == 0 && p_data[k + 2] == 1) {
+				return k;
+			}
+		}
+		return p_size;
+	};
+	const bool had_mastering = video.mastering_primaries || video.mastering_luminance;
+	const bool had_light = video.light_level;
+	bool found = false;
+	uint8_t rbsp[1024]; // SEI before a picture is small; longer messages (HDR10+ curves) are only looked at in front.
+	uint64_t start_code = find_start_code(0);
+	while (start_code < p_size) {
+		const uint64_t nal = start_code + 3;
+		if (nal >= p_size) {
+			break;
+		}
+		const uint32_t type = p_hevc ? (p_data[nal] >> 1) & 0x3f : p_data[nal] & 0x1f;
+		const bool vcl = p_hevc ? type < 32 : (type >= 1 && type <= 5);
+		if (vcl) {
+			break;
+		}
+		const uint64_t next = find_start_code(nal);
+		const bool sei = p_hevc ? type == 39 : type == 6;
+		if (sei) {
+			// Unescape (00 00 03 -> 00 00) past the NAL header.
+			uint32_t n = 0;
+			int zeros = 0;
+			for (uint64_t k = nal + (p_hevc ? 2 : 1); k < next && n < sizeof(rbsp); k++) {
+				const uint8_t b = p_data[k];
+				if (zeros >= 2 && b == 3) {
+					zeros = 0;
+					continue;
+				}
+				zeros = b == 0 ? zeros + 1 : 0;
+				rbsp[n++] = b;
+			}
+			uint32_t at = 0;
+			while (at + 2 <= n && rbsp[at] != 0x80) {
+				uint32_t payload_type = 0;
+				while (at < n && rbsp[at] == 0xff) {
+					payload_type += 255;
+					at++;
+				}
+				payload_type += at < n ? rbsp[at++] : 0;
+				uint32_t payload_size = 0;
+				while (at < n && rbsp[at] == 0xff) {
+					payload_size += 255;
+					at++;
+				}
+				payload_size += at < n ? rbsp[at++] : 0;
+				const uint8_t *p = rbsp + at;
+				const uint32_t available = at <= n ? n - at : 0;
+				const auto u16 = [p](int i) { return (uint32_t)((p[i] << 8) | p[i + 1]); };
+				const auto u32 = [p](int i) { return ((uint32_t)p[i] << 24) | ((uint32_t)p[i + 1] << 16) | ((uint32_t)p[i + 2] << 8) | p[i + 3]; };
+				if (payload_type == 137 && payload_size >= 24 && available >= 24 && !had_mastering) {
+					// Green, blue, red in the SEI; units of 0.00002 and 0.0001 cd/m2.
+					static const int slot[3] = { 1, 2, 0 }; // SEI index -> R, G, B slot.
+					for (int i = 0; i < 3; i++) {
+						video.mastering_display[slot[i] * 2] = u16(i * 4) * 0.00002;
+						video.mastering_display[slot[i] * 2 + 1] = u16(i * 4 + 2) * 0.00002;
+					}
+					video.mastering_display[6] = u16(12) * 0.00002;
+					video.mastering_display[7] = u16(14) * 0.00002;
+					video.mastering_max_nits = u32(16) * 0.0001;
+					video.mastering_min_nits = u32(20) * 0.0001;
+					video.mastering_primaries = true;
+					video.mastering_luminance = true;
+					found = true;
+				} else if (payload_type == 144 && payload_size >= 4 && available >= 4 && !had_light) {
+					video.max_cll = (int)u16(0);
+					video.max_fall = (int)u16(2);
+					video.light_level = true;
+					found = true;
+				} else if (payload_type == 4 && payload_size >= 6 && available >= 6) {
+					// ITU-T T.35: United States (0xB5), Samsung (0x003C), oriented code 1, application 4 = HDR10+.
+					if (p[0] == 0xb5 && u16(1) == 0x003c && u16(3) == 0x0001 && p[5] == 4) {
+						video.hdr10plus = true;
+					}
+				}
+				at += payload_size;
+			}
+		}
+		start_code = next;
+	}
+	if (found) {
+		video.hdr_metadata_source = video.hdr_metadata_source.is_empty() ? String("sei") : video.hdr_metadata_source + "+sei";
+	}
+}
+
+namespace {
+
+// Linear RGB with these primaries and white point (x, y of R, G, B, white) to CIE XYZ.
+Basis rgb_to_xyz(const double *p_xy) {
+	Vector3 c[3];
+	for (int i = 0; i < 3; i++) {
+		const double x = p_xy[i * 2];
+		const double y = p_xy[i * 2 + 1];
+		c[i] = Vector3(x / y, 1.0, (1.0 - x - y) / y);
+	}
+	const Basis m(c[0].x, c[1].x, c[2].x, c[0].y, c[1].y, c[2].y, c[0].z, c[1].z, c[2].z);
+	const double wx = p_xy[6];
+	const double wy = p_xy[7];
+	const Vector3 s = m.inverse().xform(Vector3(wx / wy, 1.0, (1.0 - wx - wy) / wy));
+	return m * Basis::from_scale(s);
+}
+
+const double BT709_XY[8] = { 0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290 };
+const double BT2020_XY[8] = { 0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290 };
+const double P3_D65_XY[8] = { 0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290 };
+
+// SMPTE ST 2084.
+constexpr double PQ_M1 = 2610.0 / 16384.0;
+constexpr double PQ_M2 = 2523.0 / 4096.0 * 128.0;
+constexpr double PQ_C1 = 3424.0 / 4096.0;
+constexpr double PQ_C2 = 2413.0 / 4096.0 * 32.0;
+constexpr double PQ_C3 = 2392.0 / 4096.0 * 32.0;
+// BT.2100 HLG.
+constexpr double HLG_A = 0.17883277;
+constexpr double HLG_B = 0.28466892; // 1 - 4a
+constexpr double HLG_C = 0.55991073; // 0.5 - a ln(4a)
+
+double pq_to_nits(double p_e) {
+	const double e = Math::pow(CLAMP(p_e, 0.0, 1.0), 1.0 / PQ_M2);
+	return 10000.0 * Math::pow(MAX(e - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * e), 1.0 / PQ_M1);
+}
+
+double nits_to_pq(double p_nits) {
+	const double y = Math::pow(CLAMP(p_nits / 10000.0, 0.0, 1.0), PQ_M1);
+	return Math::pow((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y), PQ_M2);
+}
+
+double hlg_to_scene(double p_e) {
+	const double e = CLAMP(p_e, 0.0, 1.0);
+	return e <= 0.5 ? e * e / 3.0 : (Math::exp((e - HLG_C) / HLG_A) + HLG_B) / 12.0;
+}
+
+} // namespace
+
+Dictionary MediaSource::get_tone_mapping(const Dictionary &p_video_info, double p_target_nits) {
+	Dictionary d;
+	const String transfer = p_video_info.get("color_transfer", String());
+	const String primaries = p_video_info.get("color_primaries", String());
+	const String kind = transfer == "smpte2084" ? "pq" : (transfer == "arib-std-b67" ? "hlg" : "sdr");
+	d["transfer"] = kind;
+	// Linear light in the video's primaries to linear BT.709 (out-of-gamut colours come out negative: clamp them).
+	const double *source = primaries == "bt2020" ? BT2020_XY : (primaries == "smpte432" ? P3_D65_XY : nullptr);
+	d["gamut_matrix"] = source ? rgb_to_xyz(BT709_XY).inverse() * rgb_to_xyz(source) : Basis();
+	d["primaries_bt709"] = source == nullptr;
+	d["pq_m1"] = PQ_M1;
+	d["pq_m2"] = PQ_M2;
+	d["pq_c1"] = PQ_C1;
+	d["pq_c2"] = PQ_C2;
+	d["pq_c3"] = PQ_C3;
+	d["hlg_a"] = HLG_A;
+	d["hlg_b"] = HLG_B;
+	d["hlg_c"] = HLG_C;
+	// The brightest the video gets: MaxCLL, else the mastering display's peak, else 1000 nits (the usual grade); never
+	// above the mastering display's peak. HLG is shown as on a 1000 nit display (system gamma 1.2), then mapped like PQ.
+	const double target = CLAMP(p_target_nits, 48.0, 10000.0);
+	double peak = 1000.0;
+	double black = 0.0;
+	if (kind == "pq") {
+		const int max_cll = p_video_info.get("max_cll", 0);
+		const Vector2 mastering = p_video_info.get("mastering_display_luminance", Vector2());
+		if (max_cll > 0) {
+			peak = max_cll;
+		} else if (mastering.y > 0.0f) {
+			peak = mastering.y;
+		}
+		if (mastering.y > 0.0f) {
+			peak = MIN(peak, (double)mastering.y);
+			black = mastering.x;
+		}
+		peak = MAX(peak, 100.0);
+	}
+	d["hlg_system_gamma"] = 1.2;
+	d["hlg_peak_nits"] = 1000.0;
+	d["source_peak_nits"] = peak;
+	d["source_black_nits"] = black;
+	d["target_peak_nits"] = target;
+	// BT.2390 EETF, on PQ values normalised to the source's range: E = (pq - source_min_pq) / (source_max_pq -
+	// source_min_pq). Below knee_start E is kept; above, a Hermite spline bends it to max_luminance (the target peak) at
+	// E = 1. tone_mapping false: the source fits the target, nothing to compress.
+	const double source_min_pq = nits_to_pq(black);
+	const double source_max_pq = nits_to_pq(peak);
+	const double max_luminance = CLAMP((nits_to_pq(target) - source_min_pq) / (source_max_pq - source_min_pq), 0.0, 1.0);
+	d["source_min_pq"] = source_min_pq;
+	d["source_max_pq"] = source_max_pq;
+	d["max_luminance"] = max_luminance;
+	d["knee_start"] = 1.5 * max_luminance - 0.5;
+	d["tone_mapping"] = kind != "sdr" && peak > target;
+	return d;
+}
+
+Color MediaSource::tone_map_color(const Color &p_rgb, const Dictionary &p_tone_mapping) {
+	const String kind = p_tone_mapping.get("transfer", String("sdr"));
+	const double target = p_tone_mapping.get("target_peak_nits", 203.0);
+	Vector3 nits;
+	if (kind == "pq") {
+		nits = Vector3(pq_to_nits(p_rgb.r), pq_to_nits(p_rgb.g), pq_to_nits(p_rgb.b));
+	} else if (kind == "hlg") {
+		// Scene light, then the OOTF of a 1000 nit display: Y^(gamma - 1), Y the BT.2020 luminance.
+		const Vector3 scene(hlg_to_scene(p_rgb.r), hlg_to_scene(p_rgb.g), hlg_to_scene(p_rgb.b));
+		const double y = 0.2627 * scene.x + 0.6780 * scene.y + 0.0593 * scene.z;
+		const double gamma = p_tone_mapping.get("hlg_system_gamma", 1.2);
+		nits = scene * (1000.0 * Math::pow(MAX(y, 0.0), gamma - 1.0));
+	} else {
+		// SDR: BT.1886 (gamma 2.4) at the target's peak; only the gamut matrix applies.
+		nits = Vector3(Math::pow(MAX((double)p_rgb.r, 0.0), 2.4), Math::pow(MAX((double)p_rgb.g, 0.0), 2.4), Math::pow(MAX((double)p_rgb.b, 0.0), 2.4)) * target;
+	}
+	const Basis gamut = p_tone_mapping.get("gamut_matrix", Basis());
+	nits = gamut.xform(nits);
+	nits = Vector3(MAX(nits.x, (real_t)0.0), MAX(nits.y, (real_t)0.0), MAX(nits.z, (real_t)0.0));
+	// The EETF on the brightest channel, applied as a ratio to all three (keeps the hue).
+	const double brightest = MAX(nits.x, MAX(nits.y, nits.z));
+	if (bool(p_tone_mapping.get("tone_mapping", false)) && brightest > 0.0) {
+		const double min_pq = p_tone_mapping["source_min_pq"];
+		const double max_pq = p_tone_mapping["source_max_pq"];
+		const double max_luminance = p_tone_mapping["max_luminance"];
+		const double knee = p_tone_mapping["knee_start"];
+		double e = CLAMP((nits_to_pq(brightest) - min_pq) / (max_pq - min_pq), 0.0, 1.0);
+		if (e > knee) {
+			const double t = (e - knee) / (1.0 - knee);
+			const double t2 = t * t;
+			const double t3 = t2 * t;
+			e = (2.0 * t3 - 3.0 * t2 + 1.0) * knee + (t3 - 2.0 * t2 + t) * (1.0 - knee) + (-2.0 * t3 + 3.0 * t2) * max_luminance;
+		}
+		nits *= pq_to_nits(e * (max_pq - min_pq) + min_pq) / brightest;
+	}
+	nits /= target;
+	return Color(nits.x, nits.y, nits.z, p_rgb.a);
 }

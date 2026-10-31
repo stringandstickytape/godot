@@ -1161,6 +1161,10 @@ void MediaSource::_deliver_video(AVPacket *p_packet) {
 		int nal_type = -1;
 		const bool has_sps = _scan_access_unit(p_packet->data, (uint64_t)p_packet->size, hevc, sps, &scan_parameter_sets, &nal_type);
 		out.nal_type = (int8_t)nal_type;
+		if (hdr_sei_pending && out.keyframe && !thread.is_started()) {
+			_parse_hdr_sei(p_packet->data, (uint64_t)p_packet->size, hevc);
+			hdr_sei_pending = false;
+		}
 		if (has_sps) {
 			out.sps_width = sps.width;
 			out.sps_height = sps.height;
@@ -1642,6 +1646,7 @@ Error MediaSource::open(const String &p_path) {
 		video.width = par->width;
 		video.height = par->height;
 		_read_stream_metadata(stream);
+		_read_hdr_side_data(stream);
 		const AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
 		video.fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
 		const AVRational sar = av_guess_sample_aspect_ratio(format, format->streams[best_video], nullptr);
@@ -1767,6 +1772,19 @@ Error MediaSource::open(const String &p_path) {
 		if (!video.sps.valid) {
 			print_line(vformat("MediaSource: no %s SPS found near the start of %s.", video.codec_name, global_path));
 		}
+	}
+	// HDR video whose container lacks the mastering display or light level metadata (most rips): read up to the first
+	// keyframe now and take them from its SEI (what is read is queued as usual).
+	hdr_sei_pending = _is_annexb_codec() && (video.color_transfer == "smpte2084" || video.color_transfer == "arib-std-b67") &&
+			!(video.mastering_luminance && video.light_level);
+	if (hdr_sei_pending) {
+		for (int i = 0; i < 4000 && hdr_sei_pending && !eof_reached && get_state() != STATE_ERROR; i++) {
+			_read_packet();
+		}
+		hdr_sei_pending = false;
+		print_line(vformat("MediaSource: HDR metadata %s: mastering display %s, MaxCLL %d, MaxFALL %d%s%s.", video.hdr_metadata_source.is_empty() ? String("none") : video.hdr_metadata_source,
+				video.mastering_luminance ? vformat("%.4f-%.0f nits", video.mastering_min_nits, video.mastering_max_nits) : String("unknown"), video.max_cll, video.max_fall,
+				video.hdr10plus ? ", HDR10+" : "", video.dolby_vision_profile >= 0 ? vformat(", Dolby Vision profile %d", video.dolby_vision_profile) : String()));
 	}
 
 	if (get_state() == STATE_ERROR) {
@@ -1932,6 +1950,21 @@ Dictionary MediaSource::get_video_info() const {
 	d["matrix_bt2020"] = video.color_matrix.begins_with("bt2020");
 	d["full_range"] = video.color_range == "pc";
 	d["hdr"] = video.color_transfer == "smpte2084" || video.color_transfer == "arib-std-b67";
+	// HDR metadata (get_tone_mapping() takes this dictionary).
+	d["hdr_transfer"] = video.color_transfer == "smpte2084" ? "pq" : (video.color_transfer == "arib-std-b67" ? "hlg" : "");
+	d["max_cll"] = video.max_cll;
+	d["max_fall"] = video.max_fall;
+	PackedVector2Array mastering;
+	if (video.mastering_primaries) {
+		for (int i = 0; i < 4; i++) {
+			mastering.push_back(Vector2(video.mastering_display[i * 2], video.mastering_display[i * 2 + 1]));
+		}
+	}
+	d["mastering_display_primaries"] = mastering;
+	d["mastering_display_luminance"] = video.mastering_luminance ? Vector2(video.mastering_min_nits, video.mastering_max_nits) : Vector2();
+	d["hdr_metadata_source"] = video.hdr_metadata_source;
+	d["dolby_vision_profile"] = video.dolby_vision_profile;
+	d["hdr10plus"] = video.hdr10plus;
 	// Stereo and spherical metadata of the container ("" when it says nothing: guess from the name, as before).
 	d["stereo_mode"] = video.stereo_mode;
 	d["stereo_inverted"] = video.stereo_inverted;
@@ -2513,6 +2546,8 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("read_video_packet"), &MediaSource::read_video_packet);
 	ClassDB::bind_method(D_METHOD("get_chapters"), &MediaSource::get_chapters);
 	ClassDB::bind_static_method("MediaSource", D_METHOD("parse_ass_event", "line", "header"), &MediaSource::parse_ass_event);
+	ClassDB::bind_static_method("MediaSource", D_METHOD("get_tone_mapping", "video_info", "target_nits"), &MediaSource::get_tone_mapping, DEFVAL(203.0));
+	ClassDB::bind_static_method("MediaSource", D_METHOD("tone_map_color", "rgb", "tone_mapping"), &MediaSource::tone_map_color);
 	ClassDB::bind_method(D_METHOD("set_playback_speed", "speed"), &MediaSource::set_playback_speed);
 	ClassDB::bind_method(D_METHOD("get_playback_speed"), &MediaSource::get_playback_speed);
 	ClassDB::bind_method(D_METHOD("get_video_bitrate_history", "seconds", "at"), &MediaSource::get_video_bitrate_history);
