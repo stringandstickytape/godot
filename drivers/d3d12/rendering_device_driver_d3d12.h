@@ -311,6 +311,12 @@ private:
 	HashMap<DXGI_FORMAT, uint32_t> format_sample_counts_mask_cache;
 	Mutex format_sample_counts_mask_cache_mutex;
 
+	// Anthropolis: texture_get_usages_supported_by_format's answers, each kept from its first query while
+	// rendering/rendering_device/d3d12/anthropolis_cache_format_support is on.
+	int64_t anthropolis_format_usages[DATA_FORMAT_MAX] = {};
+	bool anthropolis_format_usages_known[DATA_FORMAT_MAX] = {};
+	Mutex anthropolis_format_usages_mutex;
+
 	uint32_t _find_max_common_supported_sample_count(VectorView<DXGI_FORMAT> p_formats);
 	UINT _compute_component_mapping(const TextureView &p_view);
 	UINT _compute_plane_slice(DataFormat p_format, BitField<TextureAspectBits> p_aspect_bits);

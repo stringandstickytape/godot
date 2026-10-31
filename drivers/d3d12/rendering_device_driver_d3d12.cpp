@@ -1807,6 +1807,17 @@ BitField<RDD::TextureUsageBits> RenderingDeviceDriverD3D12::texture_get_usages_s
 		return 0;
 	}
 
+	// Anthropolis: a format's support cannot change while the device lives, and every new mesh surface asks for its
+	// depth and color formats, two CheckFeatureSupport calls each. With the setting on, each format is asked of the
+	// device once and its bits kept; a failed query is never kept. Same bits. Off by default.
+	const bool anthropolis_cache = GLOBAL_GET_CACHED(bool, "rendering/rendering_device/d3d12/anthropolis_cache_format_support");
+	if (anthropolis_cache) {
+		MutexLock lock(anthropolis_format_usages_mutex);
+		if (anthropolis_format_usages_known[p_format]) {
+			return anthropolis_format_usages[p_format];
+		}
+	}
+
 	D3D12_FEATURE_DATA_FORMAT_SUPPORT srv_rtv_support = {};
 	srv_rtv_support.Format = RD_TO_D3D12_FORMAT[p_format].general_format;
 	if (srv_rtv_support.Format != DXGI_FORMAT_UNKNOWN) { // Some implementations (i.e., vkd3d-proton) error out instead of returning empty.
@@ -1853,6 +1864,11 @@ BitField<RDD::TextureUsageBits> RenderingDeviceDriverD3D12::texture_get_usages_s
 		supported.clear_flag(TEXTURE_USAGE_VRS_ATTACHMENT_BIT);
 	}
 
+	if (anthropolis_cache) {
+		MutexLock lock(anthropolis_format_usages_mutex);
+		anthropolis_format_usages[p_format] = (int64_t)supported;
+		anthropolis_format_usages_known[p_format] = true;
+	}
 	return supported;
 }
 
@@ -6566,6 +6582,7 @@ Error RenderingDeviceDriverD3D12::initialize(uint32_t p_device_index, uint32_t p
 
 	// Anthropolis: registered here so a game can detect the patch with ProjectSettings.has_setting.
 	GLOBAL_DEF("rendering/rendering_device/d3d12/anthropolis_global_buffer_barriers", false);
+	GLOBAL_DEF("rendering/rendering_device/d3d12/anthropolis_cache_format_support", false);
 	GLOBAL_DEF("rendering/rendering_device/d3d12/anthropolis_tlsf_skip_futile_search", false);
 
 	context_device = context_driver->device_get(p_device_index);
