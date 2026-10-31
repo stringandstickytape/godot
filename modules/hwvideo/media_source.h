@@ -31,7 +31,9 @@
 #pragma once
 
 #include "annexb_splitter.h"
+#include "subtitle_style.h"
 
+#include "core/io/image.h"
 #include "core/math/audio_frame.h"
 #include "core/object/ref_counted.h"
 #include "core/os/condition_variable.h"
@@ -136,13 +138,22 @@ public:
 	// A subtitle event of the selected subtitle track. Text tracks (SubRip, ASS/SSA, MP4 timed text, WebVTT) are decoded:
 	// text is plain (ASS override tags removed, line breaks as \n), ass the ASS event line(s) for libass. Bitmap tracks
 	// (PGS, VobSub, DVB) are passed through: data is the raw packet, to be decoded later.
+	// One picture of a bitmap subtitle event, in the subtitle canvas's pixels.
+	struct SubtitleBitmap {
+		Rect2i rect;
+		Ref<Image> image; // RGBA8, straight alpha.
+		bool forced = false;
+	};
+
 	struct SubtitleEvent {
 		double start = 0.0; // Media seconds.
 		double end = -1.0; // -1: until the next event (bitmap tracks, or no duration in the container).
 		String text;
 		String ass;
-		PackedByteArray data;
+		PackedByteArray data; // Bitmap tracks without a decoder: the raw packet.
 		bool bitmap = false;
+		LocalVector<SubtitleBitmap> bitmaps; // Decoded bitmap tracks; none: the screen is cleared.
+		Size2i canvas; // The size the bitmaps' rects refer to.
 		uint32_t serial = 0;
 	};
 
@@ -172,6 +183,7 @@ private:
 		bool is_default = false;
 		bool forced = false;
 		bool hearing_impaired = false;
+		bool bitmap_decoded = false; // Bitmap track with a decoder: events carry images.
 		String path; // External files: where it was loaded from.
 	};
 
@@ -273,6 +285,9 @@ private:
 	String subtitle_header;
 	LocalVector<ExternalSubtitle> external_subtitles; // Tracks subtitle_tracks.size() and up.
 	uint32_t external_cursor = 0; // The next event of the selected external track to hand out.
+	// read_subtitle_event() (consumer thread): the parsed header of the selected text track.
+	String styled_header_source;
+	SubtitleStyle::Header styled_header;
 	uint32_t external_serial = 0; // The serial it was handed out under.
 	double subtitle_read_ahead = 0.0;
 	uint32_t subtitle_video_target = 0; // Video queue target while a subtitle stream is read (covers the read-ahead).
@@ -366,6 +381,7 @@ private:
 	// One decoded text subtitle packet as an event (p_start, p_duration: the packet's media time and duration, -1 if
 	// none). False if it decoded to nothing; r_error set if the decoder failed.
 	static bool _decode_text_subtitle(AVCodecContext *p_codec, AVPacket *p_packet, double p_start, double p_duration, SubtitleEvent &r_event, bool &r_error);
+	bool _decode_bitmap_subtitle(AVPacket *p_packet, double p_start, double p_duration, SubtitleEvent &r_event, bool &r_error);
 	static String _subtitle_file_to_utf8(const PackedByteArray &p_bytes, String &r_charset);
 	static Error _read_whole_file(const String &p_path, int64_t p_max_bytes, PackedByteArray &r_bytes, String &r_error);
 	void _read_stream_metadata(const AVStream *p_stream);
@@ -456,6 +472,10 @@ public:
 	// read that far ahead while a subtitle track is selected (within the queue's limits: 512 packets, 96 MiB).
 	void set_subtitle_read_ahead(double p_seconds);
 	double get_subtitle_read_ahead() const;
+
+	// The parts of an ASS event line an app can draw without libass (SubtitleStyle): runs of styled text, alignment,
+	// position, margins, script resolution. p_header: get_subtitle_header().
+	static Dictionary parse_ass_event(const String &p_line, const String &p_header);
 
 	// Language memory: "ger", "deu", "de" and "German" -> "de" (see MediaLanguages), and the track that fits a list of
 	// preferred languages best (-1: none of them).

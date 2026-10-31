@@ -852,7 +852,7 @@ void MediaSource::_open_subtitle_track(int p_track) {
 	if (p_track >= 0 && p_track < (int)subtitle_tracks.size()) {
 		const SubtitleTrack &track = subtitle_tracks[p_track];
 		const AVStream *stream = format->streams[track.stream_index];
-		if (track.text) {
+		if (track.text || track.bitmap_decoded) {
 			const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
 			subtitle_codec = codec ? avcodec_alloc_context3(codec) : nullptr;
 			int r = subtitle_codec ? avcodec_parameters_to_context(subtitle_codec, stream->codecpar) : AVERROR_DECODER_NOT_FOUND;
@@ -867,7 +867,7 @@ void MediaSource::_open_subtitle_track(int p_track) {
 				ERR_PRINT("MediaSource: " + last_error);
 			} else {
 				current_subtitle_stream = track.stream_index;
-				if (subtitle_codec->subtitle_header && subtitle_codec->subtitle_header_size > 0) {
+				if (track.text && subtitle_codec->subtitle_header && subtitle_codec->subtitle_header_size > 0) {
 					header = String::utf8((const char *)subtitle_codec->subtitle_header, subtitle_codec->subtitle_header_size);
 				}
 			}
@@ -916,7 +916,9 @@ void MediaSource::_handle_subtitle_packet() {
 	}
 	SubtitleEvent event;
 	bool error = false;
-	if (_decode_text_subtitle(subtitle_codec, read_packet, start, packet_duration, event, error)) {
+	const bool bitmap = current_subtitle_track >= 0 && current_subtitle_track < (int)subtitle_tracks.size() && subtitle_tracks[current_subtitle_track].bitmap;
+	const bool decoded = bitmap ? _decode_bitmap_subtitle(read_packet, start, packet_duration, event, error) : _decode_text_subtitle(subtitle_codec, read_packet, start, packet_duration, event, error);
+	if (decoded) {
 		_push_subtitle(event);
 	} else if (error) {
 		dstats.subtitle_decode_errors++;
@@ -1396,6 +1398,7 @@ Error MediaSource::open(const String &p_path) {
 			track.codec = String::utf8(avcodec_get_name(par->codec_id));
 			track.text = _is_text_subtitle(par->codec_id) && avcodec_find_decoder(par->codec_id) != nullptr;
 			track.bitmap = _is_bitmap_subtitle(par->codec_id);
+			track.bitmap_decoded = track.bitmap && avcodec_find_decoder(par->codec_id) != nullptr;
 			track.language = language ? String::utf8(language->value) : String();
 			track.title = title ? String::utf8(title->value) : String();
 			track.is_default = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
@@ -1882,7 +1885,36 @@ Dictionary MediaSource::read_subtitle_event() {
 	d["ass"] = event.ass;
 	d["bitmap"] = event.bitmap;
 	if (event.bitmap) {
-		d["data"] = event.data;
+		if (!event.data.is_empty()) {
+			d["data"] = event.data;
+		} else {
+			Array images;
+			bool forced = false;
+			for (const SubtitleBitmap &bitmap : event.bitmaps) {
+				Dictionary image;
+				image["rect"] = bitmap.rect;
+				image["image"] = bitmap.image;
+				image["forced"] = bitmap.forced;
+				images.push_back(image);
+				forced = forced || bitmap.forced;
+			}
+			d["images"] = images;
+			d["forced"] = forced;
+			d["canvas_size"] = event.canvas.width > 0 && event.canvas.height > 0 ? Vector2i(event.canvas) : Vector2i(video.width, video.height);
+		}
+	} else if (!event.ass.is_empty()) {
+		const String header = get_subtitle_header();
+		if (header != styled_header_source) {
+			styled_header_source = header;
+			styled_header = SubtitleStyle::parse_header(header);
+		}
+		// One event may hold several lines (several rects): each is styled on its own.
+		Array styled;
+		const Vector<String> lines = event.ass.split("\n");
+		for (const String &line : lines) {
+			styled.push_back(SubtitleStyle::parse_event(line, styled_header));
+		}
+		d["styled"] = styled;
 	}
 	d["serial"] = event.serial;
 	return d;
@@ -2186,6 +2218,7 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_output_rate"), &MediaSource::get_output_rate);
 	ClassDB::bind_method(D_METHOD("read_video_packet"), &MediaSource::read_video_packet);
 	ClassDB::bind_method(D_METHOD("get_chapters"), &MediaSource::get_chapters);
+	ClassDB::bind_static_method("MediaSource", D_METHOD("parse_ass_event", "line", "header"), &MediaSource::parse_ass_event);
 	ClassDB::bind_method(D_METHOD("set_playback_speed", "speed"), &MediaSource::set_playback_speed);
 	ClassDB::bind_method(D_METHOD("get_playback_speed"), &MediaSource::get_playback_speed);
 	ClassDB::bind_method(D_METHOD("get_video_bitrate_history", "seconds", "at"), &MediaSource::get_video_bitrate_history);

@@ -6,7 +6,7 @@
 	<description>
 		Opens a file with FFmpeg's libavformat and reads it on a worker thread. The video stream is only demuxed: its access units go, in Annex-B for H.264 and HEVC (converted from MP4/Matroska's length-prefixed form with the [code]h264_mp4toannexb[/code] / [code]hevc_mp4toannexb[/code] bitstream filters), through a bounded queue to a [V4L2Decoder] ([method V4L2Decoder.open_source], [method HWVideoTexture.open_source]). The first access unit after [method open] and after every [method seek] is a keyframe with the parameter sets (VPS/SPS/PPS) in band.
 		Files on a file share open by URL: [code]smb://host/share/path/file.mkv[/code] (SMB2/3, see [method set_smb_credentials] and [member network_buffer_size]). A thread of their own reads them ahead into a ring buffer, so network latency doesn't reach the demuxer.
-		Subtitle tracks can be selected too ([method select_subtitle_track], [method read_subtitle_event]): text tracks are decoded to text and ASS lines, bitmap tracks passed through as packets.
+		Subtitle tracks can be selected too ([method select_subtitle_track], [method read_subtitle_event]): text tracks are decoded to text, ASS lines and styled runs, bitmap tracks to RGBA images with their rectangles.
 		The selected audio track is decoded and resampled with libswresample to stereo float at the [AudioServer] mix rate, into a ring buffer that [method get_audio_stream] plays. More than two channels are downmixed (centre and surrounds at -3 dB, LFE dropped); the source layout is in [method get_audio_tracks]. The playback position of that stream is the A/V master clock.
 		All times are media seconds: the stream timestamp minus the file's start time ([method get_start_time]), so the first frame is at about 0. The thread blocks when the queues are full ([member video_queue_seconds], [member audio_queue_seconds]) and is woken when they are consumed; it never spins.
 		[codeblock]
@@ -166,7 +166,7 @@
 		<method name="get_subtitle_tracks" qualifiers="const">
 			<return type="Array" />
 			<description>
-				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]text[/code] (decoded to text: SubRip, ASS/SSA, MP4 timed text, WebVTT), [code]bitmap[/code] (PGS, VobSub, DVB, XSUB: passed through), [code]language[/code], [code]language_code[/code] ([method normalize_language]), [code]title[/code], [code]default[/code], [code]forced[/code], [code]hearing_impaired[/code] (both also from the title), [code]external[/code], and for subtitle files ([method add_external_subtitle]) [code]path[/code]. The file's own tracks come first.
+				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]text[/code] (decoded to text: SubRip, ASS/SSA, MP4 timed text, WebVTT), [code]bitmap[/code] (PGS, VobSub, DVB, XSUB), [code]bitmap_decoded[/code] (a bitmap track whose events carry images; else they carry the raw packets), [code]language[/code], [code]language_code[/code] ([method normalize_language]), [code]title[/code], [code]default[/code], [code]forced[/code], [code]hearing_impaired[/code] (both also from the title), [code]external[/code], and for subtitle files ([method add_external_subtitle]) [code]path[/code]. The file's own tracks come first.
 			</description>
 		</method>
 		<method name="get_video_bitrate_history" qualifiers="const">
@@ -187,7 +187,10 @@
 		<method name="read_subtitle_event">
 			<return type="Dictionary" />
 			<description>
-				Takes the next event of the selected subtitle track: [code]start[/code] and [code]end[/code] (media seconds; [code]end[/code] is -1 when unknown, as for most bitmap tracks, where the next event ends it), [code]text[/code] (plain text, lines separated by [code]\n[/code], ASS override tags removed), [code]ass[/code] (FFmpeg's ASS event line(s): ReadOrder, Layer, Style, Name, margins, Effect, Text), [code]bitmap[/code], [code]data[/code] (bitmap tracks: the raw packet), [code]serial[/code]. Returns an empty Dictionary when none is queued. Events come in file order, about the queue length ahead of the playback position; keep them until their time. At most 512 are queued (the oldest are dropped). Subtitle files ([method add_external_subtitle]) hand out all their events at once instead. For a negative subtitle delay, see [member subtitle_read_ahead].
+				Takes the next event of the selected subtitle track: [code]start[/code] and [code]end[/code] (media seconds; [code]end[/code] is -1 when unknown, as for most bitmap tracks, where the next event ends it), [code]text[/code] (plain text, lines separated by [code]\n[/code], ASS override tags removed), [code]ass[/code] (FFmpeg's ASS event line(s): ReadOrder, Layer, Style, Name, margins, Effect, Text), [code]bitmap[/code], [code]serial[/code].
+				Text tracks also give [code]styled[/code]: an Array with one Dictionary per ASS line of the event, as [method parse_ass_event] returns them (runs of styled text, alignment, position, margins, script resolution).
+				Bitmap tracks (PGS, VobSub, DVB, XSUB) are decoded to pictures: [code]images[/code] (an Array of Dictionaries: [code]rect[/code], a [Rect2i] in the canvas's pixels; [code]image[/code], an RGBA8 [Image] of the rect's size with straight alpha; [code]forced[/code]), [code]forced[/code] (any of them is), [code]canvas_size[/code] (the [Vector2i] the rects are in, usually the video's size; scale it to the video's rectangle). An event without images clears the screen from its start: PGS sends one after each picture, and most bitmap events have no [code]end[/code]. A bitmap track without a decoder gives [code]data[/code] (the raw packet) instead.
+				Returns an empty Dictionary when none is queued. Events come in file order, about the queue length ahead of the playback position; keep them until their time. At most 512 are queued (the oldest are dropped). Subtitle files ([method add_external_subtitle]) hand out all their events at once instead. For a negative subtitle delay, see [member subtitle_read_ahead].
 			</description>
 		</method>
 		<method name="select_subtitle_track">
@@ -229,6 +232,17 @@
 			<description>
 				Opens a file, reads its stream information, selects the default audio track and starts reading. Blocks while it reads the start of the file.
 				[param path] is a local path, a [code]res://[/code] or [code]user://[/code] path, or [code]smb://host/share/path/file[/code] (not URL-encoded: names are written as they are). For an smb:// file, the host is connected and logged into with the credentials of [method set_smb_credentials] (else as guest), which can take up to about 8 s per step when the host doesn't answer: open from a worker thread if the caller must not stall. Errors are sentences for the user in [method get_last_error], for example "Access denied: HOST refused the user name or password." or "Not found: share/path on HOST.".
+			</description>
+		</method>
+		<method name="parse_ass_event" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="line" type="String" />
+			<param index="1" name="header" type="String" />
+			<description>
+				Parses one ASS event line as FFmpeg gives it ([code]ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text[/code]) against an ASS or SSA script header ([method get_subtitle_header]; empty: ASS's defaults) into what an app can draw without libass. The result is the same as each entry of [method read_subtitle_event]'s [code]styled[/code], which already does this for text tracks:
+				[code]runs[/code]: an Array of Dictionaries, one per stretch of text with the same style: [code]text[/code] (line breaks as [code]\n[/code], [code]\h[/code] as a no-break space), [code]font[/code], [code]size[/code] (in script pixels), [code]color[/code], [code]outline_color[/code], [code]outline_width[/code], [code]bold[/code], [code]italic[/code], [code]underline[/code], [code]strikeout[/code].
+				[code]text[/code] (all runs as plain text), [code]alignment[/code] (numpad layout: 1-3 bottom, 4-6 middle, 7-9 top; left, centre, right), [code]position[/code] (from [code]\pos[/code], in script pixels; (-1, -1) if none: place by alignment and margins), [code]margin_l[/code], [code]margin_r[/code], [code]margin_v[/code], [code]play_res[/code] (the script resolution that sizes, positions and margins are in, a [Vector2i]; 384x288 when the script doesn't say, as for SubRip), [code]style[/code], [code]layer[/code], [code]back_color[/code] (the style's shadow or box colour).
+				Override tags read: [code]\b[/code], [code]\i[/code], [code]\u[/code], [code]\s[/code], [code]\fn[/code], [code]\fs[/code], [code]\c[/code]/[code]\1c[/code], [code]\3c[/code], [code]\1a[/code]/[code]\alpha[/code], [code]\bord[/code], [code]\r[/code], [code]\an[/code], [code]\a[/code], [code]\pos[/code]; a tag without a value goes back to the style's value. Others (karaoke, [code]\t[/code], [code]\move[/code], [code]\clip[/code], drawings, rotation, blur, fades) are dropped. SubRip's [code]&lt;b&gt;[/code], [code]&lt;i&gt;[/code], [code]&lt;u&gt;[/code] and [code]&lt;font color&gt;[/code] reach here as override tags.
 			</description>
 		</method>
 		<method name="pick_audio_track" qualifiers="const">

@@ -285,6 +285,62 @@ bool MediaSource::_decode_text_subtitle(AVCodecContext *p_codec, AVPacket *p_pac
 	return !r_event.ass.is_empty();
 }
 
+// A bitmap subtitle packet (PGS, VobSub, DVB, XSUB) as RGBA images. The palette entries are 0xAARRGGBB.
+bool MediaSource::_decode_bitmap_subtitle(AVPacket *p_packet, double p_start, double p_duration, SubtitleEvent &r_event, bool &r_error) {
+	r_error = false;
+	AVSubtitle subtitle = {};
+	int got = 0;
+	if (avcodec_decode_subtitle2(subtitle_codec, &subtitle, &got, p_packet) < 0) {
+		r_error = true;
+		return false;
+	}
+	if (!got) {
+		return false;
+	}
+	r_event = SubtitleEvent();
+	r_event.bitmap = true;
+	r_event.start = p_start + subtitle.start_display_time / 1000.0;
+	if (subtitle.end_display_time > subtitle.start_display_time && subtitle.end_display_time != UINT32_MAX) {
+		r_event.end = p_start + subtitle.end_display_time / 1000.0;
+	} else if (p_duration > 0.0) {
+		r_event.end = p_start + p_duration;
+	}
+	r_event.canvas = Size2i(subtitle_codec->width, subtitle_codec->height);
+	for (unsigned i = 0; i < subtitle.num_rects; i++) {
+		const AVSubtitleRect *rect = subtitle.rects[i];
+		if (rect->type != SUBTITLE_BITMAP || rect->w <= 0 || rect->h <= 0 || !rect->data[0] || !rect->data[1]) {
+			continue;
+		}
+		PackedByteArray rgba;
+		rgba.resize((int64_t)rect->w * rect->h * 4);
+		uint8_t *out = rgba.ptrw();
+		const uint32_t *palette = (const uint32_t *)rect->data[1];
+		const int colors = rect->nb_colors > 0 ? MIN(rect->nb_colors, 256) : 256;
+		for (int y = 0; y < rect->h; y++) {
+			const uint8_t *row = rect->data[0] + (int64_t)y * rect->linesize[0];
+			for (int x = 0; x < rect->w; x++) {
+				const uint32_t p = row[x] < colors ? palette[row[x]] : 0;
+				out[0] = (p >> 16) & 0xFF;
+				out[1] = (p >> 8) & 0xFF;
+				out[2] = p & 0xFF;
+				out[3] = p >> 24;
+				out += 4;
+			}
+		}
+		SubtitleBitmap bitmap;
+		bitmap.rect = Rect2i(rect->x, rect->y, rect->w, rect->h);
+		bitmap.image = Image::create_from_data(rect->w, rect->h, false, Image::FORMAT_RGBA8, rgba);
+		bitmap.forced = (rect->flags & AV_SUBTITLE_FLAG_FORCED) != 0;
+		r_event.bitmaps.push_back(bitmap);
+	}
+	avsubtitle_free(&subtitle);
+	return true; // No pictures: the screen is cleared from this time on.
+}
+
+Dictionary MediaSource::parse_ass_event(const String &p_line, const String &p_header) {
+	return SubtitleStyle::parse_event(p_line, SubtitleStyle::parse_header(p_header));
+}
+
 static bool is_valid_utf8(const uint8_t *p_data, int64_t p_size) {
 	int64_t i = 0;
 	while (i < p_size) {
@@ -610,6 +666,7 @@ Dictionary MediaSource::_subtitle_track_to_dictionary(const SubtitleTrack &p_tra
 	d["default"] = p_track.is_default;
 	d["forced"] = p_track.forced;
 	d["hearing_impaired"] = p_track.hearing_impaired;
+	d["bitmap_decoded"] = p_track.bitmap_decoded;
 	d["external"] = p_external;
 	if (p_external) {
 		d["path"] = p_track.path;
