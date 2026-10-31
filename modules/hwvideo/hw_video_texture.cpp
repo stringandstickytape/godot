@@ -229,9 +229,44 @@ void HWVideoTexture::_show(const ReadyFrame &p_frame, uint64_t p_frames_drawn) {
 	RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(release, buffer.image, to_free));
 }
 
+void HWVideoTexture::_discard_ready(uint32_t p_count, bool p_skipped) {
+	for (uint32_t k = 0; k < p_count; k++) {
+		buffers[ready[k].buffer].status = BUFFER_DECODER;
+		decoder->return_buffer(generation, ready[k].buffer);
+	}
+	if (p_skipped) {
+		frames_skipped += p_count;
+	} else {
+		frames_dropped += p_count;
+	}
+	for (uint32_t k = 0; k < p_count; k++) {
+		ready.remove_at(0); // Fewer than a handful of entries.
+	}
+}
+
+void HWVideoTexture::_return_all_ready() {
+	for (const ReadyFrame &ready_frame : ready) {
+		buffers[ready_frame.buffer].status = BUFFER_DECODER;
+		decoder->return_buffer(generation, ready_frame.buffer);
+	}
+	frames_stale += ready.size();
+	ready.clear();
+}
+
 void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	if (decoder.is_null() || !decoder->is_open()) {
 		return;
+	}
+	if (source.is_valid()) {
+		const uint32_t source_serial = source->get_serial();
+		if (source_serial != serial) {
+			// A seek on the source (by us, the audio player or anyone): frames ready now are from before it.
+			serial = source_serial;
+			clock = source->get_seek_target();
+			seek_target = clock;
+			settling = true;
+			_return_all_ready();
+		}
 	}
 	if (playing) {
 		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta;
@@ -277,25 +312,35 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 
 	// Show the newest frame that is due; the ones before it are late and dropped.
 	int due = -1;
+	bool later = false;
 	for (uint32_t k = 0; k < ready.size(); k++) {
 		if (ready[k].time > clock + 1e-4) {
+			later = true;
 			break;
 		}
 		due = (int)k;
 	}
-	if (due < 0) {
-		return;
+	if (settling) {
+		if (due < 0) {
+			if (!later) {
+				return;
+			}
+			due = 0; // The first frame is after the target (a stream starting at 0.083 s, a seek into a gap): show it.
+		} else if (!later && ready[due].time < clock - 1e-3 && decoder->get_state() != V4L2Decoder::STATE_ENDED) {
+			// Not known yet whether this is the frame for the target: keep it, skip the ones before it.
+			_discard_ready((uint32_t)due, true);
+			return;
+		}
+		_discard_ready((uint32_t)due, true);
+		settling = false;
+	} else {
+		if (due < 0) {
+			return;
+		}
+		_discard_ready((uint32_t)due, false);
 	}
-	for (int k = 0; k < due; k++) {
-		buffers[ready[k].buffer].status = BUFFER_DECODER;
-		decoder->return_buffer(generation, ready[k].buffer);
-		frames_dropped++;
-	}
-	const ReadyFrame show = ready[due];
-	ready.remove_at(0); // Fewer than a handful of entries.
-	for (int k = 0; k < due; k++) {
-		ready.remove_at(0);
-	}
+	const ReadyFrame show = ready[0];
+	ready.remove_at(0);
 	_show(show, frames_drawn);
 }
 
@@ -307,10 +352,33 @@ Error HWVideoTexture::open(const String &p_path, const String &p_codec, double p
 	frame_time = -1.0;
 	serial = 0;
 	playing = false;
-	frames_shown = frames_dropped = frames_stale = 0;
+	settling = true;
+	seek_target = 0.0;
+	frames_shown = frames_dropped = frames_stale = frames_skipped = 0;
 	const Error err = decoder->open(p_path, p_codec, p_fps);
 	if (err != OK) {
 		last_error = decoder->get_last_error();
+	}
+	return err;
+}
+
+Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
+	close();
+	ERR_FAIL_COND_V_MSG(p_source.is_null() || !p_source->is_open(), ERR_INVALID_PARAMETER, "HWVideoTexture: the MediaSource isn't open.");
+	last_error = String();
+	failed_generation = UINT32_MAX;
+	frame_time = -1.0;
+	playing = false;
+	frames_shown = frames_dropped = frames_stale = frames_skipped = 0;
+	source = p_source;
+	serial = source->get_serial();
+	clock = source->get_seek_target();
+	seek_target = clock;
+	settling = true;
+	const Error err = decoder->open_source(p_source);
+	if (err != OK) {
+		last_error = decoder->get_last_error();
+		source.unref();
 	}
 	return err;
 }
@@ -340,6 +408,7 @@ void HWVideoTexture::close() {
 	visible_rect = Rect2i();
 	playing = false;
 	decoder->close();
+	source.unref();
 }
 
 void HWVideoTexture::play() {
@@ -351,14 +420,25 @@ void HWVideoTexture::pause() {
 }
 
 void HWVideoTexture::seek_to_start() {
+	if (source.is_valid()) {
+		source->seek(0.0); // Picked up by update().
+		return;
+	}
 	serial = (uint32_t)decoder->seek_to_start();
 	clock = 0.0;
-	for (const ReadyFrame &ready_frame : ready) {
-		buffers[ready_frame.buffer].status = BUFFER_DECODER;
-		decoder->return_buffer(generation, ready_frame.buffer);
+	seek_target = 0.0;
+	settling = true;
+	_return_all_ready();
+}
+
+Error HWVideoTexture::seek(double p_seconds) {
+	if (source.is_valid()) {
+		source->seek(p_seconds);
+		return OK;
 	}
-	frames_stale += ready.size();
-	ready.clear();
+	ERR_FAIL_COND_V_MSG(p_seconds != 0.0, ERR_UNAVAILABLE, "HWVideoTexture: a raw Annex-B file can only seek to 0; open it through a MediaSource to seek anywhere.");
+	seek_to_start();
+	return OK;
 }
 
 Ref<Texture2D> HWVideoTexture::get_plane_texture(int p_plane) const {
@@ -390,6 +470,9 @@ Dictionary HWVideoTexture::get_stats() const {
 	d["frames_shown"] = frames_shown;
 	d["frames_dropped"] = frames_dropped;
 	d["frames_stale"] = frames_stale;
+	d["frames_skipped"] = frames_skipped;
+	d["settling"] = settling;
+	d["seek_target"] = seek_target;
 	d["frames_ready"] = ready.size();
 	d["position"] = clock;
 	d["frame_time"] = frame_time;
@@ -422,6 +505,9 @@ HWVideoTexture::~HWVideoTexture() {
 
 void HWVideoTexture::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open", "path", "codec", "fps"), &HWVideoTexture::open);
+	ClassDB::bind_method(D_METHOD("open_source", "source"), &HWVideoTexture::open_source);
+	ClassDB::bind_method(D_METHOD("seek", "seconds"), &HWVideoTexture::seek);
+	ClassDB::bind_method(D_METHOD("get_media_source"), &HWVideoTexture::get_media_source);
 	ClassDB::bind_method(D_METHOD("close"), &HWVideoTexture::close);
 	ClassDB::bind_method(D_METHOD("update", "delta", "master_clock"), &HWVideoTexture::update, DEFVAL(-1.0));
 	ClassDB::bind_method(D_METHOD("play"), &HWVideoTexture::play);

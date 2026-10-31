@@ -30,8 +30,10 @@
 
 #include "register_types.h"
 
+#include "audio_stream_media.h"
 #include "dmabuf_image.h"
 #include "hw_video_texture.h"
+#include "media_source.h"
 #include "v4l2_decoder.h"
 
 #include "core/object/class_db.h"
@@ -42,6 +44,9 @@ void initialize_hwvideo_module(ModuleInitializationLevel p_level) {
 	}
 
 	GDREGISTER_CLASS(DmabufImage);
+	GDREGISTER_CLASS(MediaSource);
+	GDREGISTER_CLASS(AudioStreamMedia);
+	GDREGISTER_CLASS(AudioStreamPlaybackMedia);
 	GDREGISTER_CLASS(V4L2Decoder);
 	GDREGISTER_CLASS(HWVideoTexture);
 	GDREGISTER_ABSTRACT_CLASS(HWVideoPlaneTexture);

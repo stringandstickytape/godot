@@ -65,8 +65,23 @@
 			<return type="Dictionary" />
 			<param index="0" name="path" type="String" />
 			<param index="1" name="codec" type="String" />
+			<param index="2" name="max_access_units" type="int" default="0" />
+			<param index="3" name="list_count" type="int" default="6" />
 			<description>
-				Splits the whole file into access units without decoding and returns [code]access_units[/code], [code]max_au_bytes[/code], [code]avg_au_bytes[/code], the first SPS ([code]width[/code], [code]height[/code], [code]display_width[/code], [code]display_height[/code], [code]bit_depth[/code]), [code]sps_size_changes[/code] and [code]parse_seconds[/code].
+				Splits the file (all of it, or its first [param max_access_units] if above 0) into access units without decoding. [code]first_access_units[/code] lists the first [param list_count] as [code]Vector2i(offset, size)[/code]. Also returns [code]access_units[/code], [code]max_au_bytes[/code], [code]avg_au_bytes[/code], the first SPS ([code]width[/code], [code]height[/code], [code]display_width[/code], [code]display_height[/code], [code]bit_depth[/code]), [code]sps_size_changes[/code] and [code]parse_seconds[/code].
+			</description>
+		</method>
+		<method name="open_source">
+			<return type="int" enum="Error" />
+			<param index="0" name="source" type="MediaSource" />
+			<description>
+				Decodes the video stream of an open [MediaSource] (H.264 or HEVC) instead of a raw file. Access units are popped from the source's queue, paced by their DTS against the clock, and each decoded frame's time is the PTS of the access unit it came from (the driver copies the OUTPUT timestamp to the CAPTURE buffer). Seek with [method MediaSource.seek]: the decoder drops access units of an older serial and starts a new epoch with the keyframe the source delivers; after the end of the stream was drained, it restarts the session. [member loop] is ignored.
+			</description>
+		</method>
+		<method name="get_media_source" qualifiers="const">
+			<return type="MediaSource" />
+			<description>
+				Returns the [MediaSource] given to [method open_source], or [code]null[/code].
 			</description>
 		</method>
 		<method name="seek_to_start">

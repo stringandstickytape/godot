@@ -31,6 +31,7 @@
 #pragma once
 
 #include "annexb_splitter.h"
+#include "media_source.h"
 
 #include "core/object/ref_counted.h"
 #include "core/os/mutex.h"
@@ -41,7 +42,8 @@
 #include "core/variant/variant.h"
 
 // A V4L2 stateful memory-to-memory decoder session (the Steam Frame's Qualcomm iris decoder, /dev/video-dec0), fed from a
-// raw Annex-B H.264/HEVC file, on a worker thread. A port of the session logic of spikes/01-decode/v4l2dec.c.
+// raw Annex-B H.264/HEVC file (open()) or from a MediaSource's access units (open_source()), on a worker thread. A port of
+// the session logic of spikes/01-decode/v4l2dec.c.
 //
 // One long-lived session: OUTPUT (bitstream) buffers are mmapped and fed one access unit each, paced by a clock that the
 // consumer sets (set_clock()), so the queue rate the driver measures stays near the playback rate. CAPTURE buffers are
@@ -64,8 +66,8 @@ public:
 	struct Frame {
 		uint32_t generation = 0; // The CAPTURE setup the buffer belongs to. Buffer indices are only valid within one.
 		uint32_t buffer = 0;
-		uint32_t serial = 0; // The seek_to_start() count when the frame's access unit was fed.
-		double time = 0.0; // Presentation time in seconds: display-order index / fps.
+		uint32_t serial = 0; // File: the seek_to_start() count when the access unit was fed. Source: the source's seek serial.
+		double time = 0.0; // Presentation time in seconds. File: display-order index / fps. Source: the access unit's PTS.
 	};
 
 	// Layout of the CAPTURE buffers of one generation. Only single-plane formats (NV12) are described.
@@ -112,6 +114,7 @@ private:
 	struct RecentAU {
 		AnnexBSplitter::AccessUnit au;
 		uint64_t media_index = 0;
+		double pts = 0.0; // Source mode.
 	};
 
 	struct IoctlError {
@@ -139,6 +142,8 @@ private:
 		double latency_max = 0.0;
 		uint64_t latency_count = 0;
 		uint64_t media_index = 0;
+		double input_time = 0.0; // Source mode: PTS of the last access unit fed.
+		double thread_cpu_seconds = 0.0; // CPU time of the worker thread.
 	};
 
 	// Settings, read by the worker thread; change them only while closed (lead_time and verbose can change any time).
@@ -153,7 +158,9 @@ private:
 	bool loop = false;
 	bool verbose = false;
 
-	// The stream, read-only while the worker runs.
+	// The stream, read-only while the worker runs. With a MediaSource (source valid) there is no file mapping: access
+	// units are popped from the source, and their PTS become the frame times.
+	Ref<MediaSource> source;
 	String file_path;
 	const uint8_t *file_data = nullptr;
 	uint64_t file_size = 0;
@@ -218,6 +225,12 @@ private:
 	uint64_t recent_count = 0;
 	double queue_time[QUEUE_RING] = {};
 	uint64_t queue_seq[QUEUE_RING] = {};
+	double queue_pts[QUEUE_RING] = {}; // Source mode: PTS of the access unit queued as seq.
+	MediaSource::VideoPacket held; // Source mode: the next access unit, popped but not fed yet (pacing).
+	bool have_held = false;
+	double input_time = 0.0;
+	double epoch_start_pts = 0.0; // Source mode: PTS of the first access unit of the current epoch.
+	Size2i last_sps_size;
 	double t_reconfig_start = 0.0;
 	double t_last_seen = 0.0;
 	double t_eos = 0.0;
@@ -243,12 +256,18 @@ private:
 	Error _subscribe_events();
 	Error _start_session();
 	Error _restart_session(const AnnexBSplitter::AccessUnit &p_resume, uint64_t p_media_index, const char *p_why);
+	Error _restart_session_source(const char *p_why);
+	Error _wait_for_source_input();
+	Error _start_worker();
 
 	uint64_t _timestamp_for_seq(uint64_t p_seq) const;
 	uint64_t _seq_for_timestamp(uint64_t p_usec) const;
 	double _queued_rate() const;
 	int _free_output_buffer() const;
+	int _qbuf_output(uint32_t p_index, uint64_t p_bytes);
 	int _queue_access_unit(uint32_t p_index, const AnnexBSplitter::AccessUnit &p_au);
+	bool _hold_source_packet();
+	int _queue_source_packet(uint32_t p_index);
 	int _queue_input();
 	void _begin_epoch(uint32_t p_serial, uint64_t p_base_index);
 	Epoch *_find_epoch(uint64_t p_seq);
@@ -275,9 +294,13 @@ protected:
 	static void _bind_methods();
 
 public:
-	static Dictionary probe_file(const String &p_path, const String &p_codec);
+	static Dictionary probe_file(const String &p_path, const String &p_codec, int p_max_access_units = 0, int p_list_count = 6);
 
 	Error open(const String &p_path, const String &p_codec, double p_fps);
+	// Decodes the video stream of an open MediaSource (H.264 or HEVC). Seeks are done on the source (MediaSource.seek());
+	// the decoder follows its serial. loop is ignored.
+	Error open_source(const Ref<MediaSource> &p_source);
+	Ref<MediaSource> get_media_source() const { return source; }
 	void close();
 	bool is_open() const { return thread.is_started(); }
 
@@ -285,6 +308,7 @@ public:
 	void set_clock(double p_seconds);
 	double get_clock() const;
 	// Main thread: drops what is queued and feeds from the first access unit again (new serial). Returns the serial.
+	// With a MediaSource: MediaSource.seek(0).
 	int seek_to_start();
 
 	// Main thread (C++): the frame handoff.

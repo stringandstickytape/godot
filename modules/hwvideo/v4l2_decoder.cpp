@@ -359,6 +359,9 @@ Error V4L2Decoder::_start_session() {
 		_fail("Queueing the first access units failed.");
 		return FAILED;
 	}
+	if (source.is_valid() && _wait_for_source_input() != OK) {
+		return FAILED;
+	}
 	int type = OUTPUT_TYPE;
 	if (IOCTL(VIDIOC_STREAMON, &type) < 0) {
 		_fail(vformat("STREAMON OUTPUT failed: %s.", strerror(errno)));
@@ -390,6 +393,50 @@ Error V4L2Decoder::_restart_session(const AnnexBSplitter::AccessUnit &p_resume, 
 	_begin_epoch(serial, media_index);
 	wstats.restarts++;
 	return _start_session();
+}
+
+// Source mode: closes the whole session, reopens the device and feeds from the source's queue (after a seek).
+Error V4L2Decoder::_restart_session_source(const char *p_why) {
+	_log(vformat("session restart (%s): closing and reopening the device.", p_why));
+	_close_device("session restart");
+	if (last_sps_size.width > 0) {
+		output_size = last_sps_size;
+	}
+	need_setup = false;
+	pending_reconfig = false;
+	got_last = false;
+	input_done = false;
+	stop_sent = false;
+	stop_failed = false;
+	ended = false;
+	eos_events = 0;
+	wstats.restarts++;
+	return _start_session();
+}
+
+// Source mode: the session starts with access units in the driver. The source may still be reading (just opened, or
+// seeking), so wait for them.
+Error V4L2Decoder::_wait_for_source_input() {
+	const double deadline = _now() + MAX(timeout_ms / 1000.0, 10.0);
+	while (output_in_driver == 0 && !input_done && !exit_requested.is_set()) {
+		if (_now() > deadline) {
+			_fail(vformat("No video access unit from the MediaSource in %.0f s (source state %d: %s).", MAX(timeout_ms / 1000.0, 10.0), (int)source->get_state(), source->get_last_error()));
+			return FAILED;
+		}
+		struct pollfd wait_fd = {};
+		wait_fd.fd = wake_fd;
+		wait_fd.events = POLLIN;
+		if (poll(&wait_fd, 1, POLL_SLICE_MS) > 0) {
+			uint64_t value;
+			const ssize_t r = read(wake_fd, &value, sizeof(value));
+			(void)r;
+		}
+		if (_queue_input() < 0) {
+			_fail("Queueing the first access units failed.");
+			return FAILED;
+		}
+	}
+	return OK;
 }
 
 /* Input */
@@ -433,9 +480,13 @@ int V4L2Decoder::_queue_access_unit(uint32_t p_index, const AnnexBSplitter::Acce
 		return 0;
 	}
 	memcpy(output[p_index].map, file_data + p_au.offset, p_au.size);
+	return _qbuf_output(p_index, p_au.size);
+}
 
+// Queues OUTPUT buffer p_index, holding p_bytes of bitstream, under the next seq. 1: queued, -1: error.
+int V4L2Decoder::_qbuf_output(uint32_t p_index, uint64_t p_bytes) {
 	struct v4l2_plane planes[1] = {};
-	planes[0].bytesused = (uint32_t)p_au.size;
+	planes[0].bytesused = (uint32_t)p_bytes;
 	planes[0].length = (uint32_t)output[p_index].length;
 	struct v4l2_buffer buffer = {};
 	buffer.index = p_index;
@@ -458,6 +509,67 @@ int V4L2Decoder::_queue_access_unit(uint32_t p_index, const AnnexBSplitter::Acce
 	return 1;
 }
 
+// Source mode: makes `held` the next access unit to feed. Access units read before the source's latest seek are dropped;
+// the first one after a seek starts a new epoch under its serial. False if none is queued yet, or the input is done.
+bool V4L2Decoder::_hold_source_packet() {
+	for (;;) {
+		if (!have_held) {
+			if (!source->pop_video_packet(held)) {
+				if (source->is_video_input_done(serial)) {
+					input_done = true;
+					_log(vformat("end of the input after %d access units.", media_index));
+				}
+				return false;
+			}
+			have_held = true;
+		}
+		if (held.serial != source->get_serial()) {
+			source->release_video_packet(held);
+			have_held = false;
+			continue;
+		}
+		if (held.serial != serial) {
+			serial = held.serial;
+			media_index = 0;
+			_begin_epoch(serial, 0);
+			_log_verbose(vformat("serial %d: first access unit at %.3f s%s.", serial, held.pts, held.keyframe ? " (keyframe)" : ""));
+		}
+		return true;
+	}
+}
+
+// Source mode: copies `held` into OUTPUT buffer p_index and queues it, with its PTS kept for the frame it decodes to.
+int V4L2Decoder::_queue_source_packet(uint32_t p_index) {
+	RecentAU &recent_au = recent[recent_count % RECENT_AUS];
+	recent_au.au = AnnexBSplitter::AccessUnit();
+	recent_au.au.size = held.size;
+	recent_au.au.sps_width = held.sps_width;
+	recent_au.au.sps_height = held.sps_height;
+	recent_au.media_index = media_index;
+	recent_au.pts = held.pts;
+	recent_count++;
+	if (media_index == 0) {
+		epoch_start_pts = held.pts;
+	}
+	media_index++;
+	input_time = held.pts;
+	if (held.sps_width) {
+		last_sps_size = Size2i(held.sps_width, held.sps_height);
+	}
+	int r = 0;
+	if (held.size > output[p_index].length) {
+		_log(vformat("access unit at %.3f s (%d bytes) doesn't fit an OUTPUT buffer (%d bytes); skipped. Set output_buffer_size.", held.pts, held.size, output[p_index].length));
+		wstats.aus_skipped++;
+	} else {
+		memcpy(output[p_index].map, held.data, held.size);
+		queue_pts[seq % QUEUE_RING] = held.pts;
+		r = _qbuf_output(p_index, held.size);
+	}
+	source->release_video_packet(held);
+	have_held = false;
+	return r;
+}
+
 // Feeds access units while the input is no more than lead_time ahead of the clock. Until the epoch's first frame is out the
 // feed is unpaced (SOURCE_CHANGE and B-frame reordering need a few access units), but at most all OUTPUT buffers but one
 // are in the driver: during a resolution change the driver keeps what it has, and _rate_reset() needs a free buffer.
@@ -466,6 +578,28 @@ int V4L2Decoder::_queue_input() {
 	while (!input_done && !pending_reconfig && !exit_requested.is_set()) {
 		if (output_count > 1 && output_in_driver + 1 >= output_count) {
 			break;
+		}
+		if (source.is_valid()) {
+			if (!_hold_source_packet()) {
+				break;
+			}
+			// Paced like the file path: access unit k of an epoch is due at the epoch's start + k / fps (decode order runs at
+			// the frame rate), and never later than its own PTS. Not by DTS: Matroska has none (FFmpeg sets it to the PTS,
+			// which jumps around with B-frames).
+			const double due = MIN(epoch_start_pts + (double)media_index / fps, held.pts);
+			if (epochs[epochs.size() - 1].frames > 0 && due > worker_clock + lead_time) {
+				break;
+			}
+			const int index = _free_output_buffer();
+			if (index < 0) {
+				break;
+			}
+			const int r = _queue_source_packet((uint32_t)index);
+			if (r < 0) {
+				return -1;
+			}
+			queued += r;
+			continue;
 		}
 		const Epoch &epoch = epochs[epochs.size() - 1];
 		if (epoch.frames > 0 && (double)media_index / fps > worker_clock + lead_time) {
@@ -537,7 +671,7 @@ void V4L2Decoder::_rate_reset() {
 		return;
 	}
 	AnnexBSplitter::AccessUnit au;
-	if (!splitter.next(au)) {
+	if (source.is_valid() ? !_hold_source_packet() : !splitter.next(au)) {
 		_log(vformat("rate reset: no access unit left to queue (estimate %.1f fps).", before));
 		return;
 	}
@@ -545,7 +679,7 @@ void V4L2Decoder::_rate_reset() {
 	while (!exit_requested.is_set() && (now = _now()) < target) {
 		OS::get_singleton()->delay_usec((uint64_t)(MIN(target - now, 0.05) * 1e6) + 1);
 	}
-	if (_queue_access_unit((uint32_t)index, au) == 1) {
+	if ((source.is_valid() ? _queue_source_packet((uint32_t)index) : _queue_access_unit((uint32_t)index, au)) == 1) {
 		_log_verbose(vformat("rate reset: estimate now %.1f fps.", _queued_rate()));
 	}
 }
@@ -857,7 +991,13 @@ int V4L2Decoder::_dequeue_capture() {
 			frame.buffer = buffer.index;
 			if (epoch) {
 				frame.serial = epoch->serial;
-				frame.time = (double)(epoch->base_index + epoch->frames) / fps;
+				const uint32_t slot = frame_seq % QUEUE_RING;
+				if (source.is_valid() && queue_seq[slot] == frame_seq) {
+					// The driver copies the OUTPUT timestamp to the picture decoded from it, so this is that access unit's PTS.
+					frame.time = queue_pts[slot];
+				} else {
+					frame.time = (double)(epoch->base_index + epoch->frames) / fps;
+				}
 				epoch->frames++;
 			}
 			frames.push_back(frame);
@@ -920,7 +1060,19 @@ void V4L2Decoder::_process_inbox() {
 			_queue_capture(index);
 		}
 	}
-	if (want_serial != serial && !pending_reconfig && !need_setup) {
+	if (source.is_valid()) {
+		// A seek on the source: its access units carry the new serial. If the decoder was drained to the end, the session
+		// has to start again; otherwise it just continues with the keyframe (and its parameter sets) the source delivers.
+		if (source->get_serial() != serial && !pending_reconfig && !need_setup) {
+			if (stop_sent || stop_failed || ended) {
+				if (_restart_session_source("seek after the end") != OK) {
+					_fail("Restarting the session for the seek failed.");
+				}
+			} else {
+				input_done = false;
+			}
+		}
+	} else if (want_serial != serial && !pending_reconfig && !need_setup) {
 		_seek_to_start(want_serial);
 	}
 }
@@ -972,6 +1124,12 @@ Error V4L2Decoder::_restart_after_reconfig() {
 	}
 	const RecentAU resume = *found;
 	wstats.reconfig_restart++;
+	if (source.is_valid()) {
+		// The access units fed since the new SPS are gone from the source's queue: read them again from its keyframe. This
+		// is a seek on the source (audio included), back by the few access units in flight.
+		source->seek(resume.pts);
+		return _restart_session_source("resolution change");
+	}
 	return _restart_session(resume.au, resume.media_index, "resolution change");
 }
 
@@ -981,6 +1139,12 @@ void V4L2Decoder::_publish_stats() {
 	wstats.capture_count = capture_count;
 	wstats.queued_rate = _queued_rate();
 	wstats.media_index = media_index;
+	wstats.input_time = input_time;
+	{
+		struct timespec ts;
+		clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+		wstats.thread_cpu_seconds = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+	}
 	MutexLock lock(mutex);
 	stats = wstats;
 }
@@ -1128,10 +1292,8 @@ Error V4L2Decoder::open(const String &p_path, const String &p_codec, double p_fp
 	ERR_FAIL_COND_V_MSG(is_open(), ERR_ALREADY_IN_USE, "V4L2Decoder: already open. Call close() first.");
 	ERR_FAIL_COND_V_MSG(!_parse_codec(p_codec, codec), ERR_INVALID_PARAMETER, vformat("V4L2Decoder: unknown codec '%s' (use h264 or hevc).", p_codec));
 	ERR_FAIL_COND_V_MSG(p_fps <= 0.0 || p_fps > 1000.0, ERR_INVALID_PARAMETER, "V4L2Decoder: fps must be in (0, 1000].");
-	codec_fourcc = codec == AnnexBSplitter::CODEC_H264 ? V4L2_PIX_FMT_H264 : V4L2_PIX_FMT_HEVC;
 	fps = p_fps;
-	const CharString capture_name = capture_format.utf8();
-	capture_fourcc = capture_name.length() == 4 ? v4l2_fourcc(capture_name[0], capture_name[1], capture_name[2], capture_name[3]) : 0;
+	source.unref();
 
 	{
 		MutexLock lock(mutex);
@@ -1163,6 +1325,59 @@ Error V4L2Decoder::open(const String &p_path, const String &p_codec, double p_fp
 	_log(vformat("%s: %d bytes, %s %dx%d (display %dx%d), %d-bit, %.3f fps.", p_path, file_size, codec == AnnexBSplitter::CODEC_H264 ? "H.264" : "HEVC", stream_sps.width, stream_sps.height,
 			stream_sps.display_width, stream_sps.display_height, stream_sps.bit_depth, fps));
 
+	err = _start_worker();
+	if (err != OK) {
+		_unmap_file();
+	}
+	return err;
+}
+
+Error V4L2Decoder::open_source(const Ref<MediaSource> &p_source) {
+	ERR_FAIL_COND_V_MSG(is_open(), ERR_ALREADY_IN_USE, "V4L2Decoder: already open. Call close() first.");
+	ERR_FAIL_COND_V_MSG(p_source.is_null() || !p_source->is_open(), ERR_INVALID_PARAMETER, "V4L2Decoder: the MediaSource isn't open.");
+	{
+		MutexLock lock(mutex);
+		state = STATE_CLOSED;
+		last_error = String();
+	}
+	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
+	const String path = p_source->get_path();
+	if (!info.valid) {
+		_fail(vformat("%s has no video stream.", path));
+		return ERR_INVALID_DATA;
+	}
+	if (info.codec != MediaSource::VIDEO_CODEC_H264 && info.codec != MediaSource::VIDEO_CODEC_HEVC) {
+		_fail(vformat("%s: %s video has no hardware decode path here (H.264 and HEVC only: VP9 crashes the decoder firmware, AV1 isn't exposed).", path, info.codec_name));
+		return ERR_UNAVAILABLE;
+	}
+	if (!info.sps.valid) {
+		_fail(vformat("%s: no SPS found for the %s stream, so the coded size is unknown.", path, info.codec_name));
+		return ERR_FILE_UNRECOGNIZED;
+	}
+	codec = info.codec == MediaSource::VIDEO_CODEC_H264 ? AnnexBSplitter::CODEC_H264 : AnnexBSplitter::CODEC_HEVC;
+	fps = info.fps >= 1.0 && info.fps <= 240.0 ? info.fps : 30.0;
+	stream_sps = info.sps;
+	file_path = path;
+	source = p_source;
+	if (loop) {
+		_log("loop is ignored with a MediaSource; seek to 0 at the end instead.");
+	}
+	_log(vformat("%s: %s %dx%d (display %dx%d), %d-bit, %.3f fps, from a MediaSource (frame times from PTS).", path, codec == AnnexBSplitter::CODEC_H264 ? "H.264" : "HEVC", stream_sps.width, stream_sps.height,
+			stream_sps.display_width, stream_sps.display_height, stream_sps.bit_depth, fps));
+	const Error err = _start_worker();
+	if (err != OK) {
+		source->set_video_wake_fd(-1);
+		source.unref();
+	}
+	return err;
+}
+
+// Resets the worker state, opens the device (so a missing decoder fails here, synchronously) and starts the worker.
+Error V4L2Decoder::_start_worker() {
+	codec_fourcc = codec == AnnexBSplitter::CODEC_H264 ? V4L2_PIX_FMT_H264 : V4L2_PIX_FMT_HEVC;
+	const CharString capture_name = capture_format.utf8();
+	capture_fourcc = capture_name.length() == 4 ? v4l2_fourcc(capture_name[0], capture_name[1], capture_name[2], capture_name[3]) : 0;
+
 	// Reset the worker state.
 	wstats = Stats();
 	stats = Stats();
@@ -1170,8 +1385,8 @@ Error V4L2Decoder::open(const String &p_path, const String &p_codec, double p_fp
 	output_count = output_in_driver = 0;
 	capture_count = capture_in_driver = capture_setups = 0;
 	generation = 0;
-	serial = 0;
-	requested_serial = 0;
+	serial = source.is_valid() ? source->get_serial() : 0;
+	requested_serial = serial;
 	clock = 0.0;
 	worker_clock = 0.0;
 	output_streaming = capture_streaming = capture_configured = false;
@@ -1181,22 +1396,26 @@ Error V4L2Decoder::open(const String &p_path, const String &p_codec, double p_fp
 	recent_count = 0;
 	ioctl_error_count = 0;
 	epochs.clear();
-	_begin_epoch(0, 0);
+	_begin_epoch(serial, 0);
+	have_held = false;
+	input_time = 0.0;
+	last_sps_size = Size2i(stream_sps.width, stream_sps.height);
 	frames_ready.clear();
 	buffers_returned.clear();
 	layout_valid = false;
 
-	err = _open_device();
+	Error err = _open_device();
 	if (err != OK) {
-		_unmap_file();
 		return err;
 	}
 	wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 	if (wake_fd < 0) {
 		_close_device("eventfd failed");
-		_unmap_file();
 		_fail(vformat("eventfd failed: %s.", strerror(errno)));
 		return ERR_CANT_CREATE;
+	}
+	if (source.is_valid()) {
+		source->set_video_wake_fd(wake_fd);
 	}
 	_set_state(STATE_STARTING);
 	exit_requested.clear();
@@ -1212,6 +1431,14 @@ void V4L2Decoder::close() {
 		thread.wait_to_finish();
 	}
 	_close_device("close");
+	if (source.is_valid()) {
+		source->set_video_wake_fd(-1); // Before the eventfd is closed: the source writes to it under its lock.
+		if (have_held) {
+			source->release_video_packet(held);
+			have_held = false;
+		}
+		source.unref();
+	}
 	if (wake_fd >= 0) {
 		::close(wake_fd);
 		wake_fd = -1;
@@ -1242,6 +1469,9 @@ double V4L2Decoder::get_clock() const {
 }
 
 int V4L2Decoder::seek_to_start() {
+	if (source.is_valid()) {
+		return source->seek(0.0);
+	}
 	int new_serial;
 	{
 		MutexLock lock(mutex);
@@ -1334,7 +1564,8 @@ Dictionary V4L2Decoder::get_stats() const {
 	d["queued_rate"] = stats.queued_rate;
 	d["latency_avg_ms"] = stats.latency_count ? stats.latency_sum / (double)stats.latency_count * 1e3 : 0.0;
 	d["latency_max_ms"] = stats.latency_max * 1e3;
-	d["input_position"] = (double)stats.media_index / fps;
+	d["thread_cpu_seconds"] = stats.thread_cpu_seconds;
+	d["input_position"] = source.is_valid() ? stats.input_time : (double)stats.media_index / fps;
 	d["last_error"] = last_error;
 	return d;
 }
@@ -1342,6 +1573,7 @@ Dictionary V4L2Decoder::get_stats() const {
 Dictionary V4L2Decoder::get_stream_info() const {
 	Dictionary d;
 	d["path"] = file_path;
+	d["media_source"] = source.is_valid();
 	d["codec"] = codec == AnnexBSplitter::CODEC_H264 ? "h264" : "hevc";
 	d["fps"] = fps;
 	d["width"] = stream_sps.width;
@@ -1352,7 +1584,7 @@ Dictionary V4L2Decoder::get_stream_info() const {
 	return d;
 }
 
-Dictionary V4L2Decoder::probe_file(const String &p_path, const String &p_codec) {
+Dictionary V4L2Decoder::probe_file(const String &p_path, const String &p_codec, int p_max_access_units, int p_list_count) {
 	Dictionary d;
 	AnnexBSplitter::Codec probe_codec;
 	ERR_FAIL_COND_V_MSG(!_parse_codec(p_codec, probe_codec), d, vformat("V4L2Decoder: unknown codec '%s' (use h264 or hevc).", p_codec));
@@ -1372,8 +1604,8 @@ Dictionary V4L2Decoder::probe_file(const String &p_path, const String &p_codec) 
 	uint32_t last_height = 0;
 	Array first;
 	Array size_changes;
-	while (splitter.next(au)) {
-		if (count < 6) {
+	while ((p_max_access_units <= 0 || count < (uint64_t)p_max_access_units) && splitter.next(au)) {
+		if (count < (uint64_t)MAX(p_list_count, 0)) {
 			first.push_back(Vector2i((int)au.offset, (int)au.size));
 		}
 		if (au.sps_width && (au.sps_width != last_width || au.sps_height != last_height)) {
@@ -1461,9 +1693,11 @@ V4L2Decoder::~V4L2Decoder() {
 }
 
 void V4L2Decoder::_bind_methods() {
-	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("probe_file", "path", "codec"), &V4L2Decoder::probe_file);
+	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("probe_file", "path", "codec", "max_access_units", "list_count"), &V4L2Decoder::probe_file, DEFVAL(0), DEFVAL(6));
 
 	ClassDB::bind_method(D_METHOD("open", "path", "codec", "fps"), &V4L2Decoder::open);
+	ClassDB::bind_method(D_METHOD("open_source", "source"), &V4L2Decoder::open_source);
+	ClassDB::bind_method(D_METHOD("get_media_source"), &V4L2Decoder::get_media_source);
 	ClassDB::bind_method(D_METHOD("close"), &V4L2Decoder::close);
 	ClassDB::bind_method(D_METHOD("is_open"), &V4L2Decoder::is_open);
 	ClassDB::bind_method(D_METHOD("set_clock", "seconds"), &V4L2Decoder::set_clock);

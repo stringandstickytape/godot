@@ -1,0 +1,1580 @@
+/**************************************************************************/
+/*  media_source.cpp                                                      */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
+#include "media_source.h"
+
+#include "audio_stream_media.h"
+
+#include "core/config/project_settings.h"
+#include "core/object/class_db.h"
+#include "core/os/os.h"
+#include "servers/audio/audio_server.h"
+
+#include <unistd.h>
+#include <cmath>
+#include <cstring>
+#include <ctime>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
+#include <libswresample/swresample.h>
+}
+
+static constexpr double SQRT_HALF = 0.70710678118654752440;
+
+static double thread_cpu_seconds() {
+	struct timespec ts;
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* Helpers */
+
+String MediaSource::_av_error(int p_error) {
+	char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
+	av_strerror(p_error, buffer, sizeof(buffer));
+	return String::utf8(buffer);
+}
+
+// Walks the NAL units of an Annex-B access unit up to its first picture (VCL) NAL unit, so only the few bytes in front of
+// the slice data are looked at. Returns true if there is an SPS; r_sps gets the first one. r_parameter_sets, if given,
+// gets the VPS/SPS/PPS NAL units found, each behind a 4-byte start code.
+bool MediaSource::_scan_access_unit(const uint8_t *p_data, uint64_t p_size, bool p_hevc, AnnexBSplitter::SPSInfo &r_sps, LocalVector<uint8_t> *r_parameter_sets) {
+	if (r_parameter_sets) {
+		r_parameter_sets->clear();
+	}
+	const auto find_start_code = [p_data, p_size](uint64_t p_from) -> uint64_t {
+		for (uint64_t k = p_from; k + 2 < p_size; k++) {
+			if (p_data[k + 2] > 1) {
+				k += 2; // Can't be part of a start code that begins at k, k + 1 or k + 2.
+			} else if (p_data[k] == 0 && p_data[k + 1] == 0 && p_data[k + 2] == 1) {
+				return k;
+			}
+		}
+		return p_size;
+	};
+	bool has_sps = false;
+	uint64_t start_code = find_start_code(0);
+	while (start_code < p_size) {
+		const uint64_t nal = start_code + 3;
+		if (nal >= p_size) {
+			break;
+		}
+		const uint8_t header = p_data[nal];
+		bool vcl;
+		bool parameter_set;
+		bool sps;
+		if (p_hevc) {
+			const uint32_t type = (header >> 1) & 0x3f;
+			vcl = type < 32;
+			parameter_set = type >= 32 && type <= 34;
+			sps = type == 33;
+		} else {
+			const uint32_t type = header & 0x1f;
+			vcl = type >= 1 && type <= 5;
+			parameter_set = type == 7 || type == 8;
+			sps = type == 7;
+		}
+		if (vcl) {
+			break;
+		}
+		const uint64_t next = find_start_code(nal);
+		uint64_t end = next;
+		while (end > nal && p_data[end - 1] == 0) {
+			end--; // Trailing zeros, and the zero_byte of a 4-byte start code.
+		}
+		if (end > nal) {
+			if (sps && !has_sps) {
+				has_sps = true;
+				if (p_hevc) {
+					AnnexBSplitter::parse_hevc_sps(p_data + nal, end - nal, r_sps);
+				} else {
+					AnnexBSplitter::parse_h264_sps(p_data + nal, end - nal, r_sps);
+				}
+			}
+			if (parameter_set && r_parameter_sets) {
+				static const uint8_t four_byte_start_code[4] = { 0, 0, 0, 1 };
+				for (uint8_t b : four_byte_start_code) {
+					r_parameter_sets->push_back(b);
+				}
+				for (uint64_t k = nal; k < end; k++) {
+					r_parameter_sets->push_back(p_data[k]);
+				}
+			}
+		}
+		start_code = next;
+	}
+	return has_sps;
+}
+
+// The codec configuration of MP4/Matroska (avcC or hvcC) holds the parameter sets with 16-bit lengths; Annex-B
+// configurations (some Matroska and TS muxers) are copied as they are.
+void MediaSource::_config_to_annexb(const uint8_t *p_data, int p_size, bool p_hevc, LocalVector<uint8_t> &r_out) {
+	r_out.clear();
+	if (p_data == nullptr || p_size < 4) {
+		return;
+	}
+	if ((p_data[0] == 0 && p_data[1] == 0 && p_data[2] == 1) || (p_data[0] == 0 && p_data[1] == 0 && p_data[2] == 0 && p_data[3] == 1)) {
+		for (int i = 0; i < p_size; i++) {
+			r_out.push_back(p_data[i]);
+		}
+		return;
+	}
+	if (p_data[0] != 1) {
+		return;
+	}
+	int pos = 0;
+	const auto append_nal = [&](int p_length) -> bool {
+		if (p_length <= 0 || pos + p_length > p_size) {
+			return false;
+		}
+		r_out.push_back(0);
+		r_out.push_back(0);
+		r_out.push_back(0);
+		r_out.push_back(1);
+		for (int i = 0; i < p_length; i++) {
+			r_out.push_back(p_data[pos + i]);
+		}
+		pos += p_length;
+		return true;
+	};
+	const auto read16 = [&](int &r_value) -> bool {
+		if (pos + 2 > p_size) {
+			return false;
+		}
+		r_value = (p_data[pos] << 8) | p_data[pos + 1];
+		pos += 2;
+		return true;
+	};
+	if (p_hevc) {
+		// HEVCDecoderConfigurationRecord: 22 bytes, numOfArrays, then (type, numNalus, (length, NAL unit)*)*.
+		if (p_size < 23) {
+			return;
+		}
+		pos = 22;
+		const int arrays = p_data[pos++];
+		for (int a = 0; a < arrays && pos < p_size; a++) {
+			pos++; // array_completeness, NAL unit type.
+			int count = 0;
+			if (!read16(count)) {
+				return;
+			}
+			for (int i = 0; i < count; i++) {
+				int length = 0;
+				if (!read16(length) || !append_nal(length)) {
+					return;
+				}
+			}
+		}
+	} else {
+		// AVCDecoderConfigurationRecord: 5 bytes, numOfSequenceParameterSets & 0x1f, SPSs, numOfPictureParameterSets, PPSs.
+		if (p_size < 7) {
+			return;
+		}
+		pos = 5;
+		for (int list = 0; list < 2 && pos < p_size; list++) {
+			const int count = list == 0 ? (p_data[pos++] & 0x1f) : p_data[pos++];
+			for (int i = 0; i < count; i++) {
+				int length = 0;
+				if (!read16(length) || !append_nal(length)) {
+					return;
+				}
+			}
+		}
+	}
+}
+
+void MediaSource::_set_error(const String &p_message) {
+	{
+		MutexLock lock(mutex);
+		state = STATE_ERROR;
+		last_error = p_message;
+	}
+	ERR_PRINT("MediaSource: " + p_message);
+}
+
+double MediaSource::_media_time(int64_t p_ts, int p_stream) const {
+	return (double)p_ts * av_q2d(format->streams[p_stream]->time_base) - start_time;
+}
+
+/* Packet pool: AVPacket structs are reused; FFmpeg allocates the packet data. */
+
+AVPacket *MediaSource::_packet_get() {
+	{
+		MutexLock lock(mutex);
+		if (!packet_pool.is_empty()) {
+			AVPacket *packet = packet_pool[packet_pool.size() - 1];
+			packet_pool.resize(packet_pool.size() - 1);
+			return packet;
+		}
+	}
+	return av_packet_alloc();
+}
+
+void MediaSource::_packet_put(AVPacket *p_packet) {
+	if (p_packet == nullptr) {
+		return;
+	}
+	av_packet_unref(p_packet);
+	MutexLock lock(mutex);
+	packet_pool.push_back(p_packet);
+}
+
+void MediaSource::_flush_video_queue_locked() {
+	for (uint32_t i = 0; i < video_count; i++) {
+		VideoPacket &entry = video_queue[(video_head + i) % VIDEO_QUEUE_MAX];
+		if (entry.packet) {
+			av_packet_unref(entry.packet);
+			packet_pool.push_back(entry.packet);
+		}
+		entry = VideoPacket();
+	}
+	video_head = 0;
+	video_count = 0;
+	video_queued_bytes = 0;
+}
+
+void MediaSource::_wake_consumer_locked() {
+	if (wake_fd >= 0) {
+		const uint64_t one = 1;
+		const ssize_t written = write(wake_fd, &one, sizeof(one));
+		(void)written;
+	}
+}
+
+uint32_t MediaSource::_video_queue_target() const {
+	return MAX(VIDEO_QUEUE_MIN, (uint32_t)(video_queue_seconds * (video.fps > 0.0 ? video.fps : 30.0)));
+}
+
+// Demux thread, mutex held. Read on while the video queue or the decoded audio is short of its target (ffplay's rule: a
+// stream that has enough doesn't stop the others), unless the video queue is at its hard limit.
+bool MediaSource::_needs_input_locked() const {
+	if (video_count + 4 >= VIDEO_QUEUE_MAX || video_queued_bytes >= VIDEO_QUEUE_MAX_BYTES || audio_fifo_count + 1 >= AUDIO_FIFO_MAX || audio_fifo_bytes >= AUDIO_FIFO_MAX_BYTES) {
+		return false;
+	}
+	const bool video_enough = video.stream_index < 0 || video_count >= video_queue_target;
+	bool audio_enough = true;
+	if (current_audio_stream >= 0 && audio_fifo_count == 0 && scratch_frames == 0) {
+		MutexLock audio_lock(audio_mutex);
+		audio_enough = audio_eof || (double)(ring_write - ring_read) >= audio_queue_seconds * output_rate;
+	}
+	return !(video_enough && audio_enough);
+}
+
+/* Audio */
+
+void MediaSource::_apply_discard() {
+	for (unsigned i = 0; i < format->nb_streams; i++) {
+		const bool used = (int)i == video.stream_index || (int)i == current_audio_stream;
+		format->streams[i]->discard = used ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+	}
+}
+
+void MediaSource::_audio_fifo_push(AVPacket *p_packet) {
+	if (audio_fifo.size() < AUDIO_FIFO_MAX) {
+		audio_fifo.resize(AUDIO_FIFO_MAX);
+	}
+	audio_fifo[(audio_fifo_head + audio_fifo_count) % AUDIO_FIFO_MAX] = p_packet;
+	audio_fifo_count++;
+	audio_fifo_bytes += (uint64_t)p_packet->size;
+}
+
+AVPacket *MediaSource::_audio_fifo_pop() {
+	if (audio_fifo_count == 0) {
+		return nullptr;
+	}
+	AVPacket *packet = audio_fifo[audio_fifo_head];
+	audio_fifo[audio_fifo_head] = nullptr;
+	audio_fifo_head = (audio_fifo_head + 1) % AUDIO_FIFO_MAX;
+	audio_fifo_count--;
+	audio_fifo_bytes -= (uint64_t)packet->size;
+	return packet;
+}
+
+void MediaSource::_audio_fifo_clear() {
+	while (audio_fifo_count > 0) {
+		_packet_put(_audio_fifo_pop());
+	}
+	audio_fifo_head = 0;
+	audio_fifo_bytes = 0;
+}
+
+void MediaSource::_close_audio_codec() {
+	_audio_fifo_clear();
+	avcodec_free_context(&audio_codec);
+	swr_free(&swr);
+	swr_in_format = -1;
+	swr_in_rate = 0;
+	swr_in_channels = 0;
+	swr_in_mask = 0;
+	scratch_frames = 0;
+	scratch_offset = 0;
+}
+
+void MediaSource::_open_audio_track(int p_track) {
+	_close_audio_codec();
+	current_audio_track = p_track;
+	current_audio_stream = -1;
+	if (p_track >= 0 && p_track < (int)audio_tracks.size()) {
+		const int index = audio_tracks[p_track].stream_index;
+		const AVStream *stream = format->streams[index];
+		const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
+		String problem;
+		if (codec == nullptr) {
+			problem = vformat("no decoder for %s in this FFmpeg build", avcodec_get_name(stream->codecpar->codec_id));
+		} else {
+			audio_codec = avcodec_alloc_context3(codec);
+			int r = audio_codec ? avcodec_parameters_to_context(audio_codec, stream->codecpar) : AVERROR(ENOMEM);
+			if (r >= 0) {
+				audio_codec->pkt_timebase = stream->time_base;
+				audio_codec->thread_count = 1;
+				r = avcodec_open2(audio_codec, codec, nullptr);
+			}
+			if (r < 0) {
+				problem = vformat("opening the %s decoder failed: %s", codec->name, _av_error(r));
+				avcodec_free_context(&audio_codec);
+			}
+		}
+		if (problem.is_empty()) {
+			current_audio_stream = index;
+		} else {
+			// Not fatal: the video plays on, without audio (AudioStreamMedia finishes at once).
+			MutexLock lock(mutex);
+			last_error = vformat("Audio track %d: %s.", p_track, problem);
+			ERR_PRINT("MediaSource: " + last_error);
+		}
+	}
+	_apply_discard();
+	if (current_audio_stream < 0) {
+		MutexLock audio_lock(audio_mutex);
+		audio_eof = true;
+	}
+}
+
+bool MediaSource::_configure_swr(const AVFrame *p_frame) {
+	const int channels = p_frame->ch_layout.nb_channels;
+	const uint64_t mask = p_frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? p_frame->ch_layout.u.mask : 0;
+	if (swr && swr_in_format == p_frame->format && swr_in_rate == p_frame->sample_rate && swr_in_channels == channels && swr_in_mask == mask) {
+		return true;
+	}
+	swr_free(&swr);
+	if (channels <= 0 || p_frame->sample_rate <= 0) {
+		return false;
+	}
+	AVChannelLayout in_layout = {};
+	if (p_frame->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
+		av_channel_layout_default(&in_layout, channels);
+	} else {
+		av_channel_layout_copy(&in_layout, &p_frame->ch_layout);
+	}
+	AVChannelLayout out_layout = {};
+	av_channel_layout_default(&out_layout, 2);
+	int r = swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, output_rate, &in_layout, (AVSampleFormat)p_frame->format, p_frame->sample_rate, 0, nullptr);
+	if (r >= 0) {
+		// Downmix to stereo (ITU-R BS.775): centre and surrounds at -3 dB, LFE dropped. Not normalised by default (like
+		// mpv), so dialogue keeps its level; downmix_normalize scales the matrix so no sum can exceed full scale.
+		av_opt_set_double(swr, "center_mix_level", SQRT_HALF, 0);
+		av_opt_set_double(swr, "surround_mix_level", SQRT_HALF, 0);
+		av_opt_set_double(swr, "lfe_mix_level", 0.0, 0);
+		if (downmix_normalize) {
+			av_opt_set_double(swr, "rematrix_maxval", 1.0, 0);
+		}
+		r = swr_init(swr);
+	}
+	char in_name[128] = {};
+	av_channel_layout_describe(&in_layout, in_name, sizeof(in_name));
+	av_channel_layout_uninit(&in_layout);
+	av_channel_layout_uninit(&out_layout);
+	if (r < 0) {
+		swr_free(&swr);
+		MutexLock lock(mutex);
+		last_error = vformat("Can't resample %s %d Hz audio: %s.", in_name, p_frame->sample_rate, _av_error(r));
+		ERR_PRINT("MediaSource: " + last_error);
+		return false;
+	}
+	swr_in_format = p_frame->format;
+	swr_in_rate = p_frame->sample_rate;
+	swr_in_channels = channels;
+	swr_in_mask = mask;
+	const String description = vformat("MediaSource: audio %s, %s, %d Hz -> stereo float, %d Hz%s.", av_get_sample_fmt_name((AVSampleFormat)p_frame->format), in_name, p_frame->sample_rate, output_rate,
+			downmix_normalize ? " (normalised downmix)" : "");
+	if (description != swr_description) {
+		swr_description = description;
+		print_line(description);
+	}
+	return true;
+}
+
+// p_frame null: flush what the resampler still holds (end of the file).
+void MediaSource::_resample_frame(const AVFrame *p_frame) {
+	if (p_frame && !_configure_swr(p_frame)) {
+		return;
+	}
+	if (swr == nullptr) {
+		return;
+	}
+	const int in_samples = p_frame ? p_frame->nb_samples : 0;
+	const int max_out = swr_get_out_samples(swr, in_samples);
+	if (max_out <= 0) {
+		return;
+	}
+	double time = audio_next_time;
+	if (p_frame) {
+		const int64_t ts = p_frame->best_effort_timestamp != AV_NOPTS_VALUE ? p_frame->best_effort_timestamp : p_frame->pts;
+		if (ts != AV_NOPTS_VALUE) {
+			// The resampler's buffered input comes out first.
+			time = _media_time(ts, current_audio_stream) - (double)swr_get_delay(swr, output_rate) / output_rate;
+		}
+	}
+	if (time < -1e8) {
+		time = 0.0;
+	}
+	if (scratch_frames == 0) {
+		scratch_offset = 0;
+	}
+	const uint64_t needed = (uint64_t)(scratch_offset + scratch_frames + (uint32_t)max_out) * 2;
+	if (scratch.size() < needed) {
+		scratch.resize(needed); // Grows to the largest packet once; no allocation in steady state.
+	}
+	uint8_t *out = (uint8_t *)(scratch.ptr() + (uint64_t)(scratch_offset + scratch_frames) * 2);
+	const int converted = swr_convert(swr, &out, max_out, p_frame ? (const uint8_t **)p_frame->extended_data : nullptr, in_samples);
+	if (converted <= 0) {
+		return;
+	}
+	if (scratch_frames == 0) {
+		scratch_time = time;
+		scratch_serial = demux_serial;
+	}
+	scratch_frames += (uint32_t)converted;
+	audio_next_time = time + (double)converted / output_rate;
+	dstats.audio_frames_out += (uint64_t)converted;
+}
+
+// p_packet null: drain the decoder (end of the file).
+void MediaSource::_decode_audio(const AVPacket *p_packet) {
+	if (audio_codec == nullptr) {
+		return;
+	}
+	int r = avcodec_send_packet(audio_codec, p_packet);
+	if (r < 0 && r != AVERROR_EOF) {
+		dstats.audio_decode_errors++;
+		return;
+	}
+	while ((r = avcodec_receive_frame(audio_codec, audio_frame)) >= 0) {
+		_resample_frame(audio_frame);
+		av_frame_unref(audio_frame);
+	}
+	if (r != AVERROR(EAGAIN) && r != AVERROR_EOF) {
+		dstats.audio_decode_errors++;
+	}
+	if (p_packet == nullptr) {
+		_resample_frame(nullptr);
+	}
+	_flush_scratch();
+}
+
+// audio_mutex held. p_samples null writes silence.
+void MediaSource::_write_ring_locked(const float *p_samples, uint32_t p_frames, double p_time) {
+	if (p_frames == 0) {
+		return;
+	}
+	// A marker wherever the time doesn't continue from what is in the ring (start, seek, gap in the stream).
+	bool continuous = false;
+	if (marker_count > 0) {
+		const AudioMarker &last = markers[marker_count - 1];
+		const double expected = last.time + (double)(ring_write - last.frame) / output_rate;
+		continuous = Math::abs(p_time - expected) < 0.002;
+	}
+	if (!continuous) {
+		if (marker_count == AUDIO_MARKERS_MAX) {
+			for (uint32_t i = 1; i < marker_count; i++) {
+				markers[i - 1] = markers[i];
+			}
+			marker_count--;
+		}
+		markers[marker_count].frame = ring_write;
+		markers[marker_count].time = p_time;
+		marker_count++;
+	}
+	uint32_t done = 0;
+	while (done < p_frames) {
+		const uint64_t at = (ring_write + done) % ring_capacity;
+		const uint32_t run = (uint32_t)MIN((uint64_t)(p_frames - done), ring_capacity - at);
+		if (p_samples) {
+			memcpy((void *)&ring[at], p_samples + (uint64_t)done * 2, (size_t)run * sizeof(AudioFrame));
+		} else {
+			memset((void *)&ring[at], 0, (size_t)run * sizeof(AudioFrame));
+		}
+		done += run;
+	}
+	ring_write += p_frames;
+}
+
+// Moves decoded audio into the ring, as much as fits. After a seek, audio before the target is dropped and a gap up to
+// the first decoded sample (< 1 s) is filled with silence, so the audio clock starts exactly at the target.
+void MediaSource::_flush_scratch() {
+	if (scratch_frames == 0) {
+		return;
+	}
+	const double rate = output_rate;
+	uint32_t silence = 0;
+	double silence_time = 0.0;
+	if (audio_trim_until >= 0.0) {
+		const double end = scratch_time + scratch_frames / rate;
+		if (end <= audio_trim_until) {
+			dstats.audio_dropped_frames += scratch_frames;
+			scratch_frames = 0;
+			if (eof_drained) {
+				MutexLock audio_lock(audio_mutex);
+				if (audio_serial == scratch_serial) {
+					audio_eof = true; // A seek to the very end: nothing left to play.
+				}
+			}
+			return;
+		}
+		if (scratch_time < audio_trim_until) {
+			const uint32_t skip = (uint32_t)MIN((double)scratch_frames, Math::round((audio_trim_until - scratch_time) * rate));
+			scratch_offset += skip;
+			scratch_frames -= skip;
+			scratch_time += skip / rate;
+			dstats.audio_dropped_frames += skip;
+		} else if (scratch_time - audio_trim_until < 1.0) {
+			silence = (uint32_t)Math::round((scratch_time - audio_trim_until) * rate);
+			silence_time = audio_trim_until;
+		}
+		audio_trim_until = -1.0;
+	}
+	MutexLock audio_lock(audio_mutex);
+	if (audio_serial != scratch_serial) {
+		scratch_frames = 0; // Decoded before a seek.
+		return;
+	}
+	if (silence > 0 && ring_capacity - (ring_write - ring_read) >= silence) {
+		_write_ring_locked(nullptr, silence, silence_time);
+		dstats.audio_silence_frames += silence;
+	}
+	const uint32_t room = (uint32_t)MIN((uint64_t)scratch_frames, ring_capacity - (ring_write - ring_read));
+	if (room > 0) {
+		_write_ring_locked(scratch.ptr() + (uint64_t)scratch_offset * 2, room, scratch_time);
+		scratch_offset += room;
+		scratch_frames -= room;
+		scratch_time += room / rate;
+	}
+	if (scratch_frames == 0 && eof_drained) {
+		audio_eof = true;
+	}
+}
+
+void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
+	if (p_frames <= 0) {
+		return;
+	}
+	uint32_t got = 0;
+	bool wake = false;
+	{
+		MutexLock audio_lock(audio_mutex);
+		if (ring_capacity > 0) {
+			got = (uint32_t)MIN((uint64_t)p_frames, ring_write - ring_read);
+			uint32_t done = 0;
+			while (done < got) {
+				const uint64_t at = (ring_read + done) % ring_capacity;
+				const uint32_t run = (uint32_t)MIN((uint64_t)(got - done), ring_capacity - at);
+				memcpy((void *)(p_buffer + done), (const void *)&ring[at], (size_t)run * sizeof(AudioFrame));
+				done += run;
+			}
+			ring_read += got;
+			audio_frames_mixed += got;
+			while (marker_count > 1 && markers[1].frame <= ring_read) {
+				for (uint32_t i = 1; i < marker_count; i++) {
+					markers[i - 1] = markers[i];
+				}
+				marker_count--;
+			}
+			if (marker_count > 0 && ring_read >= markers[0].frame) {
+				audio_position = markers[0].time + (double)(ring_read - markers[0].frame) / output_rate;
+			}
+		}
+		if (got < (uint32_t)p_frames && !audio_eof) {
+			if (!audio_in_underrun) {
+				audio_underruns++;
+				audio_in_underrun = true;
+			}
+		} else {
+			audio_in_underrun = false;
+		}
+		const uint64_t fill = ring_write - ring_read;
+		const uint32_t wanted = audio_space_wanted.get();
+		wake = (wanted > 0 && ring_capacity - fill >= wanted) || (double)fill < audio_queue_seconds * 0.75 * output_rate;
+	}
+	if (got < (uint32_t)p_frames) {
+		memset((void *)(p_buffer + got), 0, (size_t)(p_frames - got) * sizeof(AudioFrame));
+	}
+	if (wake && demux_idle.is_set()) {
+		MutexLock lock(mutex);
+		condition.notify_one();
+	}
+}
+
+double MediaSource::get_audio_position() const {
+	MutexLock audio_lock(audio_mutex);
+	return audio_position;
+}
+
+bool MediaSource::is_audio_finished() const {
+	MutexLock audio_lock(audio_mutex);
+	return audio_eof && ring_write == ring_read;
+}
+
+/* Video */
+
+void MediaSource::_deliver_video(AVPacket *p_packet) {
+	const int index = video.stream_index;
+	const AVRational time_base = format->streams[index]->time_base;
+	VideoPacket out;
+	out.pts = p_packet->pts != AV_NOPTS_VALUE ? _media_time(p_packet->pts, index) : (p_packet->dts != AV_NOPTS_VALUE ? _media_time(p_packet->dts, index) : next_video_pts);
+	out.dts = p_packet->dts != AV_NOPTS_VALUE ? _media_time(p_packet->dts, index) : out.pts;
+	const double frame_duration = p_packet->duration > 0 ? p_packet->duration * av_q2d(time_base) : (video.fps > 0.0 ? 1.0 / video.fps : 0.0);
+	next_video_pts = MAX(out.pts, out.dts) + frame_duration;
+	out.keyframe = (p_packet->flags & AV_PKT_FLAG_KEY) != 0;
+
+	if (need_keyframe) {
+		if (!out.keyframe) {
+			dstats.video_skipped++;
+			_packet_put(p_packet);
+			return;
+		}
+		need_keyframe = false;
+	}
+
+	if (_is_annexb_codec() && (out.keyframe || need_parameter_sets)) {
+		const bool hevc = video.codec == VIDEO_CODEC_HEVC;
+		AnnexBSplitter::SPSInfo sps;
+		const bool has_sps = _scan_access_unit(p_packet->data, (uint64_t)p_packet->size, hevc, sps, &scan_parameter_sets);
+		if (has_sps) {
+			out.sps_width = sps.width;
+			out.sps_height = sps.height;
+			inband_parameter_sets = scan_parameter_sets;
+			if (!video.sps.valid && !thread.is_started() && sps.valid) {
+				video.sps = sps;
+				video.bit_depth = (int)sps.bit_depth;
+			}
+		} else if (need_parameter_sets) {
+			// The first access unit after open or a seek must carry the parameter sets: a decoder (re)starts with it. The
+			// mp4toannexb filters add them to IDR pictures, not to other keyframes (recovery points, CRA).
+			const LocalVector<uint8_t> &sets = inband_parameter_sets.is_empty() ? config_parameter_sets : inband_parameter_sets;
+			if (!sets.is_empty()) {
+				AVPacket *with_sets = _packet_get();
+				if (with_sets && av_new_packet(with_sets, (int)sets.size() + p_packet->size) == 0) {
+					memcpy(with_sets->data, sets.ptr(), sets.size());
+					memcpy(with_sets->data + sets.size(), p_packet->data, p_packet->size);
+					av_packet_copy_props(with_sets, p_packet);
+					_packet_put(p_packet);
+					p_packet = with_sets;
+					dstats.video_parameter_sets_added++;
+					if (_scan_access_unit(p_packet->data, (uint64_t)p_packet->size, hevc, sps, nullptr)) {
+						out.sps_width = sps.width;
+						out.sps_height = sps.height;
+					}
+				} else {
+					_packet_put(with_sets);
+				}
+			}
+		}
+	}
+	need_parameter_sets = false;
+
+	out.packet = p_packet;
+	out.data = p_packet->data;
+	out.size = (uint32_t)p_packet->size;
+	out.serial = demux_serial;
+	dstats.video_packets++;
+	dstats.video_bytes += out.size;
+
+	MutexLock lock(mutex);
+	if (out.serial != serial || video_count >= VIDEO_QUEUE_MAX) {
+		// Read before a seek (or, never expected, past the hard limit).
+		av_packet_unref(p_packet);
+		packet_pool.push_back(p_packet);
+		return;
+	}
+	video_queue[(video_head + video_count) % VIDEO_QUEUE_MAX] = out;
+	video_count++;
+	video_queued_bytes += out.size;
+	if (video_count == 1) {
+		_wake_consumer_locked();
+	}
+}
+
+void MediaSource::_receive_from_bsf() {
+	for (;;) {
+		AVPacket *packet = _packet_get();
+		if (packet == nullptr) {
+			return;
+		}
+		if (av_bsf_receive_packet(bsf, packet) < 0) {
+			_packet_put(packet);
+			return;
+		}
+		_deliver_video(packet);
+	}
+}
+
+void MediaSource::_handle_video_packet() {
+	if (bsf) {
+		// The filter takes the reference; the Annex-B output is the one copy of the access unit before the decoder's.
+		if (av_bsf_send_packet(bsf, read_packet) < 0) {
+			av_packet_unref(read_packet);
+			dstats.video_skipped++;
+			return;
+		}
+		_receive_from_bsf();
+	} else {
+		AVPacket *packet = _packet_get();
+		if (packet == nullptr) {
+			return;
+		}
+		av_packet_move_ref(packet, read_packet);
+		_deliver_video(packet);
+	}
+}
+
+/* Demux thread */
+
+bool MediaSource::_read_packet() {
+	const int r = av_read_frame(format, read_packet);
+	if (r < 0) {
+		if (r == AVERROR_EOF || (format->pb && avio_feof(format->pb))) {
+			eof_reached = true;
+		} else if (r == AVERROR(EAGAIN)) {
+			OS::get_singleton()->delay_usec(1000);
+		} else {
+			dstats.read_errors++;
+			if (++read_errors_in_row >= 64) {
+				_set_error(vformat("Reading %s failed: %s.", path, _av_error(r)));
+				eof_reached = true;
+			}
+		}
+		return false;
+	}
+	read_errors_in_row = 0;
+	dstats.packets_read++;
+	dstats.bytes_read += (uint64_t)read_packet->size;
+	if (read_packet->stream_index == video.stream_index) {
+		_handle_video_packet();
+	} else if (read_packet->stream_index == current_audio_stream) {
+		dstats.audio_packets++;
+		if (scratch_frames > 0 || audio_fifo_count > 0) {
+			// The ring is full: keep the packet compressed and read on for the video.
+			AVPacket *queued = _packet_get();
+			if (queued) {
+				av_packet_move_ref(queued, read_packet);
+				_audio_fifo_push(queued);
+			}
+		} else {
+			_decode_audio(read_packet);
+		}
+	}
+	av_packet_unref(read_packet);
+	return true;
+}
+
+void MediaSource::_drain_at_eof() {
+	if (bsf) {
+		av_bsf_send_packet(bsf, nullptr);
+		_receive_from_bsf();
+	}
+	eof_drained = true;
+	_decode_audio(nullptr);
+	if (audio_codec == nullptr || scratch_frames == 0) {
+		MutexLock audio_lock(audio_mutex);
+		if (audio_serial == demux_serial) {
+			audio_eof = true;
+		}
+	}
+	MutexLock lock(mutex);
+	if (serial == demux_serial) {
+		demux_eof = true;
+		if (state == STATE_READING) {
+			state = STATE_ENDED;
+		}
+		_wake_consumer_locked();
+	}
+}
+
+void MediaSource::_do_seek(double p_target) {
+	const int stream = video.stream_index >= 0 ? video.stream_index : current_audio_stream;
+	int r;
+	if (stream >= 0) {
+		// The keyframe at or before the target (max_ts = target).
+		const double seconds_per_tick = av_q2d(format->streams[stream]->time_base);
+		const int64_t ts = (int64_t)Math::round((p_target + start_time) / seconds_per_tick);
+		r = avformat_seek_file(format, stream, INT64_MIN, ts, ts, 0);
+		if (r < 0) {
+			r = av_seek_frame(format, stream, ts, AVSEEK_FLAG_BACKWARD);
+		}
+	} else {
+		const int64_t ts = (int64_t)Math::round((p_target + start_time) * AV_TIME_BASE);
+		r = avformat_seek_file(format, -1, INT64_MIN, ts, ts, 0);
+	}
+	if (r < 0) {
+		MutexLock lock(mutex);
+		last_error = vformat("Seeking to %.3f s failed: %s.", p_target, _av_error(r));
+		ERR_PRINT("MediaSource: " + last_error);
+	}
+	if (bsf) {
+		av_bsf_flush(bsf);
+	}
+	if (audio_codec) {
+		avcodec_flush_buffers(audio_codec);
+	}
+	_audio_fifo_clear();
+	swr_free(&swr); // Its delay line holds audio from before the seek; reconfigured with the next frame.
+	swr_in_format = -1;
+	scratch_frames = 0;
+	scratch_offset = 0;
+	need_keyframe = true;
+	need_parameter_sets = true;
+	eof_reached = false;
+	eof_drained = false;
+	read_errors_in_row = 0;
+	audio_trim_until = p_target;
+	audio_next_time = p_target;
+	next_video_pts = p_target;
+	if (current_audio_stream < 0) {
+		MutexLock audio_lock(audio_mutex);
+		audio_eof = true;
+	}
+}
+
+void MediaSource::_thread_loop() {
+	for (;;) {
+		bool do_seek = false;
+		double target = 0.0;
+		int track;
+		{
+			MutexLock lock(mutex);
+			if (exit_requested) {
+				return;
+			}
+			if (seek_pending) {
+				do_seek = true;
+				seek_pending = false;
+				target = seek_target;
+				demux_serial = serial;
+			}
+			track = audio_track;
+			dstats.thread_cpu_seconds = thread_cpu_seconds();
+			stats = dstats;
+		}
+		if (track != current_audio_track) {
+			_open_audio_track(track);
+		}
+		if (do_seek) {
+			_do_seek(target);
+		}
+
+		bool progress = false;
+		// Audio: decoded audio into the ring; the next queued packet once the last one is in.
+		if (scratch_frames > 0) {
+			const uint32_t before = scratch_frames;
+			_flush_scratch();
+			progress = scratch_frames != before;
+		}
+		if (scratch_frames == 0 && audio_fifo_count > 0) {
+			AVPacket *packet = _audio_fifo_pop();
+			_decode_audio(packet);
+			_packet_put(packet);
+			progress = true;
+		}
+		// Read while a queue is short (audio read while the ring is full waits compressed in audio_fifo).
+		if (!eof_reached) {
+			bool want;
+			{
+				MutexLock lock(mutex);
+				want = !seek_pending && state != STATE_ERROR && _needs_input_locked();
+			}
+			if (want) {
+				_read_packet();
+				progress = true;
+			}
+		} else if (!eof_drained && scratch_frames == 0 && audio_fifo_count == 0) {
+			_drain_at_eof();
+			progress = true;
+		}
+		if (progress) {
+			continue;
+		}
+
+		// Nothing to do: wait for the consumers (video pops, audio mixes), a seek, a track change or close().
+		audio_space_wanted.set(scratch_frames);
+		MutexLock lock(mutex);
+		demux_idle.set();
+		bool work = exit_requested || seek_pending || audio_track != current_audio_track;
+		if (!work && state != STATE_ERROR) {
+			if (scratch_frames > 0) {
+				MutexLock audio_lock(audio_mutex);
+				work = audio_serial != scratch_serial || ring_capacity - (ring_write - ring_read) >= scratch_frames;
+			} else {
+				work = audio_fifo_count > 0;
+			}
+			if (!work) {
+				work = eof_reached ? (!eof_drained && scratch_frames == 0 && audio_fifo_count == 0) : _needs_input_locked();
+			}
+		}
+		if (!work) {
+			dstats.thread_cpu_seconds = thread_cpu_seconds();
+			stats = dstats;
+			condition.wait(lock);
+		}
+		demux_idle.clear();
+		audio_space_wanted.set(0);
+	}
+}
+
+void MediaSource::_thread_func(void *p_userdata) {
+	static_cast<MediaSource *>(p_userdata)->_thread_loop();
+}
+
+/* Public API */
+
+Error MediaSource::open(const String &p_path) {
+	close();
+	{
+		MutexLock lock(mutex);
+		state = STATE_CLOSED;
+		last_error = String();
+		serial = 0;
+		seek_pending = false;
+		seek_target = 0.0;
+		exit_requested = false;
+		demux_eof = false;
+		last_video_pts = -1.0;
+		stats = Stats();
+		seek_count = 0;
+		video_head = video_count = 0;
+		video_queued_bytes = 0;
+	}
+	dstats = Stats();
+	path = p_path;
+	const String global_path = ProjectSettings::get_singleton() ? ProjectSettings::get_singleton()->globalize_path(p_path) : p_path;
+
+	AVFormatContext *context = nullptr;
+	int r = avformat_open_input(&context, global_path.utf8().get_data(), nullptr, nullptr);
+	if (r < 0) {
+		_set_error(vformat("Can't open %s: %s.", global_path, _av_error(r)));
+		return ERR_FILE_CANT_OPEN;
+	}
+	format = context;
+	r = avformat_find_stream_info(format, nullptr);
+	if (r < 0) {
+		_set_error(vformat("Can't read the streams of %s: %s.", global_path, _av_error(r)));
+		_close_internal();
+		return ERR_FILE_UNRECOGNIZED;
+	}
+	format_name = format->iformat && format->iformat->name ? String::utf8(format->iformat->name) : String();
+	start_time = format->start_time != AV_NOPTS_VALUE ? (double)format->start_time / AV_TIME_BASE : 0.0;
+	duration = format->duration != AV_NOPTS_VALUE ? (double)format->duration / AV_TIME_BASE : 0.0;
+	bit_rate = format->bit_rate;
+
+	const int best_video = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+	const int best_audio = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, best_video >= 0 ? best_video : -1, nullptr, 0);
+	int default_track = -1;
+	for (unsigned i = 0; i < format->nb_streams; i++) {
+		const AVStream *stream = format->streams[i];
+		const AVCodecParameters *par = stream->codecpar;
+		const AVDictionaryEntry *language = av_dict_get(stream->metadata, "language", nullptr, 0);
+		const AVDictionaryEntry *title = av_dict_get(stream->metadata, "title", nullptr, 0);
+		if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+			AudioTrack track;
+			track.stream_index = (int)i;
+			track.codec = String::utf8(avcodec_get_name(par->codec_id));
+			track.channels = par->ch_layout.nb_channels;
+			char layout[128] = {};
+			av_channel_layout_describe(&par->ch_layout, layout, sizeof(layout));
+			track.channel_layout = String::utf8(layout);
+			track.sample_rate = par->sample_rate;
+			track.bit_rate = par->bit_rate;
+			track.language = language ? String::utf8(language->value) : String();
+			track.title = title ? String::utf8(title->value) : String();
+			track.is_default = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
+			if ((int)i == best_audio) {
+				default_track = (int)audio_tracks.size();
+			}
+			audio_tracks.push_back(track);
+		} else if (par->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+			SubtitleTrack track;
+			track.stream_index = (int)i;
+			track.codec = String::utf8(avcodec_get_name(par->codec_id));
+			track.language = language ? String::utf8(language->value) : String();
+			track.title = title ? String::utf8(title->value) : String();
+			track.is_default = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
+			track.forced = (stream->disposition & AV_DISPOSITION_FORCED) != 0;
+			subtitle_tracks.push_back(track);
+		}
+	}
+
+	if (best_video >= 0) {
+		const AVStream *stream = format->streams[best_video];
+		const AVCodecParameters *par = stream->codecpar;
+		video.valid = true;
+		video.stream_index = best_video;
+		video.codec_name = String::utf8(avcodec_get_name(par->codec_id));
+		switch (par->codec_id) {
+			case AV_CODEC_ID_H264:
+				video.codec = VIDEO_CODEC_H264;
+				break;
+			case AV_CODEC_ID_HEVC:
+				video.codec = VIDEO_CODEC_HEVC;
+				break;
+			case AV_CODEC_ID_VP9:
+				video.codec = VIDEO_CODEC_VP9;
+				break;
+			case AV_CODEC_ID_AV1:
+				video.codec = VIDEO_CODEC_AV1;
+				break;
+			default:
+				video.codec = VIDEO_CODEC_OTHER;
+				break;
+		}
+		video.width = par->width;
+		video.height = par->height;
+		const AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
+		video.fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
+		const AVPixFmtDescriptor *pixel = av_pix_fmt_desc_get((AVPixelFormat)par->format);
+		video.pixel_format = pixel ? String::utf8(pixel->name) : String();
+		video.bit_depth = pixel ? pixel->comp[0].depth : par->bits_per_raw_sample;
+		const char *profile = avcodec_profile_name(par->codec_id, par->profile);
+		video.profile = profile ? String::utf8(profile) : String();
+		if (_is_annexb_codec()) {
+			const bool hevc = video.codec == VIDEO_CODEC_HEVC;
+			_config_to_annexb(par->extradata, par->extradata_size, hevc, config_parameter_sets);
+			if (!config_parameter_sets.is_empty()) {
+				AnnexBSplitter::SPSInfo sps;
+				if (_scan_access_unit(config_parameter_sets.ptr(), config_parameter_sets.size(), hevc, sps, nullptr) && sps.valid) {
+					video.sps = sps;
+					video.bit_depth = (int)sps.bit_depth;
+				}
+			}
+			if (video.pixel_format.is_empty() && video.sps.valid) {
+				// libavformat sets the pixel format only when it can decode; without video decoders, say what the SPS says.
+				static const char *chroma_names[] = { "gray", "yuv420p", "yuv422p", "yuv444p" };
+				video.pixel_format = chroma_names[MIN(video.sps.chroma_format, 3u)];
+				if (video.sps.bit_depth > 8) {
+					video.pixel_format += itos(video.sps.bit_depth) + "le";
+				}
+			}
+			if (par->extradata_size > 0 && par->extradata[0] == 1) {
+				// Length-prefixed NAL units (avcC/hvcC): convert to Annex-B. The filter also puts the parameter sets in
+				// front of every IDR picture.
+				const AVBitStreamFilter *filter = av_bsf_get_by_name(hevc ? "hevc_mp4toannexb" : "h264_mp4toannexb");
+				r = filter ? av_bsf_alloc(filter, &bsf) : AVERROR_BSF_NOT_FOUND;
+				if (r >= 0) {
+					r = avcodec_parameters_copy(bsf->par_in, par);
+				}
+				if (r >= 0) {
+					bsf->time_base_in = stream->time_base;
+					r = av_bsf_init(bsf);
+				}
+				if (r < 0) {
+					_set_error(vformat("Can't set up the Annex-B conversion of the %s stream: %s.", video.codec_name, _av_error(r)));
+					_close_internal();
+					return ERR_CANT_CREATE;
+				}
+			}
+		}
+	}
+	video_queue_target = _video_queue_target();
+
+	output_rate = AudioServer::get_singleton() ? (int)AudioServer::get_singleton()->get_mix_rate() : 48000;
+	if (output_rate <= 0) {
+		output_rate = 48000;
+	}
+	ring_capacity = (uint64_t)(output_rate * AUDIO_RING_SECONDS);
+	ring.resize(ring_capacity);
+	{
+		MutexLock audio_lock(audio_mutex);
+		ring_read = ring_write = 0;
+		marker_count = 0;
+		audio_position = 0.0;
+		audio_serial = 0;
+		audio_eof = false;
+		audio_in_underrun = false;
+		audio_underruns = 0;
+		audio_frames_mixed = 0;
+	}
+	read_packet = av_packet_alloc();
+	audio_frame = av_frame_alloc();
+	demux_serial = 0;
+	need_keyframe = true;
+	need_parameter_sets = true;
+	eof_reached = eof_drained = false;
+	read_errors_in_row = 0;
+	inband_parameter_sets.clear();
+	next_video_pts = 0.0;
+	audio_trim_until = -1.0;
+	audio_next_time = 0.0;
+	scratch_frames = scratch_offset = 0;
+	audio_space_wanted.set(0);
+	demux_idle.clear();
+
+	{
+		MutexLock lock(mutex);
+		audio_track = default_track;
+	}
+	_open_audio_track(default_track);
+
+	// Without a codec configuration (MPEG-TS), the coded size comes from the first SPS in the stream: read up to it now
+	// (what is read is queued as usual).
+	if (_is_annexb_codec() && !video.sps.valid) {
+		for (int i = 0; i < 4000 && !video.sps.valid && !eof_reached && get_state() != STATE_ERROR; i++) {
+			_read_packet();
+		}
+		if (!video.sps.valid) {
+			print_line(vformat("MediaSource: no %s SPS found near the start of %s.", video.codec_name, global_path));
+		}
+	}
+
+	if (get_state() == STATE_ERROR) {
+		_close_internal();
+		return FAILED;
+	}
+	{
+		MutexLock lock(mutex);
+		state = STATE_READING;
+	}
+
+	String summary = vformat("MediaSource: %s: %s, %.1f s", global_path, format_name, duration);
+	if (video.valid) {
+		summary += vformat(", video %s %dx%d %.3f fps %d-bit", video.codec_name, video.width, video.height, video.fps, video.bit_depth);
+		if (video.sps.valid) {
+			summary += vformat(" (SPS %dx%d)", video.sps.width, video.sps.height);
+		}
+	}
+	if (default_track >= 0) {
+		const AudioTrack &track = audio_tracks[default_track];
+		summary += vformat(", audio track %d of %d: %s %s %d Hz", default_track, audio_tracks.size(), track.codec, track.channel_layout, track.sample_rate);
+	}
+	summary += vformat(", %d subtitle track(s).", subtitle_tracks.size());
+	print_line(summary);
+
+	thread.start(&MediaSource::_thread_func, this);
+	return OK;
+}
+
+void MediaSource::_close_internal() {
+	if (thread.is_started()) {
+		{
+			MutexLock lock(mutex);
+			exit_requested = true;
+			condition.notify_all();
+		}
+		thread.wait_to_finish();
+	}
+	_close_audio_codec();
+	av_bsf_free(&bsf);
+	av_packet_free(&read_packet);
+	av_frame_free(&audio_frame);
+	{
+		MutexLock lock(mutex);
+		_flush_video_queue_locked();
+		demux_eof = false;
+	}
+	if (format) {
+		avformat_close_input(&format);
+	}
+	video = VideoInfo();
+	swr_description = String();
+	audio_tracks.clear();
+	subtitle_tracks.clear();
+	config_parameter_sets.clear();
+	inband_parameter_sets.clear();
+	current_audio_track = -1;
+	current_audio_stream = -1;
+	{
+		MutexLock audio_lock(audio_mutex);
+		ring.clear();
+		ring_capacity = 0;
+		ring_read = ring_write = 0;
+		marker_count = 0;
+		audio_eof = true;
+	}
+}
+
+void MediaSource::close() {
+	_close_internal();
+	MutexLock lock(mutex);
+	if (state != STATE_ERROR) {
+		state = STATE_CLOSED;
+	}
+	audio_track = -1;
+}
+
+Dictionary MediaSource::get_video_info() const {
+	Dictionary d;
+	if (!video.valid) {
+		return d;
+	}
+	static const char *codec_names[] = { "", "h264", "hevc", "vp9", "av1", "other" };
+	d["stream_index"] = video.stream_index;
+	d["codec"] = video.codec == VIDEO_CODEC_OTHER ? video.codec_name : String(codec_names[video.codec]);
+	d["codec_name"] = video.codec_name;
+	d["width"] = video.width;
+	d["height"] = video.height;
+	d["fps"] = video.fps;
+	d["bit_depth"] = video.bit_depth;
+	d["profile"] = video.profile;
+	d["pixel_format"] = video.pixel_format;
+	d["is_h264"] = video.codec == VIDEO_CODEC_H264;
+	d["is_hevc"] = video.codec == VIDEO_CODEC_HEVC;
+	d["is_vp9"] = video.codec == VIDEO_CODEC_VP9;
+	d["is_av1"] = video.codec == VIDEO_CODEC_AV1;
+	// What the Steam Frame decodes in hardware to a format we can import (spike 01): H.264 and HEVC, 8-bit.
+	d["hw_decodable"] = _is_annexb_codec() && video.bit_depth <= 8;
+	d["annexb_filter"] = bsf != nullptr;
+	if (video.sps.valid) {
+		d["coded_width"] = video.sps.width;
+		d["coded_height"] = video.sps.height;
+		d["display_width"] = video.sps.display_width;
+		d["display_height"] = video.sps.display_height;
+		d["chroma_format"] = video.sps.chroma_format;
+	}
+	return d;
+}
+
+Array MediaSource::get_audio_tracks() const {
+	Array tracks;
+	for (uint32_t i = 0; i < audio_tracks.size(); i++) {
+		const AudioTrack &track = audio_tracks[i];
+		Dictionary d;
+		d["index"] = i;
+		d["stream_index"] = track.stream_index;
+		d["codec"] = track.codec;
+		d["channels"] = track.channels;
+		d["channel_layout"] = track.channel_layout;
+		d["sample_rate"] = track.sample_rate;
+		d["bit_rate"] = track.bit_rate;
+		d["language"] = track.language;
+		d["title"] = track.title;
+		d["default"] = track.is_default;
+		tracks.push_back(d);
+	}
+	return tracks;
+}
+
+Array MediaSource::get_subtitle_tracks() const {
+	Array tracks;
+	for (uint32_t i = 0; i < subtitle_tracks.size(); i++) {
+		const SubtitleTrack &track = subtitle_tracks[i];
+		Dictionary d;
+		d["index"] = i;
+		d["stream_index"] = track.stream_index;
+		d["codec"] = track.codec;
+		d["language"] = track.language;
+		d["title"] = track.title;
+		d["default"] = track.is_default;
+		d["forced"] = track.forced;
+		tracks.push_back(d);
+	}
+	return tracks;
+}
+
+Dictionary MediaSource::get_info() const {
+	Dictionary d;
+	d["path"] = path;
+	d["format"] = format_name;
+	d["duration"] = duration;
+	d["start_time"] = start_time;
+	d["bit_rate"] = bit_rate;
+	d["video"] = get_video_info();
+	d["audio_tracks"] = get_audio_tracks();
+	d["subtitle_tracks"] = get_subtitle_tracks();
+	d["audio_track"] = get_audio_track();
+	d["output_rate"] = output_rate;
+	return d;
+}
+
+Error MediaSource::select_audio_track(int p_track) {
+	ERR_FAIL_COND_V_MSG(!is_open(), ERR_UNCONFIGURED, "MediaSource: not open.");
+	ERR_FAIL_COND_V_MSG(p_track < -1 || p_track >= (int)audio_tracks.size(), ERR_INVALID_PARAMETER, vformat("MediaSource: no audio track %d (%d tracks).", p_track, audio_tracks.size()));
+	const double position = get_position();
+	{
+		MutexLock lock(mutex);
+		if (audio_track == p_track) {
+			return OK;
+		}
+		audio_track = p_track;
+	}
+	// The demux thread is ahead of the playback position by the queues: read again from here with the new track.
+	seek(position);
+	return OK;
+}
+
+int MediaSource::get_audio_track() const {
+	MutexLock lock(mutex);
+	return audio_track;
+}
+
+int MediaSource::seek(double p_seconds) {
+	ERR_FAIL_COND_V_MSG(!is_open(), -1, "MediaSource: not open.");
+	double target = MAX(p_seconds, 0.0);
+	if (duration > 0.0) {
+		target = MIN(target, duration);
+	}
+	MutexLock lock(mutex);
+	serial++;
+	seek_pending = true;
+	seek_target = target;
+	demux_eof = false;
+	seek_count++;
+	if (state == STATE_ENDED) {
+		state = STATE_READING;
+	}
+	_flush_video_queue_locked();
+	last_video_pts = -1.0;
+	{
+		MutexLock audio_lock(audio_mutex);
+		ring_read = ring_write = 0;
+		marker_count = 0;
+		audio_position = target;
+		audio_serial = serial;
+		audio_eof = audio_track < 0;
+		audio_in_underrun = false;
+	}
+	condition.notify_one();
+	_wake_consumer_locked();
+	return (int)serial;
+}
+
+uint32_t MediaSource::get_serial() const {
+	MutexLock lock(mutex);
+	return serial;
+}
+
+double MediaSource::get_seek_target() const {
+	MutexLock lock(mutex);
+	return seek_target;
+}
+
+double MediaSource::get_position() const {
+	if (get_audio_track() >= 0) {
+		return get_audio_position();
+	}
+	MutexLock lock(mutex);
+	return last_video_pts >= 0.0 ? last_video_pts : seek_target;
+}
+
+bool MediaSource::is_eof() const {
+	MutexLock lock(mutex);
+	return demux_eof;
+}
+
+MediaSource::State MediaSource::get_state() const {
+	MutexLock lock(mutex);
+	return state;
+}
+
+String MediaSource::get_last_error() const {
+	MutexLock lock(mutex);
+	return last_error;
+}
+
+Dictionary MediaSource::get_stats() const {
+	static const char *state_names[] = { "closed", "reading", "ended", "error" };
+	Dictionary d;
+	MutexLock lock(mutex);
+	d["state"] = (int)state;
+	d["state_name"] = state_names[state];
+	d["serial"] = serial;
+	d["eof"] = demux_eof;
+	d["packets_read"] = stats.packets_read;
+	d["bytes_read"] = stats.bytes_read;
+	d["video_packets"] = stats.video_packets;
+	d["video_bytes"] = stats.video_bytes;
+	d["video_skipped"] = stats.video_skipped;
+	d["video_parameter_sets_added"] = stats.video_parameter_sets_added;
+	d["video_queue"] = video_count;
+	d["video_queue_bytes"] = video_queued_bytes;
+	d["audio_packets"] = stats.audio_packets;
+	d["audio_frames_out"] = stats.audio_frames_out;
+	d["audio_decode_errors"] = stats.audio_decode_errors;
+	d["audio_dropped_frames"] = stats.audio_dropped_frames;
+	d["audio_silence_frames"] = stats.audio_silence_frames;
+	d["read_errors"] = stats.read_errors;
+	d["thread_cpu_seconds"] = stats.thread_cpu_seconds;
+	d["seeks"] = seek_count;
+	d["last_error"] = last_error;
+	{
+		MutexLock audio_lock(audio_mutex);
+		d["audio_buffered"] = output_rate > 0 ? (double)(ring_write - ring_read) / output_rate : 0.0;
+		d["audio_position"] = audio_position;
+		d["audio_underruns"] = audio_underruns;
+		d["audio_frames_mixed"] = audio_frames_mixed;
+		d["audio_finished"] = audio_eof && ring_write == ring_read;
+	}
+	return d;
+}
+
+Ref<AudioStreamMedia> MediaSource::get_audio_stream() {
+	Ref<AudioStreamMedia> stream;
+	stream.instantiate();
+	stream->set_media_source(this);
+	return stream;
+}
+
+Dictionary MediaSource::read_video_packet() {
+	Dictionary d;
+	VideoPacket packet;
+	if (!pop_video_packet(packet)) {
+		return d;
+	}
+	PackedByteArray data;
+	data.resize(packet.size);
+	memcpy(data.ptrw(), packet.data, packet.size);
+	d["data"] = data;
+	d["pts"] = packet.pts;
+	d["dts"] = packet.dts;
+	d["keyframe"] = packet.keyframe;
+	d["serial"] = packet.serial;
+	d["sps_width"] = packet.sps_width;
+	d["sps_height"] = packet.sps_height;
+	release_video_packet(packet);
+	return d;
+}
+
+bool MediaSource::pop_video_packet(VideoPacket &r_packet) {
+	MutexLock lock(mutex);
+	if (video_count == 0) {
+		return false;
+	}
+	VideoPacket &entry = video_queue[video_head];
+	r_packet = entry;
+	entry = VideoPacket();
+	video_head = (video_head + 1) % VIDEO_QUEUE_MAX;
+	video_count--;
+	video_queued_bytes -= r_packet.size;
+	last_video_pts = r_packet.pts;
+	if (demux_idle.is_set() && video_count < video_queue_target * 3 / 4) {
+		condition.notify_one();
+	}
+	return true;
+}
+
+void MediaSource::release_video_packet(VideoPacket &r_packet) {
+	if (r_packet.packet) {
+		_packet_put(r_packet.packet);
+	}
+	r_packet = VideoPacket();
+}
+
+void MediaSource::set_video_wake_fd(int p_fd) {
+	MutexLock lock(mutex);
+	wake_fd = p_fd;
+}
+
+bool MediaSource::is_video_input_done(uint32_t p_serial) const {
+	MutexLock lock(mutex);
+	if (state == STATE_ERROR || state == STATE_CLOSED) {
+		return video_count == 0;
+	}
+	return demux_eof && video_count == 0 && !seek_pending && p_serial == serial;
+}
+
+#define SETTING_GUARD() ERR_FAIL_COND_MSG(is_open(), "MediaSource: change the settings before open().")
+
+void MediaSource::set_video_queue_seconds(double p_seconds) {
+	SETTING_GUARD();
+	video_queue_seconds = CLAMP(p_seconds, 0.1, 10.0);
+}
+
+void MediaSource::set_audio_queue_seconds(double p_seconds) {
+	SETTING_GUARD();
+	audio_queue_seconds = CLAMP(p_seconds, 0.1, AUDIO_RING_SECONDS - 1.0);
+}
+
+void MediaSource::set_downmix_normalize(bool p_normalize) {
+	SETTING_GUARD();
+	downmix_normalize = p_normalize;
+}
+
+MediaSource::~MediaSource() {
+	_close_internal();
+	for (AVPacket *packet : packet_pool) {
+		av_packet_free(&packet);
+	}
+	packet_pool.clear();
+}
+
+void MediaSource::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("open", "path"), &MediaSource::open);
+	ClassDB::bind_method(D_METHOD("close"), &MediaSource::close);
+	ClassDB::bind_method(D_METHOD("is_open"), &MediaSource::is_open);
+	ClassDB::bind_method(D_METHOD("get_path"), &MediaSource::get_path);
+	ClassDB::bind_method(D_METHOD("get_info"), &MediaSource::get_info);
+	ClassDB::bind_method(D_METHOD("get_video_info"), &MediaSource::get_video_info);
+	ClassDB::bind_method(D_METHOD("get_audio_tracks"), &MediaSource::get_audio_tracks);
+	ClassDB::bind_method(D_METHOD("get_subtitle_tracks"), &MediaSource::get_subtitle_tracks);
+	ClassDB::bind_method(D_METHOD("select_audio_track", "track"), &MediaSource::select_audio_track);
+	ClassDB::bind_method(D_METHOD("get_audio_track"), &MediaSource::get_audio_track);
+	ClassDB::bind_method(D_METHOD("seek", "seconds"), &MediaSource::seek);
+	ClassDB::bind_method(D_METHOD("get_serial"), &MediaSource::get_serial);
+	ClassDB::bind_method(D_METHOD("get_seek_target"), &MediaSource::get_seek_target);
+	ClassDB::bind_method(D_METHOD("get_duration"), &MediaSource::get_duration);
+	ClassDB::bind_method(D_METHOD("get_start_time"), &MediaSource::get_start_time);
+	ClassDB::bind_method(D_METHOD("get_position"), &MediaSource::get_position);
+	ClassDB::bind_method(D_METHOD("get_audio_position"), &MediaSource::get_audio_position);
+	ClassDB::bind_method(D_METHOD("is_eof"), &MediaSource::is_eof);
+	ClassDB::bind_method(D_METHOD("get_state"), &MediaSource::get_state);
+	ClassDB::bind_method(D_METHOD("get_last_error"), &MediaSource::get_last_error);
+	ClassDB::bind_method(D_METHOD("get_stats"), &MediaSource::get_stats);
+	ClassDB::bind_method(D_METHOD("get_audio_stream"), &MediaSource::get_audio_stream);
+	ClassDB::bind_method(D_METHOD("get_output_rate"), &MediaSource::get_output_rate);
+	ClassDB::bind_method(D_METHOD("read_video_packet"), &MediaSource::read_video_packet);
+
+	ClassDB::bind_method(D_METHOD("set_video_queue_seconds", "seconds"), &MediaSource::set_video_queue_seconds);
+	ClassDB::bind_method(D_METHOD("get_video_queue_seconds"), &MediaSource::get_video_queue_seconds);
+	ClassDB::bind_method(D_METHOD("set_audio_queue_seconds", "seconds"), &MediaSource::set_audio_queue_seconds);
+	ClassDB::bind_method(D_METHOD("get_audio_queue_seconds"), &MediaSource::get_audio_queue_seconds);
+	ClassDB::bind_method(D_METHOD("set_downmix_normalize", "normalize"), &MediaSource::set_downmix_normalize);
+	ClassDB::bind_method(D_METHOD("is_downmix_normalize"), &MediaSource::is_downmix_normalize);
+
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "video_queue_seconds"), "set_video_queue_seconds", "get_video_queue_seconds");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "audio_queue_seconds"), "set_audio_queue_seconds", "get_audio_queue_seconds");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
+
+	BIND_ENUM_CONSTANT(STATE_CLOSED);
+	BIND_ENUM_CONSTANT(STATE_READING);
+	BIND_ENUM_CONSTANT(STATE_ENDED);
+	BIND_ENUM_CONSTANT(STATE_ERROR);
+}

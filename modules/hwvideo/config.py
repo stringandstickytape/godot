@@ -9,9 +9,12 @@ def configure(env):
 
 def get_doc_classes():
     return [
+        "AudioStreamMedia",
+        "AudioStreamPlaybackMedia",
         "DmabufImage",
         "HWVideoPlaneTexture",
         "HWVideoTexture",
+        "MediaSource",
         "V4L2Decoder",
     ]
 

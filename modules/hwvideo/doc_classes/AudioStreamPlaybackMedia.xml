@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="AudioStreamPlaybackMedia" inherits="AudioStreamPlayback" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Playback of an [AudioStreamMedia].
+	</brief_description>
+	<description>
+		Pulls decoded audio from the [MediaSource]'s ring buffer. [method AudioStreamPlayback.seek], and [method AudioStreamPlayback.start] with a position above 0, seek the source (video included). It stops playing when the source has read its last audio and the buffer is empty.
+	</description>
+	<tutorials>
+	</tutorials>
+</class>

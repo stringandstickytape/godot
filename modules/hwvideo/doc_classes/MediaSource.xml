@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="MediaSource" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Reads a media file (Matroska/WebM, MP4/MOV, MPEG-TS, AVI) with FFmpeg: video access units for a hardware decoder, decoded audio for an [AudioStreamMedia].
+	</brief_description>
+	<description>
+		Opens a file with FFmpeg's libavformat and reads it on a worker thread. The video stream is only demuxed: its access units go, in Annex-B for H.264 and HEVC (converted from MP4/Matroska's length-prefixed form with the [code]h264_mp4toannexb[/code] / [code]hevc_mp4toannexb[/code] bitstream filters), through a bounded queue to a [V4L2Decoder] ([method V4L2Decoder.open_source], [method HWVideoTexture.open_source]). The first access unit after [method open] and after every [method seek] is a keyframe with the parameter sets (VPS/SPS/PPS) in band.
+		The selected audio track is decoded and resampled with libswresample to stereo float at the [AudioServer] mix rate, into a ring buffer that [method get_audio_stream] plays. More than two channels are downmixed (centre and surrounds at -3 dB, LFE dropped); the source layout is in [method get_audio_tracks]. The playback position of that stream is the A/V master clock.
+		All times are media seconds: the stream timestamp minus the file's start time ([method get_start_time]), so the first frame is at about 0. The thread blocks when the queues are full ([member video_queue_seconds], [member audio_queue_seconds]) and is woken when they are consumed; it never spins.
+		[codeblock]
+		var source := MediaSource.new()
+		if source.open("/path/film.mkv") == OK:
+		    print(source.get_info())
+		    video.open_source(source)              # HWVideoTexture
+		    $AudioStreamPlayer.stream = source.get_audio_stream()
+		[/codeblock]
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="close">
+			<return type="void" />
+			<description>
+				Stops the thread and closes the file. Close a [V4L2Decoder] reading from it first.
+			</description>
+		</method>
+		<method name="get_audio_position" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the media time of the next audio frame to be mixed: the time of the last frame mixed plus one frame. Right after [method seek] it is the seek target.
+			</description>
+		</method>
+		<method name="get_audio_stream">
+			<return type="AudioStreamMedia" />
+			<description>
+				Returns a new [AudioStreamMedia] that plays the decoded audio. Play it from one [AudioStreamPlayer] at a time.
+			</description>
+		</method>
+		<method name="get_audio_track" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the selected audio track (index into [method get_audio_tracks]), or -1.
+			</description>
+		</method>
+		<method name="get_audio_tracks" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns one Dictionary per audio stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]channels[/code], [code]channel_layout[/code] (for example "5.1(side)"), [code]sample_rate[/code], [code]bit_rate[/code], [code]language[/code], [code]title[/code], [code]default[/code].
+			</description>
+		</method>
+		<method name="get_duration" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the duration in seconds (0 if unknown).
+			</description>
+		</method>
+		<method name="get_info" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns [code]path[/code], [code]format[/code], [code]duration[/code], [code]start_time[/code], [code]bit_rate[/code], [code]video[/code] ([method get_video_info]), [code]audio_tracks[/code], [code]subtitle_tracks[/code], [code]audio_track[/code] and [code]output_rate[/code].
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the last error or warning (a failed seek or an audio track that can't be decoded don't stop the source).
+			</description>
+		</method>
+		<method name="get_output_rate" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the sample rate of the decoded audio: the [AudioServer] mix rate when the file was opened.
+			</description>
+		</method>
+		<method name="get_path" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the path given to [method open].
+			</description>
+		</method>
+		<method name="get_position" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns [method get_audio_position] if an audio track is selected, else the PTS of the last video access unit taken from the queue.
+			</description>
+		</method>
+		<method name="get_seek_target" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the target of the last [method seek] (0 after [method open]).
+			</description>
+		</method>
+		<method name="get_serial" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the seek count. Video access units carry the serial they were read under.
+			</description>
+		</method>
+		<method name="get_start_time" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the file's start time in seconds, which is subtracted from every timestamp.
+			</description>
+		</method>
+		<method name="get_state" qualifiers="const">
+			<return type="int" enum="MediaSource.State" />
+			<description>
+				Returns the state.
+			</description>
+		</method>
+		<method name="get_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns counters: [code]packets_read[/code], [code]bytes_read[/code], [code]video_packets[/code], [code]video_bytes[/code], [code]video_skipped[/code] (before the first keyframe), [code]video_parameter_sets_added[/code], [code]video_queue[/code], [code]video_queue_bytes[/code], [code]audio_packets[/code], [code]audio_frames_out[/code], [code]audio_decode_errors[/code], [code]audio_dropped_frames[/code] (before a seek target), [code]audio_silence_frames[/code], [code]audio_buffered[/code] (seconds), [code]audio_position[/code], [code]audio_underruns[/code], [code]audio_frames_mixed[/code], [code]audio_finished[/code], [code]read_errors[/code], [code]seeks[/code], [code]thread_cpu_seconds[/code] (CPU time of the demux thread), [code]serial[/code], [code]eof[/code], [code]state[/code], [code]state_name[/code], [code]last_error[/code].
+			</description>
+		</method>
+		<method name="get_subtitle_tracks" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]language[/code], [code]title[/code], [code]default[/code], [code]forced[/code]. Subtitles are not read yet.
+			</description>
+		</method>
+		<method name="get_video_info" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns the video stream: [code]codec[/code] ("h264", "hevc", "vp9", "av1" or FFmpeg's name), [code]is_h264[/code], [code]is_hevc[/code], [code]is_vp9[/code], [code]is_av1[/code], [code]width[/code], [code]height[/code], [code]fps[/code], [code]bit_depth[/code], [code]profile[/code], [code]pixel_format[/code], [code]hw_decodable[/code] (H.264 or HEVC, 8-bit), [code]annexb_filter[/code], and from the SPS [code]coded_width[/code], [code]coded_height[/code], [code]display_width[/code], [code]display_height[/code], [code]chroma_format[/code]. Empty if there is no video.
+			</description>
+		</method>
+		<method name="is_eof" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] once the file is read to the end (queued data may still be waiting).
+			</description>
+		</method>
+		<method name="is_open" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] between a successful [method open] and [method close].
+			</description>
+		</method>
+		<method name="open">
+			<return type="int" enum="Error" />
+			<param index="0" name="path" type="String" />
+			<description>
+				Opens a file, reads its stream information, selects the default audio track and starts reading.
+			</description>
+		</method>
+		<method name="read_video_packet">
+			<return type="Dictionary" />
+			<description>
+				For scripts and tests: takes the next video access unit from the queue and returns [code]data[/code] (a copy), [code]pts[/code], [code]dts[/code], [code]keyframe[/code], [code]serial[/code], [code]sps_width[/code], [code]sps_height[/code] (coded size of an SPS in it, or 0). Returns an empty Dictionary if none is queued yet. Don't use it while a [V4L2Decoder] reads the same source.
+			</description>
+		</method>
+		<method name="seek">
+			<return type="int" />
+			<param index="0" name="seconds" type="float" />
+			<description>
+				Drops everything queued and reads again from the keyframe at or before [param seconds]. Decoded audio before the target is dropped (and a short gap filled with silence), so the audio clock restarts exactly at the target. A [HWVideoTexture] playing this source notices the new serial, drops its stale frames and shows the frame at the target. Returns the new serial. Any thread.
+			</description>
+		</method>
+		<method name="select_audio_track">
+			<return type="int" enum="Error" />
+			<param index="0" name="track" type="int" />
+			<description>
+				Selects an audio track (-1: none). While open, this seeks to the current position, because the queues already hold the old track's audio.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="audio_queue_seconds" type="float" setter="set_audio_queue_seconds" getter="get_audio_queue_seconds" default="1.0">
+			Decoded audio to keep ahead of the playback position. Set before [method open].
+		</member>
+		<member name="downmix_normalize" type="bool" setter="set_downmix_normalize" getter="is_downmix_normalize" default="false">
+			If [code]true[/code], the downmix to stereo is scaled so no sum can exceed full scale (about 7.7 dB quieter for 5.1). Set before [method open].
+		</member>
+		<member name="video_queue_seconds" type="float" setter="set_video_queue_seconds" getter="get_video_queue_seconds" default="1.0">
+			Video access units to keep queued, in seconds of frames. Set before [method open].
+		</member>
+	</members>
+	<constants>
+		<constant name="STATE_CLOSED" value="0" enum="State">
+		</constant>
+		<constant name="STATE_READING" value="1" enum="State">
+		</constant>
+		<constant name="STATE_ENDED" value="2" enum="State">
+			The whole file was read; what is queued can still be consumed. A [method seek] reads again.
+		</constant>
+		<constant name="STATE_ERROR" value="3" enum="State">
+		</constant>
+	</constants>
+</class>

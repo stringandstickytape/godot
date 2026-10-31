@@ -62,7 +62,8 @@ public:
 
 // Plays a V4L2Decoder's output with no copy: every CAPTURE buffer is imported once as a DmabufImage (per CAPTURE setup),
 // the frame due at the clock is shown through two plane textures, and buffers go back to the decoder only once the GPU is
-// done with them. Call update() once per frame from the main thread.
+// done with them. Call update() once per frame from the main thread. The input is a raw Annex-B file (open()) or a
+// MediaSource (open_source()); with a source, seeks go through it and are picked up here by its serial.
 class HWVideoTexture : public RefCounted {
 	GDCLASS(HWVideoTexture, RefCounted);
 
@@ -86,6 +87,7 @@ class HWVideoTexture : public RefCounted {
 	};
 
 	Ref<V4L2Decoder> decoder;
+	Ref<MediaSource> source;
 	Ref<HWVideoPlaneTexture> plane_textures[DmabufImage::MAX_PLANES];
 	LocalVector<Buffer> buffers;
 	LocalVector<ReadyFrame> ready;
@@ -102,9 +104,15 @@ class HWVideoTexture : public RefCounted {
 	double clock = 0.0;
 	double frame_time = -1.0;
 	bool playing = false;
+	// After open or a seek: frames before the target are decoded only to reach it. Nothing is shown until the frame for
+	// the target is known (the newest at or before it, once a later one has arrived), so a seek doesn't flash the frames
+	// between the keyframe and the target.
+	bool settling = false;
+	double seek_target = 0.0;
 	uint64_t frames_shown = 0;
 	uint64_t frames_dropped = 0;
 	uint64_t frames_stale = 0;
+	uint64_t frames_skipped = 0;
 	String last_error;
 
 	static void _render_thread_swap(const Ref<DmabufImage> &p_release, const Ref<DmabufImage> &p_acquire, const Array &p_free);
@@ -113,12 +121,17 @@ class HWVideoTexture : public RefCounted {
 	void _release_generation(Array &r_free);
 	void _free_buffer(Buffer &p_buffer, Array &r_free);
 	void _show(const ReadyFrame &p_frame, uint64_t p_frames_drawn);
+	void _discard_ready(uint32_t p_count, bool p_skipped);
+	void _return_all_ready();
 
 protected:
 	static void _bind_methods();
 
 public:
 	Error open(const String &p_path, const String &p_codec, double p_fps);
+	// Plays the video stream of an open MediaSource. Play its get_audio_stream() in an AudioStreamPlayer and pass that
+	// player's clock to update().
+	Error open_source(const Ref<MediaSource> &p_source);
 	void close();
 
 	// Advances the clock by p_delta while playing, or sets it to p_master_clock when that is >= 0 (e.g. the audio
@@ -129,11 +142,14 @@ public:
 	void pause();
 	bool is_playing() const { return playing; }
 	void seek_to_start();
+	// With a MediaSource: MediaSource.seek() (audio and video). With a raw file only 0 is possible.
+	Error seek(double p_seconds);
 	double get_position() const { return clock; }
 	double get_frame_time() const { return frame_time; }
 	bool has_frame() const { return shown >= 0 || have_orphan; }
 
 	Ref<V4L2Decoder> get_decoder() const { return decoder; }
+	Ref<MediaSource> get_media_source() const { return source; }
 	Ref<Texture2D> get_plane_texture(int p_plane) const;
 	RID get_plane_rd_rid(int p_plane) const;
 	Size2i get_decoded_size() const { return decoded_size; }

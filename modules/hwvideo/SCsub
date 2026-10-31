@@ -1,9 +1,25 @@
 #!/usr/bin/env python
 from misc.utility.scons_hints import *
 
+import os
+
 Import("env")
 Import("env_modules")
 
 env_hwvideo = env_modules.Clone()
+
+# FFmpeg (libavformat, libavcodec, libswresample, libavutil), static, built by build/ffmpeg-build.sh of the player
+# repository into ~/src/ffmpeg-<arch>. HWVIDEO_FFMPEG_PREFIX overrides the prefix.
+ffmpeg_arch = {"arm64": "aarch64", "x86_64": "x86_64"}.get(env["arch"], env["arch"])
+ffmpeg_prefix = os.environ.get("HWVIDEO_FFMPEG_PREFIX", os.path.expanduser("~/src/ffmpeg-" + ffmpeg_arch))
+ffmpeg_libs = ["avformat", "avcodec", "swresample", "avutil"]  # Dependents before dependencies.
+for lib in ffmpeg_libs:
+    if not os.path.isfile(os.path.join(ffmpeg_prefix, "lib", "lib%s.a" % lib)):
+        print("hwvideo: lib%s.a not found in %s/lib. Build FFmpeg first: build/ffmpeg-build.sh %s" % (lib, ffmpeg_prefix, ffmpeg_arch))
+        Exit(255)
+
+# -isystem: FFmpeg's headers aren't held to the engine's warning flags.
+env_hwvideo.Append(CCFLAGS=["-isystem", os.path.join(ffmpeg_prefix, "include")])
+env.Append(LIBS=[File(os.path.join(ffmpeg_prefix, "lib", "lib%s.a" % lib)) for lib in ffmpeg_libs] + ["m", "atomic"])
 
 env_hwvideo.add_source_files(env.modules_sources, "*.cpp")

@@ -4,7 +4,7 @@
 		Shows the frames of a [V4L2Decoder] with no copy.
 	</brief_description>
 	<description>
-		Imports every decoder CAPTURE buffer once as a [DmabufImage], shows the frame that is due at the clock through two plane textures ([method get_plane_texture]), and gives buffers back to the decoder once the GPU is done with them. Call [method update] once per frame from the main thread.
+		Plays a raw Annex-B file ([method open]) or the video of a [MediaSource] ([method open_source]). Imports every decoder CAPTURE buffer once as a [DmabufImage], shows the frame that is due at the clock through two plane textures ([method get_plane_texture]), and gives buffers back to the decoder once the GPU is done with them. Call [method update] once per frame from the main thread.
 		Sample plane 0 (Y) with [code].r[/code] and plane 1 (CbCr) with [code].ra[/code], and crop to [method get_visible_uv_rect]: the decoder pads the height.
 	</description>
 	<tutorials>
@@ -26,6 +26,12 @@
 			<return type="V4L2Decoder" />
 			<description>
 				Returns the decoder, to change its settings before [method open].
+			</description>
+		</method>
+		<method name="get_media_source" qualifiers="const">
+			<return type="MediaSource" />
+			<description>
+				Returns the [MediaSource] given to [method open_source], or [code]null[/code].
 			</description>
 		</method>
 		<method name="get_frame_time" qualifiers="const">
@@ -63,7 +69,7 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns the decoder's [method V4L2Decoder.get_stats] plus [code]frames_shown[/code], [code]frames_dropped[/code] (late), [code]frames_stale[/code] (from before a seek), [code]position[/code] and [code]frame_time[/code].
+				Returns the decoder's [method V4L2Decoder.get_stats] plus [code]frames_shown[/code], [code]frames_dropped[/code] (late), [code]frames_stale[/code] (from before a seek), [code]frames_skipped[/code] (decoded on the way to a seek target), [code]settling[/code], [code]seek_target[/code], [code]position[/code] and [code]frame_time[/code].
 			</description>
 		</method>
 		<method name="get_visible_rect" qualifiers="const">
@@ -99,6 +105,13 @@
 				Opens the decoder (see [method V4L2Decoder.open]). The first frame is shown as soon as it is decoded; the clock starts with [method play].
 			</description>
 		</method>
+		<method name="open_source">
+			<return type="int" enum="Error" />
+			<param index="0" name="source" type="MediaSource" />
+			<description>
+				Plays the video stream of an open [MediaSource], with frame times from the stream's PTS. Play [method MediaSource.get_audio_stream] in an [AudioStreamPlayer] and pass its clock to [method update]. Seeks made on the source (by [method seek], the audio player or directly) are picked up in [method update] from its serial: ready frames are dropped as stale, the clock jumps to the target, and nothing is shown until the frame at the target is known (frames between the keyframe and the target count as [code]frames_skipped[/code]).
+			</description>
+		</method>
 		<method name="pause">
 			<return type="void" />
 			<description>
@@ -109,6 +122,13 @@
 			<return type="void" />
 			<description>
 				Starts the clock.
+			</description>
+		</method>
+		<method name="seek">
+			<return type="int" enum="Error" />
+			<param index="0" name="seconds" type="float" />
+			<description>
+				With a [MediaSource]: [method MediaSource.seek] (audio and video). With a raw file only 0 works ([method seek_to_start]).
 			</description>
 		</method>
 		<method name="seek_to_start">
