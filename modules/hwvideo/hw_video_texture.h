@@ -156,6 +156,10 @@ private:
 	uint64_t frames_stale = 0;
 	uint64_t frames_skipped = 0;
 	String last_error;
+	// set_next(): opened ahead (prerolled by this one's update()), it takes over the plane textures when this one ends.
+	Ref<HWVideoTexture> next;
+	uint64_t next_set_usec = 0;
+	double next_preroll_seconds = -1.0; // From set_next() until it had its first frame; -1 until then.
 
 	static void _render_thread_swap(const Ref<DmabufImage> &p_release, const Ref<DmabufImage> &p_acquire, const Array &p_free);
 
@@ -173,6 +177,8 @@ private:
 	void _free_software_textures();
 	Dictionary _get_software_stats() const;
 	static void _render_thread_upload(RID p_y, RID p_uv, const Vector<uint8_t> &p_y_data, const Vector<uint8_t> &p_uv_data);
+	void _point_planes();
+	void _check_next();
 
 protected:
 	static void _bind_methods();
@@ -197,6 +203,20 @@ public:
 	double get_position() const { return clock; }
 	double get_frame_time() const { return frame_time; }
 	bool has_frame() const { return shown >= 0 || have_orphan || software_shown >= 0; }
+
+	// The next item, gapless (#44 groundwork). p_next is open (open_source()) but not playing: this texture's update()
+	// also updates it, so it decodes and holds its first frame. Once this one is finished (is_finished()), the two
+	// swap plane textures (swap_planes_with(): a material keeps the plane texture objects it has, which now belong to
+	// p_next and show its frames), p_next starts playing and next_started(p_next) is emitted. From then on, update
+	// p_next (and pass its audio clock), and close this one. Null: none.
+	void set_next(const Ref<HWVideoTexture> &p_next);
+	Ref<HWVideoTexture> get_next() const { return next; }
+	// The input ended, every frame was shown, and the last one has been up for its duration (or the source's audio
+	// finished, if that comes first: the audio clock stops there).
+	bool is_finished() const;
+	// Exchanges the plane textures with p_other's and points each set at its new owner's current frame: a material that
+	// samples the plane textures this one had now shows p_other's frames, and the other way round. Main thread.
+	void swap_planes_with(const Ref<HWVideoTexture> &p_other);
 
 	Ref<V4L2Decoder> get_decoder() const { return decoder; }
 	Ref<MediaSource> get_media_source() const { return source; }

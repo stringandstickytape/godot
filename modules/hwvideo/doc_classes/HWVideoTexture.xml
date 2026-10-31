@@ -65,6 +65,12 @@
 				On the software path: why the hardware path wasn't used (the same sentence as [code]hw_unsupported_reason[/code] in [method MediaSource.get_video_info]).
 			</description>
 		</method>
+		<method name="get_next" qualifiers="const">
+			<return type="HWVideoTexture" />
+			<description>
+				Returns the item set with [method set_next], until it takes over (then [code]null[/code]).
+			</description>
+		</method>
 		<method name="get_overlay_stats">
 			<return type="Dictionary" />
 			<description>
@@ -93,7 +99,7 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns the decoder's [method V4L2Decoder.get_stats] plus [code]frames_shown[/code], [code]frames_dropped[/code] (late), [code]frames_stale[/code] (from before a seek), [code]frames_skipped[/code] (decoded on the way to a seek target), [code]settling[/code], [code]seek_target[/code], [code]position[/code] and [code]frame_time[/code].
+				Returns the decoder's [method V4L2Decoder.get_stats] plus [code]frames_shown[/code], [code]frames_dropped[/code] (late), [code]frames_stale[/code] (from before a seek), [code]frames_skipped[/code] (decoded on the way to a seek target), [code]settling[/code], [code]seek_target[/code], [code]position[/code], [code]frame_time[/code] and [code]next_preroll_seconds[/code] (from [method set_next] until the next item's first frame was ready; -1 until then).
 			</description>
 		</method>
 		<method name="get_system_stats" qualifiers="static">
@@ -118,6 +124,12 @@
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] once a frame is on screen.
+			</description>
+		</method>
+		<method name="is_finished" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] once the input has ended, every frame was shown, and the last one has been up for its duration (one frame at the stream's rate). With a [MediaSource] whose audio has finished, [code]true[/code] as soon as the last frame is shown: the audio clock stops at the end of the audio. The boundary is the end of the video, so audio that runs on past it is cut.
 			</description>
 		</method>
 		<method name="is_playing" qualifiers="const">
@@ -167,6 +179,21 @@
 				Sets the clock to 0 and decodes from the start again. The current frame stays on screen until the first new one.
 			</description>
 		</method>
+		<method name="set_next">
+			<return type="void" />
+			<param index="0" name="next" type="HWVideoTexture" />
+			<description>
+				The next item, for a change without a gap (groundwork for a playlist). [param next] is opened with [method open_source] and not played. From now on this texture's [method update] also updates [param next], which decodes and holds its first frame (a few frames ahead at most: its decoder's lead time) and then waits. Its [MediaSource] reads ahead its queues and stops. Once this one [method is_finished], [method update] calls [method swap_planes_with], so a material that samples this texture's plane textures goes on with [param next]'s frames, without changing a parameter. It then calls [method HWVideoTexture.play] on [param next] and emits [signal next_started]. From there on, call [method update] on [param next], with the clock of its source's audio stream, and close this one.
+				The swap happens in the [method update] in which this item's last frame has been shown for its duration: the next item's first frame is on screen at the next draw. On the host's software path, the next item was ready 40 ms after this call. While it waited, its threads used 0.3 % of a core and it held about 60 MB more. The hardware path holds a second set of decoder buffers meanwhile. [code]next_preroll_seconds[/code] in [method get_stats] is the time until its first frame was ready. [code]null[/code]: none.
+			</description>
+		</method>
+		<method name="swap_planes_with">
+			<return type="void" />
+			<param index="0" name="other" type="HWVideoTexture" />
+			<description>
+				Exchanges the plane textures ([method get_plane_texture]) with [param other]'s and points each set at its new owner's current frame (the placeholder if it has none yet). A material that samples the textures this one had now shows [param other]'s frames, and the other way round. [signal format_changed] is emitted on both, since the two may differ in size and packing. [method set_next] uses it at the end of an item; call it directly to change items somewhere else.
+			</description>
+		</method>
 		<method name="update">
 			<return type="void" />
 			<param index="0" name="delta" type="float" />
@@ -197,7 +224,13 @@
 	<signals>
 		<signal name="format_changed">
 			<description>
-				Emitted when a new set of decoder buffers was imported: the decoded size or visible rectangle may have changed.
+				Emitted when a new set of decoder buffers was imported: the decoded size or visible rectangle may have changed. Also emitted on both by [method swap_planes_with].
+			</description>
+		</signal>
+		<signal name="next_started">
+			<param index="0" name="next" type="HWVideoTexture" />
+			<description>
+				Emitted by [method update] when the item set with [method set_next] has taken over the plane textures and started playing. Play its source's audio stream now, update [param next] from the next frame on, and close this one.
 			</description>
 		</signal>
 	</signals>

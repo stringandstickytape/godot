@@ -337,6 +337,7 @@ bool HWVideoTexture::_check_seek() {
 void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	if (software) {
 		_update_software(p_delta, p_master_clock);
+		_check_next();
 		return;
 	}
 	if (decoder.is_null() || !decoder->is_open()) {
@@ -395,6 +396,73 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	if (_select_due(decoder->get_state() == V4L2Decoder::STATE_ENDED, show)) {
 		_show(show, frames_drawn);
 	}
+	_check_next();
+}
+
+/* The next item (#44) */
+
+// Points the plane textures at the frame on screen (the placeholder if none).
+void HWVideoTexture::_point_planes() {
+	for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+		RID rid;
+		if (software) {
+			rid = software_shown >= 0 ? software_rs[p] : RID();
+		} else if (shown >= 0) {
+			rid = buffers[shown].planes[p];
+		} else if (have_orphan) {
+			rid = orphan.planes[p];
+		}
+		plane_textures[p]->set_source(rid, rid.is_valid() ? plane_sizes[p] : Size2i());
+	}
+}
+
+void HWVideoTexture::swap_planes_with(const Ref<HWVideoTexture> &p_other) {
+	ERR_FAIL_COND(p_other.is_null() || p_other.ptr() == this);
+	for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+		SWAP(plane_textures[p], p_other->plane_textures[p]);
+	}
+	_point_planes();
+	p_other->_point_planes();
+	emit_signal(SNAME("format_changed"));
+	p_other->emit_signal(SNAME("format_changed"));
+}
+
+void HWVideoTexture::set_next(const Ref<HWVideoTexture> &p_next) {
+	ERR_FAIL_COND_MSG(p_next.ptr() == this, "HWVideoTexture: an item can't be its own next.");
+	next = p_next;
+	next_set_usec = OS::get_singleton()->get_ticks_usec();
+	next_preroll_seconds = -1.0;
+}
+
+bool HWVideoTexture::is_finished() const {
+	const bool input_ended = software ? software->is_ended() : (decoder.is_valid() && decoder->is_open() && decoder->get_state() == V4L2Decoder::STATE_ENDED);
+	if (!input_ended || !ready.is_empty() || !has_frame() || frame_time < 0.0) {
+		return false;
+	}
+	if (source.is_valid() && source->has_audio() && source->is_audio_finished()) {
+		return true; // The audio clock stops at the end of the audio.
+	}
+	const double fps = source.is_valid() ? source->get_video_stream_info().fps : 0.0;
+	return clock >= frame_time + (fps > 0.0 ? 1.0 / fps : 0.0) - 1e-4;
+}
+
+// After this frame's update(): preroll the next item; at the end of this one, hand it the plane textures.
+void HWVideoTexture::_check_next() {
+	if (next.is_null()) {
+		return;
+	}
+	next->update(0.0, -1.0); // Not playing: it decodes and shows its first frame, then waits (its lead time).
+	if (next_preroll_seconds < 0.0 && next->has_frame()) {
+		next_preroll_seconds = (OS::get_singleton()->get_ticks_usec() - next_set_usec) / 1e6;
+	}
+	if (!next->has_frame() || !is_finished()) {
+		return;
+	}
+	const Ref<HWVideoTexture> incoming = next;
+	next.unref();
+	swap_planes_with(incoming);
+	incoming->play();
+	emit_signal(SNAME("next_started"), incoming);
 }
 
 // Q08C (UBWC) buffers that don't import: reopen the decoder with linear NV12 and carry on from the same time. Once: the
@@ -686,6 +754,7 @@ Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
 }
 
 void HWVideoTexture::close() {
+	next.unref(); // Still open: the caller's to close.
 	if (RS::get_singleton() != nullptr) {
 		Array to_free;
 		for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
@@ -786,6 +855,7 @@ Dictionary HWVideoTexture::get_stats() const {
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
 	d["process_cpu_seconds"] = cpu.tv_sec + cpu.tv_nsec * 1e-9;
 	d["frames_shown"] = frames_shown;
+	d["next_preroll_seconds"] = next_preroll_seconds;
 	d["frames_dropped"] = frames_dropped;
 	d["frames_stale"] = frames_stale;
 	d["frames_skipped"] = frames_skipped;
@@ -1073,6 +1143,10 @@ void HWVideoTexture::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_position"), &HWVideoTexture::get_position);
 	ClassDB::bind_method(D_METHOD("get_frame_time"), &HWVideoTexture::get_frame_time);
 	ClassDB::bind_method(D_METHOD("has_frame"), &HWVideoTexture::has_frame);
+	ClassDB::bind_method(D_METHOD("set_next", "next"), &HWVideoTexture::set_next);
+	ClassDB::bind_method(D_METHOD("get_next"), &HWVideoTexture::get_next);
+	ClassDB::bind_method(D_METHOD("is_finished"), &HWVideoTexture::is_finished);
+	ClassDB::bind_method(D_METHOD("swap_planes_with", "other"), &HWVideoTexture::swap_planes_with);
 	ClassDB::bind_method(D_METHOD("get_decoder"), &HWVideoTexture::get_decoder);
 	ClassDB::bind_method(D_METHOD("get_plane_texture", "plane"), &HWVideoTexture::get_plane_texture);
 	ClassDB::bind_method(D_METHOD("get_plane_rd_rid", "plane"), &HWVideoTexture::get_plane_rd_rid);
@@ -1102,4 +1176,5 @@ void HWVideoTexture::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_stats"), &HWVideoTexture::get_stats);
 
 	ADD_SIGNAL(MethodInfo("format_changed"));
+	ADD_SIGNAL(MethodInfo("next_started", PropertyInfo(Variant::OBJECT, "next", PROPERTY_HINT_RESOURCE_TYPE, "HWVideoTexture")));
 }
