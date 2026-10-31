@@ -48,6 +48,9 @@ struct AVFormatContext;
 struct AVFrame;
 struct AVPacket;
 struct SwrContext;
+struct AVIOContext;
+
+class SmbFile;
 
 class AudioStreamMedia;
 
@@ -202,6 +205,11 @@ private:
 	int output_rate = 48000;
 	uint64_t ring_capacity = 0;
 
+	// smb://host/share/path: the file is read by an SmbFile (readahead thread) through a custom AVIOContext.
+	SmbFile *smb_file = nullptr;
+	AVIOContext *avio = nullptr;
+	int64_t network_buffer_size = 16 << 20;
+
 	Thread thread;
 
 	// Shared, under mutex. Never held while reading the file or decoding.
@@ -298,6 +306,7 @@ private:
 	static void _config_to_annexb(const uint8_t *p_data, int p_size, bool p_hevc, LocalVector<uint8_t> &r_out);
 
 	void _set_error(const String &p_message);
+	void _close_network();
 	double _media_time(int64_t p_ts, int p_stream) const;
 	bool _is_annexb_codec() const { return video.codec == VIDEO_CODEC_H264 || video.codec == VIDEO_CODEC_HEVC; }
 
@@ -373,6 +382,10 @@ public:
 	bool is_eof() const;
 	State get_state() const;
 	String get_last_error() const;
+
+	static void set_smb_credentials(const String &p_host, const String &p_user, const String &p_password, const String &p_domain = String());
+	void set_network_buffer_size(int64_t p_bytes);
+	int64_t get_network_buffer_size() const { return network_buffer_size; }
 	Dictionary get_stats() const;
 
 	Ref<AudioStreamMedia> get_audio_stream();

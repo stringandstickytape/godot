@@ -5,6 +5,7 @@
 	</brief_description>
 	<description>
 		Opens a file with FFmpeg's libavformat and reads it on a worker thread. The video stream is only demuxed: its access units go, in Annex-B for H.264 and HEVC (converted from MP4/Matroska's length-prefixed form with the [code]h264_mp4toannexb[/code] / [code]hevc_mp4toannexb[/code] bitstream filters), through a bounded queue to a [V4L2Decoder] ([method V4L2Decoder.open_source], [method HWVideoTexture.open_source]). The first access unit after [method open] and after every [method seek] is a keyframe with the parameter sets (VPS/SPS/PPS) in band.
+		Files on a file share open by URL: [code]smb://host/share/path/file.mkv[/code] (SMB2/3, see [method set_smb_credentials] and [member network_buffer_size]). A thread of their own reads them ahead into a ring buffer, so network latency doesn't reach the demuxer.
 		Subtitle tracks can be selected too ([method select_subtitle_track], [method read_subtitle_event]): text tracks are decoded to text and ASS lines, bitmap tracks passed through as packets.
 		The selected audio track is decoded and resampled with libswresample to stereo float at the [AudioServer] mix rate, into a ring buffer that [method get_audio_stream] plays. More than two channels are downmixed (centre and surrounds at -3 dB, LFE dropped); the source layout is in [method get_audio_tracks]. The playback position of that stream is the A/V master clock.
 		All times are media seconds: the stream timestamp minus the file's start time ([method get_start_time]), so the first frame is at about 0. The thread blocks when the queues are full ([member video_queue_seconds], [member audio_queue_seconds]) and is woken when they are consumed; it never spins.
@@ -112,7 +113,8 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns counters: [code]packets_read[/code], [code]bytes_read[/code], [code]video_packets[/code], [code]video_bytes[/code], [code]video_skipped[/code] (before the first keyframe), [code]video_parameter_sets_added[/code], [code]video_queue[/code], [code]video_queue_bytes[/code], [code]audio_packets[/code], [code]audio_frames_out[/code], [code]audio_decode_errors[/code], [code]audio_dropped_frames[/code] (before a seek target), [code]audio_silence_frames[/code], [code]audio_buffered[/code] (seconds), [code]audio_position[/code], [code]audio_underruns[/code], [code]audio_frames_mixed[/code], [code]audio_finished[/code], [code]read_errors[/code], [code]seeks[/code], [code]seek_retries[/code], [code]subtitle_events[/code], [code]subtitle_decode_errors[/code], [code]subtitle_queue[/code], [code]thread_cpu_seconds[/code] (CPU time of the demux thread), [code]serial[/code], [code]eof[/code], [code]state[/code], [code]state_name[/code], [code]last_error[/code].
+				Returns counters: [code]packets_read[/code], [code]bytes_read[/code], [code]video_packets[/code], [code]video_bytes[/code], [code]video_skipped[/code] (before the first keyframe), [code]video_parameter_sets_added[/code], [code]video_queue[/code], [code]video_queue_bytes[/code], [code]audio_packets[/code], [code]audio_frames_out[/code], [code]audio_decode_errors[/code], [code]audio_dropped_frames[/code] (before a seek target), [code]audio_silence_frames[/code], [code]audio_buffered[/code] (seconds), [code]audio_position[/code], [code]audio_underruns[/code], [code]audio_frames_mixed[/code], [code]audio_finished[/code], [code]read_errors[/code], [code]seeks[/code], [code]seek_retries[/code], [code]subtitle_events[/code], [code]subtitle_decode_errors[/code], [code]subtitle_queue[/code], [code]thread_cpu_seconds[/code] (CPU time of the demux thread), [code]serial[/code], [code]eof[/code], [code]state[/code], [code]state_name[/code], [code]last_error[/code], [code]network[/code] ([code]true[/code] for smb:// files).
+				For smb:// files also: [code]net_buffer_bytes[/code] (ring size), [code]net_buffered_bytes[/code] (read ahead of the demuxer's position), [code]net_bytes_read[/code], [code]net_requests[/code], [code]net_resets[/code] (seeks outside the buffered range), [code]net_waits[/code] (reads that had to wait for the network), [code]net_stalls[/code] (of those, waits while reading on, not right after a seek: the network didn't keep up), [code]net_wait_seconds[/code], [code]net_reconnects[/code], [code]net_errors[/code], [code]net_read_mbps[/code] (Mbit/s while requests were in flight: the link's rate), [code]net_average_mbps[/code] (since open), [code]net_busy_seconds[/code], [code]net_thread_cpu_seconds[/code] (CPU time of the readahead thread).
 			</description>
 		</method>
 		<method name="get_subtitle_header" qualifiers="const">
@@ -168,7 +170,8 @@
 			<return type="int" enum="Error" />
 			<param index="0" name="path" type="String" />
 			<description>
-				Opens a file, reads its stream information, selects the default audio track and starts reading.
+				Opens a file, reads its stream information, selects the default audio track and starts reading. Blocks while it reads the start of the file.
+				[param path] is a local path, a [code]res://[/code] or [code]user://[/code] path, or [code]smb://host/share/path/file[/code] (not URL-encoded: names are written as they are). For an smb:// file, the host is connected and logged into with the credentials of [method set_smb_credentials] (else as guest), which can take up to about 8 s per step when the host doesn't answer: open from a worker thread if the caller must not stall. Errors are sentences for the user in [method get_last_error], for example "Access denied: HOST refused the user name or password." or "Not found: share/path on HOST.".
 			</description>
 		</method>
 		<method name="read_video_packet">
@@ -191,6 +194,16 @@
 				Selects an audio track (-1: none). While open, this seeks to the current position, because the queues already hold the old track's audio.
 			</description>
 		</method>
+		<method name="set_smb_credentials" qualifiers="static">
+			<return type="void" />
+			<param index="0" name="host" type="String" />
+			<param index="1" name="user" type="String" />
+			<param index="2" name="password" type="String" />
+			<param index="3" name="domain" type="String" default="&quot;&quot;" />
+			<description>
+				Sets the credentials for smb:// files on [param host] (as it appears in the URL; not case-sensitive), shared with [MediaBrowser] ([method MediaBrowser.set_smb_credentials] is the same). [param domain] is the host's computer name or workgroup for a local account, or empty. An empty user and password remove the entry. Kept in memory only; never logged, never part of a path. NTLMSSP authentication; signing is used when the server requires it (AES-CMAC, with the CPU's AES instructions when it has them).
+			</description>
+		</method>
 	</methods>
 	<members>
 		<member name="audio_decoder_options" type="Dictionary" setter="set_audio_decoder_options" getter="get_audio_decoder_options" default="{}">
@@ -201,6 +214,9 @@
 		</member>
 		<member name="downmix_normalize" type="bool" setter="set_downmix_normalize" getter="is_downmix_normalize" default="false">
 			If [code]true[/code], the downmix to stereo is scaled so no sum can exceed full scale (about 7.7 dB quieter for 5.1). Set before [method open].
+		</member>
+		<member name="network_buffer_size" type="int" setter="set_network_buffer_size" getter="get_network_buffer_size" default="16777216">
+			Size in bytes of the readahead ring of smb:// files (4 MiB to 256 MiB; applies at the next [method open]). Reads of up to 1 MiB, up to 4 in flight; 1/8 of the ring is kept behind the read position for short backward seeks, the rest is read ahead. After a seek outside the ring the readahead starts at 256 KiB and doubles as the file is read on. A lost connection is reopened (5 tries, 0.5 s to 8 s apart) and the reading resumes where it stopped; after that the source goes to [constant STATE_ERROR] with the reason in [method get_last_error].
 		</member>
 		<member name="video_queue_seconds" type="float" setter="set_video_queue_seconds" getter="get_video_queue_seconds" default="1.0">
 			Video access units to keep queued, in seconds of frames. Set before [method open].

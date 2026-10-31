@@ -22,4 +22,18 @@ for lib in ffmpeg_libs:
 env_hwvideo.Append(CCFLAGS=["-isystem", os.path.join(ffmpeg_prefix, "include")])
 env.Append(LIBS=[File(os.path.join(ffmpeg_prefix, "lib", "lib%s.a" % lib)) for lib in ffmpeg_libs] + ["m", "atomic"])
 
+# libsmb2 (SMB2/3 client), static, built by build/libsmb2-build.sh into ~/src/libsmb2-<arch> with the player's patches.
+# HWVIDEO_LIBSMB2_PREFIX overrides the prefix.
+libsmb2_prefix = os.environ.get("HWVIDEO_LIBSMB2_PREFIX", os.path.expanduser("~/src/libsmb2-" + ffmpeg_arch))
+libsmb2_lib = None
+for libdir in ["lib", "lib64"]:
+    candidate = os.path.join(libsmb2_prefix, libdir, "libsmb2.a")
+    if os.path.isfile(candidate):
+        libsmb2_lib = candidate
+if libsmb2_lib is None:
+    print("hwvideo: libsmb2.a not found in %s/lib. Build it first: build/libsmb2-build.sh %s" % (libsmb2_prefix, ffmpeg_arch))
+    Exit(255)
+env_hwvideo.Append(CCFLAGS=["-isystem", os.path.join(libsmb2_prefix, "include")])
+env.Append(LIBS=[File(libsmb2_lib)])
+
 env_hwvideo.add_source_files(env.modules_sources, "*.cpp")

@@ -31,6 +31,7 @@
 #include "media_source.h"
 
 #include "audio_stream_media.h"
+#include "smb_client.h"
 
 #include "core/config/project_settings.h"
 #include "core/object/class_db.h"
@@ -53,6 +54,7 @@ extern "C" {
 }
 
 static constexpr double SQRT_HALF = 0.70710678118654752440;
+static constexpr int AVIO_BUFFER_SIZE = 256 << 10; // smb:// files: FFmpeg's read buffer in front of the SmbFile ring.
 
 static double thread_cpu_seconds() {
 	struct timespec ts;
@@ -976,6 +978,10 @@ bool MediaSource::_read_packet() {
 			eof_reached = true;
 		} else if (r == AVERROR(EAGAIN)) {
 			OS::get_singleton()->delay_usec(1000);
+		} else if (smb_file && smb_file->has_failed()) {
+			dstats.read_errors++;
+			_set_error(smb_file->get_error());
+			eof_reached = true;
 		} else {
 			dstats.read_errors++;
 			if (++read_errors_in_row >= 64) {
@@ -1220,11 +1226,38 @@ Error MediaSource::open(const String &p_path) {
 	}
 	dstats = Stats();
 	path = p_path;
-	const String global_path = ProjectSettings::get_singleton() ? ProjectSettings::get_singleton()->globalize_path(p_path) : p_path;
+	const bool network = SmbUrl::is_smb(p_path);
+	const String global_path = network || !ProjectSettings::get_singleton() ? p_path : ProjectSettings::get_singleton()->globalize_path(p_path);
 
 	AVFormatContext *context = nullptr;
+	if (network) {
+		// Blocking: connect, log in, open (up to about 8 s each when the host doesn't answer).
+		String error;
+		smb_file = memnew(SmbFile);
+		if (smb_file->open(p_path, (uint64_t)network_buffer_size, error) != OK) {
+			_close_network();
+			_set_error(error);
+			return ERR_FILE_CANT_OPEN;
+		}
+		print_line(vformat("MediaSource: %s: %.2f GB over %s.", p_path, (double)smb_file->get_size() / 1e9, smb_file->get_description()));
+		uint8_t *buffer = (uint8_t *)av_malloc(AVIO_BUFFER_SIZE);
+		avio = buffer ? avio_alloc_context(buffer, AVIO_BUFFER_SIZE, 0, smb_file, &SmbFile::avio_read, nullptr, &SmbFile::avio_seek) : nullptr;
+		context = avio ? avformat_alloc_context() : nullptr;
+		if (!context) {
+			if (!avio) {
+				av_free(buffer);
+			}
+			_close_network();
+			_set_error("Out of memory.");
+			return ERR_OUT_OF_MEMORY;
+		}
+		context->pb = avio;
+		context->flags |= AVFMT_FLAG_CUSTOM_IO;
+	}
 	int r = avformat_open_input(&context, global_path.utf8().get_data(), nullptr, nullptr);
 	if (r < 0) {
+		// avformat_open_input() freed the context; a custom AVIOContext stays ours.
+		_close_network();
 		_set_error(vformat("Can't open %s: %s.", global_path, _av_error(r)));
 		return ERR_FILE_CANT_OPEN;
 	}
@@ -1438,7 +1471,22 @@ Error MediaSource::open(const String &p_path) {
 	return OK;
 }
 
+void MediaSource::_close_network() {
+	if (avio) {
+		av_freep(&avio->buffer);
+		avio_context_free(&avio);
+	}
+	if (smb_file) {
+		smb_file->close();
+		memdelete(smb_file);
+		smb_file = nullptr;
+	}
+}
+
 void MediaSource::_close_internal() {
+	if (smb_file) {
+		smb_file->abort(); // The demux thread may wait for network data.
+	}
 	if (thread.is_started()) {
 		{
 			MutexLock lock(mutex);
@@ -1462,6 +1510,7 @@ void MediaSource::_close_internal() {
 	if (format) {
 		avformat_close_input(&format);
 	}
+	_close_network();
 	video = VideoInfo();
 	swr_description = String();
 	audio_tracks.clear();
@@ -1742,6 +1791,24 @@ Dictionary MediaSource::get_stats() const {
 	d["thread_cpu_seconds"] = stats.thread_cpu_seconds;
 	d["seeks"] = seek_count;
 	d["last_error"] = last_error;
+	d["network"] = smb_file != nullptr;
+	if (smb_file) {
+		const SmbFile::Stats n = smb_file->get_stats();
+		d["net_buffer_bytes"] = n.buffer_size;
+		d["net_buffered_bytes"] = n.buffered;
+		d["net_bytes_read"] = n.bytes_read;
+		d["net_requests"] = n.requests;
+		d["net_resets"] = n.resets;
+		d["net_waits"] = n.waits;
+		d["net_stalls"] = n.stalls;
+		d["net_wait_seconds"] = n.wait_seconds;
+		d["net_reconnects"] = n.reconnects;
+		d["net_errors"] = n.errors;
+		d["net_read_mbps"] = n.busy_seconds > 0.0 ? (double)n.bytes_read * 8.0 / n.busy_seconds / 1e6 : 0.0;
+		d["net_average_mbps"] = n.open_seconds > 0.0 ? (double)n.bytes_read * 8.0 / n.open_seconds / 1e6 : 0.0;
+		d["net_busy_seconds"] = n.busy_seconds;
+		d["net_thread_cpu_seconds"] = n.thread_cpu_seconds;
+	}
 	{
 		MutexLock audio_lock(audio_mutex);
 		d["audio_buffered"] = output_rate > 0 ? (double)(ring_write - ring_read) / output_rate : 0.0;
@@ -1844,6 +1911,14 @@ void MediaSource::set_downmix_normalize(bool p_normalize) {
 	downmix_normalize = p_normalize;
 }
 
+void MediaSource::set_smb_credentials(const String &p_host, const String &p_user, const String &p_password, const String &p_domain) {
+	SmbCredentials::set(p_host, p_user, p_password, p_domain);
+}
+
+void MediaSource::set_network_buffer_size(int64_t p_bytes) {
+	network_buffer_size = CLAMP(p_bytes, (int64_t)4 << 20, (int64_t)256 << 20); // Applies at the next open().
+}
+
 void MediaSource::set_audio_decoder_options(const Dictionary &p_options) {
 	SETTING_GUARD();
 	audio_decoder_options = p_options.duplicate();
@@ -1893,6 +1968,9 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_audio_queue_seconds"), &MediaSource::get_audio_queue_seconds);
 	ClassDB::bind_method(D_METHOD("set_downmix_normalize", "normalize"), &MediaSource::set_downmix_normalize);
 	ClassDB::bind_method(D_METHOD("is_downmix_normalize"), &MediaSource::is_downmix_normalize);
+	ClassDB::bind_static_method("MediaSource", D_METHOD("set_smb_credentials", "host", "user", "password", "domain"), &MediaSource::set_smb_credentials, DEFVAL(String()));
+	ClassDB::bind_method(D_METHOD("set_network_buffer_size", "bytes"), &MediaSource::set_network_buffer_size);
+	ClassDB::bind_method(D_METHOD("get_network_buffer_size"), &MediaSource::get_network_buffer_size);
 	ClassDB::bind_method(D_METHOD("set_audio_decoder_options", "options"), &MediaSource::set_audio_decoder_options);
 	ClassDB::bind_method(D_METHOD("get_audio_decoder_options"), &MediaSource::get_audio_decoder_options);
 
@@ -1900,6 +1978,7 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "audio_queue_seconds"), "set_audio_queue_seconds", "get_audio_queue_seconds");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "network_buffer_size", PROPERTY_HINT_RANGE, "4194304,268435456,1048576,suffix:B"), "set_network_buffer_size", "get_network_buffer_size");
 
 	BIND_ENUM_CONSTANT(STATE_CLOSED);
 	BIND_ENUM_CONSTANT(STATE_READING);

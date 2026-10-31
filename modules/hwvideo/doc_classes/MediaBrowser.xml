@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="MediaBrowser" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Lists SMB shares and folders, and local folders, for a file browser.
+	</brief_description>
+	<description>
+		Paths are [code]smb://host[/code] (the host's shares), [code]smb://host/share/folder/...[/code] (a folder on a share) or local paths. SMB paths are not URL-encoded: names with spaces, [code]#[/code] or [code]%[/code] are written as they are. SMB2 and SMB3 (with signing; no Kerberos, no SMB1), logged in with the credentials given by [method set_smb_credentials] for the host, else as guest.
+		Every call blocks for network round trips (up to [member timeout] seconds each when a host doesn't answer): call it from a worker thread, for example a [WorkerThreadPool] task. One connection is kept per object and reused while the host and share stay the same; a connection the server dropped meanwhile is replaced once, silently. Calls on one object are serialized.
+		[codeblock]
+		MediaBrowser.set_smb_credentials("192.168.2.10", "user", password, "")
+		var browser := MediaBrowser.new()
+		var entries := browser.list_dir("smb://192.168.2.10/Films")
+		if entries.is_empty() and browser.get_last_error() != "":
+		    print(browser.get_last_error())
+		[/codeblock]
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="disconnect_host">
+			<return type="void" />
+			<description>
+				Closes the kept connection, if any.
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				Why the last call returned nothing, as a sentence for the user: for example "Access denied: HOST refused the user name or password.", "HOST has no share named \"X\".", "Not found: share/folder on HOST.", "Can't reach HOST: connection refused (is file sharing on, and port 445 open?).", "No answer from HOST within 8 s.", "Can't find the host NAME: the name doesn't resolve.". Empty after a call that succeeded (an empty folder is not an error). Never contains the password.
+			</description>
+		</method>
+		<method name="list_dir">
+			<return type="Array" />
+			<param index="0" name="path" type="String" />
+			<description>
+				Returns one Dictionary per entry: [code]name[/code], [code]is_dir[/code], [code]size[/code] (bytes; 0 for folders), [code]mtime[/code] (Unix time). Folders first, then by name in natural order, ignoring case; no [code].[/code] and [code]..[/code], no names starting with a dot unless [member include_hidden]. For [code]smb://host[/code], the host's shares as folders (see [method list_shares]). Empty on an error: see [method get_last_error].
+			</description>
+		</method>
+		<method name="list_shares">
+			<return type="String[]" />
+			<param index="0" name="host" type="String" />
+			<description>
+				Returns the names of the host's shared folders, sorted: no printers, no IPC$, no hidden or administrative shares (names ending in [code]$[/code]). Uses the server service over DCE/RPC on IPC$. Some servers or policies don't allow listing shares; then the result is empty and [method get_last_error] says so, and the user has to type the share name.
+			</description>
+		</method>
+		<method name="set_smb_credentials" qualifiers="static">
+			<return type="void" />
+			<param index="0" name="host" type="String" />
+			<param index="1" name="user" type="String" />
+			<param index="2" name="password" type="String" />
+			<param index="3" name="domain" type="String" default="&quot;&quot;" />
+			<description>
+				Sets the credentials for [param host] (as it appears in paths; not case-sensitive), for [MediaBrowser] and [MediaSource] alike (it is the same as [method MediaSource.set_smb_credentials]). [param domain] is the host's computer name or workgroup for a local account, or empty. An empty user and password remove the entry. The password is kept in memory only, and never logged. A connection already open keeps the credentials it logged in with: call [method disconnect_host] after changing them.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="include_hidden" type="bool" setter="set_include_hidden" getter="get_include_hidden" default="false">
+			If [code]true[/code], [method list_dir] also lists names that start with a dot.
+		</member>
+		<member name="timeout" type="float" setter="set_timeout" getter="get_timeout" default="8.0">
+			Seconds to wait for each step (connect, log in, list) before giving up with "No answer from HOST".
+		</member>
+	</members>
+</class>
