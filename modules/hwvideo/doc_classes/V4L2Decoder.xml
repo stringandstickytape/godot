@@ -92,6 +92,13 @@
 				VP9 (profiles 0 and 2): one container packet (a frame or a superframe) per OUTPUT buffer, [code]VP90[/code] on OUTPUT, the container's frame size for its format; after a seek the keyframe resets every reference, so there is no end-of-sequence NAL unit and no flush ([member seek_eos] doesn't apply). Only one [V4L2Decoder] in the process holds a VP9 session at a time (two at once crash the Frame's decoder firmware): another one's [method open_source] of VP9 fails with [constant ERR_BUSY] until the first is closed ([method is_vp9_session_live]). A VP9 session stops itself with state [constant STATE_ERROR] when the decoder looks broken: 3 failed DQBUFs in a row, 8 buffers in a row flagged as errors, no picture 4 s after 3 access units were fed, or the general hang check ([member timeout_ms]); [method is_decoder_fault] is then [code]true[/code] and hardware VP9 stays off for the rest of the run ([method get_vp9_disabled_reason]). A 10-bit VP9 stream that is offered no P010 on CAPTURE fails with [method is_format_error] [code]true[/code], and later 10-bit VP9 streams get the 10-bit reason in [code]hw_unsupported_reason[/code]. [HWVideoTexture] goes on in software in both cases.
 			</description>
 		</method>
+		<method name="split_vp9_packet" qualifiers="static">
+			<return type="Array" />
+			<param index="0" name="packet" type="PackedByteArray" />
+			<description>
+				The frames of a VP9 packet as the decoder is fed them: FFmpeg's [code]vp9_superframe_split[/code] splits a superframe (a hidden alt-ref frame and a shown one in one container packet) into its frames, one OUTPUT buffer each. One [Dictionary] per frame, with [code]data[/code] and [code]hidden[/code] (not shown). A plain frame comes back as it is; empty if the filter is missing or refuses the packet.
+			</description>
+		</method>
 		<method name="probe_vp9_packet" qualifiers="static">
 			<return type="Dictionary" />
 			<param index="0" name="packet" type="PackedByteArray" />
@@ -158,6 +165,9 @@
 		</member>
 		<member name="capture_format" type="String" setter="set_capture_format" getter="get_capture_format" default="&quot;Q08C&quot;">
 			CAPTURE fourcc to ask for after SOURCE_CHANGE for 8-bit streams, or empty for the driver's choice. [HWVideoTexture] can import NV12 and [code]Q08C[/code] (Qualcomm UBWC-compressed NV12, imported with [code]DRM_FORMAT_MOD_QCOM_COMPRESSED[/code]). Q08C is the default: on the Frame it shows the same picture as NV12 with less memory traffic. If its import fails, [HWVideoTexture] reopens the decoder with NV12 once and carries on. If the driver doesn't offer the format, it picks another (logged). 10-bit streams ignore this (see [method is_p010_available]).
+		</member>
+		<member name="q10c_ycbcr" type="bool" setter="set_q10c_ycbcr" getter="is_q10c_ycbcr" default="false">
+			10-bit streams (HEVC Main 10, VP9 profile 2) decode to [code]Q10C[/code] when the driver offers no P010 (or [code]HWVIDEO_P010=0[/code] is set), for [HWVideoTexture]'s import through a YCbCr sampler ([method DmabufImage.import_ycbcr]). [method HWVideoTexture.open_source] sets it when [method DmabufImage.is_q10c_available] is true. Set it while closed.
 		</member>
 		<member name="experimental_10bit" type="bool" setter="set_experimental_10bit" getter="is_experimental_10bit" default="false">
 			Decode 10-bit HEVC to [code]Q10C[/code] (the only correct 10-bit output of the Frame's 6.18 kernel) for [HWVideoTexture]'s experimental import (see [member HWVideoTexture.q10c_view]). Off: 10-bit streams are refused with a readable reason (see [code]hw_unsupported_reason[/code] in [method MediaSource.get_video_info]). For a 10-bit stream the decoder logs the CAPTURE formats the driver offers (a linear 10-bit format such as P010 would show there).

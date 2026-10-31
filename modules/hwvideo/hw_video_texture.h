@@ -75,6 +75,7 @@ public:
 		PACKING_TP10_RGBA8, // Q10C: each texel is a 32-bit word of three 10-bit samples, as R8G8B8A8 (bytes, little-endian).
 		PACKING_TP10_RGB10A2, // Q10C: the same words as A2B10G10R10: r, g, b are the three samples.
 		PACKING_P010, // Y as R16 (red), interleaved CbCr as R16G16 (red, green) at half size; 10 bits in the high bits.
+		// (Q10C through the YCbCr sampler is converted to these P010 planes on the GPU, so it reports PACKING_P010.)
 	};
 
 private:
@@ -88,6 +89,7 @@ private:
 	struct Buffer {
 		Ref<DmabufImage> image;
 		RID planes[DmabufImage::MAX_PLANES]; // RenderingServer textures of the image's plane views.
+		bool shared_planes = false; // Q10C (YCbCr): planes[] are the generation's out textures (ycbcr_rs), not this buffer's.
 		BufferStatus status = BUFFER_DECODER;
 		uint64_t release_frame = 0;
 	};
@@ -130,6 +132,26 @@ private:
 	void _fall_back_to_nv12();
 	// Q10C import experiment: "rgb10a2", "rgb10a2_mutable", "rgba8" or "rgba8_mutable" (see q10c_view in the docs).
 	String q10c_view = "rgb10a2_mutable";
+	// Q10C through the YCbCr sampler: the pass writes every shown buffer into these (Y R16, CbCr R16G16, as P010). The ones
+	// of the previous generation stay until its orphan buffer is gone.
+	RID ycbcr_rd[DmabufImage::MAX_PLANES];
+	RID ycbcr_rs[DmabufImage::MAX_PLANES];
+	RID ycbcr_old_rd[DmabufImage::MAX_PLANES];
+	RID ycbcr_old_rs[DmabufImage::MAX_PLANES];
+	String q10c_description; // The candidate in use ("" when this generation isn't Q10C through the YCbCr sampler).
+	String q10c_failure; // Set by _import_generation() or the picture check: update() then switches to software.
+	uint32_t q10c_check_serial = 0; // Picture checks of this texture (stale verdicts are ignored).
+	int q10c_checks_left = 0; // Flat frames are inconclusive: check a later one, a few times.
+	uint64_t q10c_check_at_frame = 0; // frames_shown at which to read the next frame back.
+	String q10c_verdict; // Of the last check.
+	void _free_ycbcr_textures(bool p_old_only);
+	Error _create_ycbcr_textures(const Size2i &p_size);
+	Error _import_q10c_buffers(const V4L2Decoder::CaptureLayout &p_layout);
+	void _request_q10c_check();
+	static void _render_thread_q10c_readback(RID p_texture, uint64_t p_object, uint32_t p_serial, Rect2i p_visible, int p_width);
+	static void _q10c_readback_done(const Vector<uint8_t> &p_data, uint64_t p_object, uint32_t p_serial, Rect2i p_visible, int p_width);
+	static void _q10c_verdict_main(uint64_t p_object, uint32_t p_serial, int p_result, const String &p_verdict);
+	void _on_q10c_verdict(uint32_t p_serial, int p_result, const String &p_verdict);
 
 	// Software path, for what the hardware path can't show (open_source() picks it). Null on the hardware path.
 	SoftwareVideoDecoder *software = nullptr;

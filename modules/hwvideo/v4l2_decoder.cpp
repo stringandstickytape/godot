@@ -34,6 +34,11 @@
 #include "core/object/class_db.h"
 #include "core/os/os.h"
 
+extern "C" {
+#include <libavcodec/bsf.h>
+#include <libavcodec/packet.h>
+}
+
 #include <fcntl.h>
 #include <linux/videodev2.h>
 #include <poll.h>
@@ -561,7 +566,7 @@ int V4L2Decoder::_queue_access_unit(uint32_t p_index, const AnnexBSplitter::Acce
 }
 
 // Queues OUTPUT buffer p_index, holding p_bytes of bitstream, under the next seq. 1: queued, -1: error.
-int V4L2Decoder::_qbuf_output(uint32_t p_index, uint64_t p_bytes) {
+int V4L2Decoder::_qbuf_output(uint32_t p_index, uint64_t p_bytes, bool p_counts_as_frame) {
 	struct v4l2_plane planes[1] = {};
 	planes[0].bytesused = (uint32_t)p_bytes;
 	planes[0].length = (uint32_t)output[p_index].length;
@@ -583,10 +588,145 @@ int V4L2Decoder::_qbuf_output(uint32_t p_index, uint64_t p_bytes) {
 	output_in_driver++;
 	seq++;
 	wstats.aus_queued++;
-	if (++fed_since_frame == VP9_UNANSWERED_AUS) {
+	if (p_counts_as_frame && ++fed_since_frame == VP9_UNANSWERED_AUS) {
 		t_unanswered = queue_time[(seq - 1) % QUEUE_RING];
 	}
 	return 1;
+}
+
+// VP9: the frames of a superframe, each in an OUTPUT buffer of its own (FFmpeg's vp9_superframe_split; the hidden alt-ref
+// frames too, which give no picture). The PTS of the packet goes with each of them; the shown frame decodes to the picture.
+void V4L2Decoder::_split_vp9_packet() {
+	vp9_held_split = true;
+	if (held.packet == nullptr || held.size < 2) {
+		return;
+	}
+	// Only superframes need the filter: they end with an index (marker 0b110mmfff, sizes, the marker again).
+	const uint8_t marker = held.data[held.size - 1];
+	if ((marker & 0xe0) != 0xc0) {
+		return;
+	}
+	if (!vp9_split_tried) {
+		vp9_split_tried = true;
+		const AVBitStreamFilter *filter = av_bsf_get_by_name("vp9_superframe_split");
+		int r = filter ? av_bsf_alloc(filter, &vp9_split) : AVERROR_BSF_NOT_FOUND;
+		if (r >= 0) {
+			vp9_split->par_in->codec_id = AV_CODEC_ID_VP9;
+			r = av_bsf_init(vp9_split);
+		}
+		if (r < 0) {
+			av_bsf_free(&vp9_split);
+			_log(vformat("WARNING: FFmpeg's vp9_superframe_split isn't available (%d); VP9 superframes go to the decoder whole.", r));
+		}
+	}
+	if (vp9_split == nullptr) {
+		return;
+	}
+	AVPacket *in = av_packet_alloc();
+	if (in == nullptr || av_packet_ref(in, held.packet) < 0 || av_bsf_send_packet(vp9_split, in) < 0) {
+		av_packet_free(&in);
+		av_bsf_flush(vp9_split);
+		_log_verbose(vformat("vp9_superframe_split refused the packet at %.3f s; it goes in whole.", held.pts));
+		return;
+	}
+	av_packet_free(&in); // av_bsf_send_packet() took its reference.
+	for (;;) {
+		AVPacket *out = av_packet_alloc();
+		if (out == nullptr || av_bsf_receive_packet(vp9_split, out) < 0) {
+			av_packet_free(&out);
+			break;
+		}
+		vp9_parts.push_back(out);
+	}
+	if (vp9_parts.size() <= 1) {
+		_drop_vp9_parts(); // One frame after all: the packet goes in as it is.
+		vp9_held_split = true;
+		return;
+	}
+	uint32_t hidden = 0;
+	for (const AVPacket *part : vp9_parts) {
+		hidden += part->pts == AV_NOPTS_VALUE && held.packet->pts != AV_NOPTS_VALUE ? 1 : 0;
+	}
+	if (wstats.vp9_superframes == 0) {
+		_log(vformat("VP9 superframes are split with vp9_superframe_split (the first at %.3f s: %d frames, %d hidden), one frame per OUTPUT buffer.", held.pts, vp9_parts.size(), hidden));
+	}
+	wstats.vp9_superframes++;
+	wstats.vp9_split_frames += vp9_parts.size();
+	wstats.vp9_hidden_frames += hidden;
+}
+
+void V4L2Decoder::_drop_vp9_parts() {
+	for (AVPacket *&part : vp9_parts) {
+		av_packet_free(&part);
+	}
+	vp9_parts.clear();
+	vp9_part = 0;
+	vp9_held_split = false;
+	if (vp9_split) {
+		av_bsf_flush(vp9_split);
+	}
+}
+
+// Source mode, VP9: queues the next frame of `held` into OUTPUT buffer p_index (the whole packet if it isn't a superframe),
+// and lets go of `held` after its last frame. 1: queued, 0: skipped (too large), -1: error.
+int V4L2Decoder::_queue_vp9_packet(uint32_t p_index) {
+	if (!vp9_held_split) {
+		_split_vp9_packet();
+		// Once per container packet: the bookkeeping of _queue_source_packet().
+		RecentAU &recent_au = recent[recent_count % RECENT_AUS];
+		recent_au.au = AnnexBSplitter::AccessUnit();
+		recent_au.au.size = held.size;
+		recent_au.au.sps_width = held.sps_width;
+		recent_au.au.sps_height = held.sps_height;
+		recent_au.media_index = media_index;
+		recent_au.pts = held.pts;
+		recent_count++;
+		if (media_index == 0) {
+			epoch_start_pts = held.pts;
+		}
+		media_index++;
+		input_time = held.pts;
+		if (held.sps_width) {
+			last_sps_size = Size2i(held.sps_width, held.sps_height);
+		}
+		wstats.vp9_packets++;
+	}
+	const uint8_t *data = held.data;
+	uint64_t size = held.size;
+	bool shown = true;
+	bool last = true;
+	if (!vp9_parts.is_empty()) {
+		const AVPacket *part = vp9_parts[vp9_part];
+		data = part->data;
+		size = (uint64_t)part->size;
+		shown = !(part->pts == AV_NOPTS_VALUE && held.packet->pts != AV_NOPTS_VALUE);
+		last = vp9_part + 1 >= vp9_parts.size();
+	}
+	int r = 0;
+	if (size > output[p_index].length) {
+		_log(vformat("VP9 frame at %.3f s (%d bytes) doesn't fit an OUTPUT buffer (%d bytes); skipped. Set output_buffer_size.", held.pts, size, output[p_index].length));
+		wstats.aus_skipped++;
+	} else {
+		memcpy(output[p_index].map, data, size);
+		queue_pts[seq % QUEUE_RING] = held.pts;
+		r = _qbuf_output(p_index, size, shown);
+	}
+	if (last) {
+		_drop_vp9_parts();
+		source->release_video_packet(held);
+		have_held = false;
+	} else {
+		vp9_part++;
+	}
+	return r;
+}
+
+void V4L2Decoder::_log_vp9_split_summary() {
+	if (!vp9 || wstats.vp9_packets == 0) {
+		return;
+	}
+	_log(vformat("VP9: %d packets fed; %d superframes split into %d frames (%d hidden) by vp9_superframe_split%s.", wstats.vp9_packets, wstats.vp9_superframes, wstats.vp9_split_frames,
+			wstats.vp9_hidden_frames, vp9_split_tried && vp9_split == nullptr ? " (the filter was missing: superframes went in whole)" : ""));
 }
 
 // Source mode: makes `held` the next access unit to feed. Access units read before the source's latest seek are dropped;
@@ -604,6 +744,7 @@ bool V4L2Decoder::_hold_source_packet() {
 			have_held = true;
 		}
 		if (held.serial != source->get_serial()) {
+			_drop_vp9_parts();
 			source->release_video_packet(held);
 			have_held = false;
 			continue;
@@ -653,6 +794,9 @@ bool V4L2Decoder::_hold_source_packet() {
 // Source mode: copies `held` into OUTPUT buffer p_index and queues it, with its PTS kept for the frame it decodes to.
 // With a pending end-of-sequence NAL unit (seek_eos), that goes in front, or alone into this buffer (`held` stays).
 int V4L2Decoder::_queue_source_packet(uint32_t p_index) {
+	if (vp9) {
+		return _queue_vp9_packet(p_index);
+	}
 	static const uint8_t h264_eos[] = { 0, 0, 0, 1, 0x0a }; // nal_unit_type 10, end of sequence.
 	static const uint8_t hevc_eos[] = { 0, 0, 0, 1, 0x48, 0x01 }; // nal_unit_type 36 (EOS_NUT), layer 0, TemporalId 0.
 	const uint8_t *eos = codec == AnnexBSplitter::CODEC_H264 ? h264_eos : hevc_eos;
@@ -718,7 +862,7 @@ int V4L2Decoder::_queue_input() {
 			// the frame rate), and never later than its own PTS. Not by DTS: Matroska has none (FFmpeg sets it to the PTS,
 			// which jumps around with B-frames).
 			const double due = MIN(epoch_start_pts + (double)media_index / fps, held.pts);
-			if (epochs[epochs.size() - 1].frames > 0 && due > worker_clock + lead_time) {
+			if (epochs[epochs.size() - 1].frames > 0 && due > worker_clock + lead_time && !(vp9 && vp9_held_split)) {
 				break;
 			}
 			const int index = _free_output_buffer();
@@ -909,9 +1053,13 @@ Error V4L2Decoder::_setup_capture() {
 		_log(vformat("CAPTURE formats offered for this VP9 stream: %s.", offered));
 	}
 
+	if (offers_p010 && is_10bit && is_p010_forced_off()) {
+		_log("HWVIDEO_P010=0: not using the P010 the driver offers.");
+		offers_p010 = false;
+	}
 	if (is_10bit && vp9) {
 		// The patched module's P010 may be there for HEVC and not for VP9: keep the HEVC answer, note the VP9 one.
-		if (!offers_p010 && !experimental_10bit) {
+		if (!offers_p010 && !experimental_10bit && !q10c_ycbcr) {
 			MediaSource::set_hw_vp9_p010_refused(true);
 			{
 				MutexLock lock(mutex);
@@ -923,8 +1071,8 @@ Error V4L2Decoder::_setup_capture() {
 	} else if (is_10bit) {
 		_note_p010_offered(offers_p010, offered);
 	}
-	// 10-bit: linear P010 when the driver offers it (a patched module); Q10C otherwise (experiment), the only correct 10-bit
-	// output of the stock 6.18 kernel (NV12 gets the low 8 bits of each sample).
+	// 10-bit: linear P010 when the driver offers it (a patched module); Q10C otherwise (the YCbCr import, or the old
+	// experiment), the only correct 10-bit output of the stock 6.18 kernel (NV12 gets the low 8 bits of each sample).
 	const uint32_t want_fourcc = is_10bit ? ((offers_p010 && !experimental_10bit) ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_QC10C) : capture_fourcc;
 	if (want_fourcc && format.fmt.pix_mp.pixelformat != want_fourcc) {
 		struct v4l2_format want = format;
@@ -953,7 +1101,7 @@ Error V4L2Decoder::_setup_capture() {
 		return FAILED;
 	}
 	// Only formats HWVideoTexture can show: anything else would be garbage on screen.
-	const bool importable = is_10bit ? (pf.pixelformat == V4L2_PIX_FMT_P010 || (experimental_10bit && pf.pixelformat == V4L2_PIX_FMT_QC10C)) : (pf.pixelformat == V4L2_PIX_FMT_NV12 || pf.pixelformat == V4L2_PIX_FMT_QC08C);
+	const bool importable = is_10bit ? (pf.pixelformat == V4L2_PIX_FMT_P010 || ((experimental_10bit || q10c_ycbcr) && pf.pixelformat == V4L2_PIX_FMT_QC10C)) : (pf.pixelformat == V4L2_PIX_FMT_NV12 || pf.pixelformat == V4L2_PIX_FMT_QC08C);
 	if (!importable) {
 		{
 			MutexLock lock(mutex);
@@ -1018,6 +1166,10 @@ Error V4L2Decoder::_setup_capture() {
 
 	uint32_t pitch = pf.plane_fmt[0].bytesperline;
 	uint64_t chroma_offset = 0;
+	uint64_t y_data_offset = 0;
+	uint64_t uv_data_offset = 0;
+	uint32_t y_meta_pitch = 0;
+	uint32_t uv_meta_pitch = 0;
 	const bool ubwc = pf.pixelformat == V4L2_PIX_FMT_QC08C || pf.pixelformat == V4L2_PIX_FMT_QC10C;
 	if (pf.pixelformat == V4L2_PIX_FMT_QC10C) {
 		// QC10C (UBWC-compressed TP10: three 10-bit samples in each 32-bit word, top 2 bits unused; W is a multiple of 192):
@@ -1038,6 +1190,10 @@ Error V4L2Decoder::_setup_capture() {
 		}
 		pitch = stride;
 		chroma_offset = y_meta + y_size;
+		y_data_offset = y_meta;
+		uv_data_offset = y_meta + y_size + uv_meta;
+		y_meta_pitch = (uint32_t)align((w + 47) / 48, 64);
+		uv_meta_pitch = (uint32_t)align(((w + 1) / 2 + 23) / 24, 64);
 		_log(vformat("QC10C layout: Y metadata %d bytes, Y %d, UV metadata %d, UV %d; total %d (sizeimage %d)%s.", (int64_t)y_meta, (int64_t)y_size, (int64_t)uv_meta, (int64_t)uv_size, (int64_t)total,
 				pf.plane_fmt[0].sizeimage, total == pf.plane_fmt[0].sizeimage ? "" : ": MISMATCH, the import may fail or show garbage"));
 	} else if (ubwc) {
@@ -1057,6 +1213,10 @@ Error V4L2Decoder::_setup_capture() {
 		}
 		pitch = align(w, 128);
 		chroma_offset = y_meta + y_size;
+		y_data_offset = y_meta;
+		uv_data_offset = y_meta + y_size + uv_meta;
+		y_meta_pitch = (uint32_t)align((w + 31) / 32, 64);
+		uv_meta_pitch = (uint32_t)align((w / 2 + 15) / 16, 64);
 		_log(vformat("QC08C layout: Y metadata %d bytes, Y %d, UV metadata %d, UV %d; total %d (sizeimage %d)%s.", (int64_t)y_meta, (int64_t)y_size, (int64_t)uv_meta, (int64_t)uv_size, (int64_t)total,
 				pf.plane_fmt[0].sizeimage, total == pf.plane_fmt[0].sizeimage ? "" : ": MISMATCH, the import may fail or show garbage"));
 	} else {
@@ -1084,6 +1244,10 @@ Error V4L2Decoder::_setup_capture() {
 		layout.pitch = pitch;
 		layout.chroma_offset = chroma_offset;
 		layout.ubwc = ubwc;
+		layout.y_data_offset = y_data_offset;
+		layout.uv_data_offset = uv_data_offset;
+		layout.y_meta_pitch = y_meta_pitch;
+		layout.uv_meta_pitch = uv_meta_pitch;
 		layout.buffer_size = pf.plane_fmt[0].sizeimage;
 		layout.visible = visible;
 		layout.fds.clear();
@@ -1614,7 +1778,7 @@ Error V4L2Decoder::open_source(const Ref<MediaSource> &p_source) {
 	// Refuse what can't be shown before the device is opened: AV1, 10-bit (unless P010 is offered), 4:2:2, VP9 profiles
 	// 1 and 3.
 	const bool ten_bit = MAX(info.bit_depth, (int)info.sps.bit_depth) > 8;
-	const String reason = MediaSource::get_hw_unsupported_reason(info, experimental_10bit || (ten_bit && is_p010_available(device_path)));
+	const String reason = MediaSource::get_hw_unsupported_reason(info, experimental_10bit || q10c_ycbcr || (ten_bit && is_p010_available(device_path)));
 	if (!reason.is_empty()) {
 		_fail(reason);
 		return ERR_UNAVAILABLE;
@@ -1702,6 +1866,7 @@ Error V4L2Decoder::_start_worker() {
 	epochs.clear();
 	_begin_epoch(serial, 0);
 	have_held = false;
+	_drop_vp9_parts();
 	eos_pending = false;
 	input_time = 0.0;
 	last_sps_size = Size2i(stream_sps.width, stream_sps.height);
@@ -1738,6 +1903,12 @@ void V4L2Decoder::close() {
 	}
 	_close_device("close");
 	_release_vp9(); // After the device is closed: the next VP9 session may open now.
+	if (source.is_valid() && vp9) {
+		_log_vp9_split_summary();
+	}
+	_drop_vp9_parts();
+	av_bsf_free(&vp9_split);
+	vp9_split_tried = false;
 	if (source.is_valid()) {
 		source->set_video_wake_fd(-1); // Before the eventfd is closed: the source writes to it under its lock.
 		if (have_held) {
@@ -1879,6 +2050,13 @@ Dictionary V4L2Decoder::get_stats() const {
 	d["codec"] = vp9 ? "vp9" : (codec == AnnexBSplitter::CODEC_H264 ? "h264" : "hevc");
 	d["format_error"] = format_error;
 	d["decoder_fault"] = decoder_fault;
+	if (vp9) {
+		d["vp9_packets"] = stats.vp9_packets;
+		d["vp9_superframes"] = stats.vp9_superframes;
+		d["vp9_split_frames"] = stats.vp9_split_frames;
+		d["vp9_hidden_frames"] = stats.vp9_hidden_frames;
+	}
+	d["q10c_ycbcr"] = q10c_ycbcr;
 	return d;
 }
 
@@ -2034,6 +2212,38 @@ bool V4L2Decoder::parse_vp9_packet(const uint8_t *p_data, uint64_t p_size, VP9Fr
 	r_info.frames = frames;
 	r_info.valid = any;
 	return any;
+}
+
+Array V4L2Decoder::split_vp9_packet(const PackedByteArray &p_packet) {
+	Array result;
+	const AVBitStreamFilter *filter = av_bsf_get_by_name("vp9_superframe_split");
+	AVBSFContext *bsf = nullptr;
+	if (filter == nullptr || p_packet.is_empty() || av_bsf_alloc(filter, &bsf) < 0) {
+		return result;
+	}
+	bsf->par_in->codec_id = AV_CODEC_ID_VP9;
+	AVPacket *in = av_packet_alloc();
+	AVPacket *out = av_packet_alloc();
+	if (av_bsf_init(bsf) >= 0 && in && out && av_new_packet(in, p_packet.size()) >= 0) {
+		memcpy(in->data, p_packet.ptr(), p_packet.size());
+		in->pts = 0; // The filter marks the hidden frames by taking their PTS away.
+		if (av_bsf_send_packet(bsf, in) >= 0) {
+			while (av_bsf_receive_packet(bsf, out) >= 0) {
+				PackedByteArray data;
+				data.resize(out->size);
+				memcpy(data.ptrw(), out->data, out->size);
+				Dictionary d;
+				d["data"] = data;
+				d["hidden"] = out->pts == AV_NOPTS_VALUE;
+				result.push_back(d);
+				av_packet_unref(out);
+			}
+		}
+	}
+	av_packet_free(&in);
+	av_packet_free(&out);
+	av_bsf_free(&bsf);
+	return result;
 }
 
 Dictionary V4L2Decoder::probe_vp9_packet(const PackedByteArray &p_packet) {
@@ -2240,6 +2450,15 @@ void V4L2Decoder::set_loop(bool p_loop) {
 	loop = p_loop;
 }
 
+void V4L2Decoder::set_q10c_ycbcr(bool p_enabled) {
+	ERR_FAIL_COND_MSG(is_open(), "V4L2Decoder: set q10c_ycbcr while closed.");
+	q10c_ycbcr = p_enabled;
+}
+
+bool V4L2Decoder::is_p010_forced_off() {
+	return OS::get_singleton()->get_environment("HWVIDEO_P010") == "0";
+}
+
 void V4L2Decoder::set_experimental_10bit(bool p_enabled) {
 	SETTING_GUARD();
 	experimental_10bit = p_enabled;
@@ -2260,6 +2479,7 @@ V4L2Decoder::~V4L2Decoder() {
 void V4L2Decoder::_bind_methods() {
 	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("probe_file", "path", "codec", "max_access_units", "list_count"), &V4L2Decoder::probe_file, DEFVAL(0), DEFVAL(6));
 	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("probe_vp9_packet", "packet"), &V4L2Decoder::probe_vp9_packet);
+	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("split_vp9_packet", "packet"), &V4L2Decoder::split_vp9_packet);
 	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("is_vp9_session_live"), &V4L2Decoder::is_vp9_session_live);
 	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("get_vp9_disabled_reason"), &V4L2Decoder::get_vp9_disabled_reason);
 	ClassDB::bind_method(D_METHOD("is_vp9"), &V4L2Decoder::is_vp9);
@@ -2302,6 +2522,8 @@ void V4L2Decoder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_loop", "loop"), &V4L2Decoder::set_loop);
 	ClassDB::bind_method(D_METHOD("get_loop"), &V4L2Decoder::get_loop);
 	ClassDB::bind_method(D_METHOD("set_verbose", "verbose"), &V4L2Decoder::set_verbose);
+	ClassDB::bind_method(D_METHOD("set_q10c_ycbcr", "enabled"), &V4L2Decoder::set_q10c_ycbcr);
+	ClassDB::bind_method(D_METHOD("is_q10c_ycbcr"), &V4L2Decoder::is_q10c_ycbcr);
 	ClassDB::bind_method(D_METHOD("set_experimental_10bit", "enabled"), &V4L2Decoder::set_experimental_10bit);
 	ClassDB::bind_method(D_METHOD("is_experimental_10bit"), &V4L2Decoder::is_experimental_10bit);
 	ClassDB::bind_method(D_METHOD("is_verbose"), &V4L2Decoder::is_verbose);
@@ -2320,6 +2542,7 @@ void V4L2Decoder::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "loop"), "set_loop", "get_loop");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "verbose"), "set_verbose", "is_verbose");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "experimental_10bit"), "set_experimental_10bit", "is_experimental_10bit");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "q10c_ycbcr"), "set_q10c_ycbcr", "is_q10c_ycbcr");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "seek_eos", PROPERTY_HINT_ENUM, "Off,Prepend,Separate"), "set_seek_eos", "get_seek_eos");
 
 	BIND_ENUM_CONSTANT(STATE_CLOSED);

@@ -62,7 +62,7 @@
 		<method name="get_decode_path_text" qualifiers="const">
 			<return type="String" />
 			<description>
-				[method get_decode_path] for people: [code]"hardware (VP9)"[/code], [code]"hardware (VP9, 10-bit)"[/code], [code]"hardware (10-bit)"[/code], [code]"hardware"[/code], [code]"software"[/code] or an empty string. Also [code]decode_path_text[/code] in [method get_stats] and [method get_overlay_stats].
+				[method get_decode_path] for people: [code]"hardware (VP9)"[/code], [code]"hardware (VP9, 10-bit)"[/code], [code]"hardware (VP9, 10-bit, Q10C)"[/code], [code]"hardware (10-bit)"[/code], [code]"hardware (10-bit, Q10C)"[/code], [code]"hardware"[/code], [code]"software"[/code] or an empty string. [code]Q10C[/code]: 10-bit without P010, read through the GPU's YCbCr sampler. Also [code]decode_path_text[/code] in [method get_stats] and [method get_overlay_stats].
 			</description>
 		</method>
 		<method name="get_software_reason" qualifiers="const">
@@ -87,6 +87,7 @@
 			<return type="int" enum="HWVideoTexture.Packing" />
 			<description>
 				Returns how the plane textures hold the samples of the current decoder buffers. The shader must unpack [constant PACKING_TP10_RGBA8] and [constant PACKING_TP10_RGB10A2] itself, with [code]texelFetch[/code] (see [member q10c_view]).
+				10-bit without P010 (the stock kernel module) goes, when the Vulkan driver can import [code]Q10C[/code] ([method DmabufImage.is_q10c_available]), through a YCbCr sampler: a compute pass writes each shown frame into R16 and R16G16 textures as P010 holds it, so the packing is [constant PACKING_P010] and the shader is the P010 one. The first frames are read back once and checked (a decoded picture is smooth, a misread one is noise); if the import or that check fails, playback goes on in software and Q10C stays off for the run ([code]HWVIDEO_Q10C_CHECK=0[/code] skips the check). [method get_stats] then has [code]q10c[/code] (the format and modifier) and [code]q10c_check[/code].
 			</description>
 		</method>
 		<method name="get_plane_texture" qualifiers="const">

@@ -123,11 +123,12 @@ void HWVideoTexture::_render_thread_swap(const Ref<DmabufImage> &p_release, cons
 
 void HWVideoTexture::_free_buffer(Buffer &p_buffer, Array &r_free) {
 	for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
-		if (p_buffer.planes[p].is_valid()) {
+		if (p_buffer.planes[p].is_valid() && !p_buffer.shared_planes) {
 			RS::get_singleton()->free_rid(p_buffer.planes[p]);
-			p_buffer.planes[p] = RID();
 		}
+		p_buffer.planes[p] = RID();
 	}
+	p_buffer.shared_planes = false;
 	if (p_buffer.image.is_valid()) {
 		r_free.push_back(p_buffer.image);
 		p_buffer.image.unref();
@@ -203,6 +204,31 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 	}
 	const uint64_t q10c_offsets[DmabufImage::MAX_PLANES] = { 0, layout.chroma_offset };
 	const uint64_t q10c_pitches[DmabufImage::MAX_PLANES] = { layout.pitch, layout.pitch };
+
+	if (q10c && decoder->is_q10c_ycbcr()) {
+		// Q10C through the YCbCr sampler: one multi-planar image per buffer, converted into P010-like planes when shown.
+		err = _import_q10c_buffers(layout);
+		if (err == OK) {
+			generation = p_generation;
+			have_generation = true;
+			decoded_size = layout.size;
+			visible_rect = layout.visible;
+			packing = PACKING_P010;
+			plane_sizes[0] = layout.size;
+			plane_sizes[1] = layout.size / 2;
+			print_line(vformat("HWVideoTexture: imported %d decoder buffers (generation %d): Q10C through a YCbCr sampler (%s) %dx%d, visible %dx%d+%d+%d; shown as P010.", buffers.size(), p_generation, q10c_description,
+					layout.size.width, layout.size.height, visible_rect.size.x, visible_rect.size.y, visible_rect.position.x, visible_rect.position.y));
+		} else {
+			failed_generation = p_generation;
+		}
+		if (!to_free.is_empty()) {
+			RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));
+		}
+		if (err == OK) {
+			emit_signal(SNAME("format_changed"));
+		}
+		return err;
+	}
 
 	buffers.resize(layout.fds.size());
 	for (uint32_t i = 0; i < layout.fds.size(); i++) {
@@ -283,8 +309,239 @@ void HWVideoTexture::_show(const ReadyFrame &p_frame, uint64_t p_frames_drawn) {
 		// Nothing points at it any more.
 		_free_buffer(orphan, to_free);
 		have_orphan = false;
+		_free_ycbcr_textures(true);
 	}
 	RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(release, buffer.image, to_free));
+	if (buffer.image.is_valid() && buffer.image->is_ycbcr() && q10c_checks_left > 0 && frames_shown >= q10c_check_at_frame) {
+		_request_q10c_check();
+	}
+}
+
+/* Q10C through the YCbCr sampler */
+
+void HWVideoTexture::_free_ycbcr_textures(bool p_old_only) {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+		RID *rs[2] = { &ycbcr_old_rs[p], p_old_only ? nullptr : &ycbcr_rs[p] };
+		RID *rdt[2] = { &ycbcr_old_rd[p], p_old_only ? nullptr : &ycbcr_rd[p] };
+		for (int k = 0; k < 2; k++) {
+			if (rs[k] && rs[k]->is_valid() && RS::get_singleton() != nullptr) {
+				RS::get_singleton()->free_rid(*rs[k]);
+			}
+			if (rs[k]) {
+				*rs[k] = RID();
+			}
+			if (rdt[k] && rdt[k]->is_valid() && rd != nullptr) {
+				rd->free_rid(*rdt[k]); // Destroyed once the frames that may use it are done.
+			}
+			if (rdt[k]) {
+				*rdt[k] = RID();
+			}
+		}
+	}
+}
+
+Error HWVideoTexture::_create_ycbcr_textures(const Size2i &p_size) {
+	// The current ones may still be on screen (the orphan of the last generation): keep them until that is replaced. If the
+	// orphan shows the old ones (two generations without a frame in between), the current ones are the ones nothing shows.
+	const bool orphan_shows_old = have_orphan && orphan.shared_planes && orphan.planes[0].is_valid() && orphan.planes[0] == ycbcr_old_rs[0];
+	if (orphan_shows_old) {
+		RenderingDevice *rd = RenderingDevice::get_singleton();
+		for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+			if (ycbcr_rs[p].is_valid()) {
+				RS::get_singleton()->free_rid(ycbcr_rs[p]);
+			}
+			if (ycbcr_rd[p].is_valid() && rd != nullptr) {
+				rd->free_rid(ycbcr_rd[p]);
+			}
+			ycbcr_rd[p] = RID();
+			ycbcr_rs[p] = RID();
+		}
+	} else {
+		_free_ycbcr_textures(true);
+		for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+			ycbcr_old_rd[p] = ycbcr_rd[p];
+			ycbcr_old_rs[p] = ycbcr_rs[p];
+			ycbcr_rd[p] = RID();
+			ycbcr_rs[p] = RID();
+		}
+	}
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	ERR_FAIL_NULL_V(rd, ERR_UNAVAILABLE);
+	const Size2i sizes[DmabufImage::MAX_PLANES] = { p_size, p_size / 2 };
+	const RD::DataFormat formats[DmabufImage::MAX_PLANES] = { RD::DATA_FORMAT_R16_UNORM, RD::DATA_FORMAT_R16G16_UNORM };
+	for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+		RD::TextureFormat format;
+		format.format = formats[p];
+		format.width = sizes[p].width;
+		format.height = sizes[p].height;
+		format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+		ycbcr_rd[p] = rd->texture_create(format, RD::TextureView());
+		ERR_FAIL_COND_V_MSG(ycbcr_rd[p].is_null(), ERR_CANT_CREATE, "HWVideoTexture: couldn't create the textures of the Q10C YCbCr pass.");
+		ycbcr_rs[p] = RS::get_singleton()->texture_rd_create(ycbcr_rd[p]);
+	}
+	return OK;
+}
+
+// One YCbCr import per buffer of the generation. The first candidate that imports is kept for the run; a candidate that
+// the driver refuses is skipped (on the first buffer only: they all have the same layout).
+Error HWVideoTexture::_import_q10c_buffers(const V4L2Decoder::CaptureLayout &p_layout) {
+	const Vector<DmabufImage::YCbCrCandidate> candidates = DmabufImage::get_q10c_candidates();
+	Error err = candidates.is_empty() ? ERR_UNAVAILABLE : _create_ycbcr_textures(p_layout.size);
+	int chosen = DmabufImage::get_q10c_chosen();
+	String tried;
+	buffers.resize(p_layout.fds.size());
+	for (uint32_t i = 0; i < p_layout.fds.size(); i++) {
+		Buffer &buffer = buffers[i];
+		buffer = Buffer();
+		if (err == OK) {
+			const int first = chosen >= 0 ? chosen : 0;
+			const int last = chosen >= 0 ? chosen : (int)candidates.size() - 1;
+			for (int c = first; c <= last; c++) {
+				const DmabufImage::YCbCrCandidate &candidate = candidates[c];
+				// Where the memory planes start (see DmabufImage::YCbCrCandidate::layout).
+				uint64_t offsets[4] = { 0, p_layout.chroma_offset, 0, 0 };
+				uint64_t pitches[4] = { p_layout.pitch, p_layout.pitch, 0, 0 };
+				uint32_t count = 2;
+				if (candidate.layout == "data") {
+					offsets[0] = p_layout.y_data_offset;
+					offsets[1] = p_layout.uv_data_offset;
+				} else if (candidate.layout == "4plane") {
+					const uint64_t o[4] = { p_layout.y_data_offset, p_layout.uv_data_offset, 0, p_layout.chroma_offset };
+					const uint64_t pt[4] = { p_layout.pitch, p_layout.pitch, p_layout.y_meta_pitch, p_layout.uv_meta_pitch };
+					for (int k = 0; k < 4; k++) {
+						offsets[k] = o[k];
+						pitches[k] = pt[k];
+					}
+					count = 4;
+				} else if (candidate.layout == "1plane") {
+					count = 1;
+				}
+				buffer.image.instantiate();
+				err = buffer.image->import_ycbcr(p_layout.fds[i], candidate.format, candidate.modifier, p_layout.size.width, p_layout.size.height, offsets, pitches, count, ycbcr_rd[0], ycbcr_rd[1]);
+				if (err == OK) {
+					if (chosen < 0) {
+						chosen = c;
+						DmabufImage::set_q10c_chosen(c);
+					}
+					q10c_description = candidate.describe();
+					break;
+				}
+				tried += (tried.is_empty() ? "" : "; ") + candidate.describe() + ": " + error_names[err];
+				buffer.image.unref();
+			}
+			if (err == OK) {
+				buffer.shared_planes = true;
+				buffer.planes[0] = ycbcr_rs[0];
+				buffer.planes[1] = ycbcr_rs[1];
+			}
+		}
+		::close(p_layout.fds[i]); // The image holds its own reference.
+	}
+	if (err != OK) {
+		Array to_free;
+		for (Buffer &buffer : buffers) {
+			_free_buffer(buffer, to_free);
+		}
+		buffers.clear();
+		if (!to_free.is_empty()) {
+			RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));
+		}
+		_free_ycbcr_textures(false);
+		q10c_description = String();
+		last_error = candidates.is_empty() ? "No Vulkan import for Q10C: " + DmabufImage::get_q10c_report() : "No Q10C import worked (" + (tried.is_empty() ? String(error_names[err]) : tried) + ").";
+		ERR_PRINT("HWVideoTexture: " + last_error);
+		q10c_failure = last_error;
+		return err;
+	}
+	// The picture check: read the first frame back and look at it (unless HWVIDEO_Q10C_CHECK=0).
+	q10c_checks_left = OS::get_singleton()->get_environment("HWVIDEO_Q10C_CHECK") == "0" ? 0 : 8;
+	q10c_check_at_frame = frames_shown + 1;
+	return OK;
+}
+
+void HWVideoTexture::_request_q10c_check() {
+	q10c_checks_left--;
+	q10c_check_at_frame = frames_shown + 24; // If this frame is flat, try about a second later.
+	q10c_check_serial++;
+	RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_q10c_readback).bind(ycbcr_rd[0], (uint64_t)get_instance_id(), q10c_check_serial, visible_rect, decoded_size.width));
+}
+
+// Render thread, after the frame's pass was recorded: read the luma back (once, a few frames later, no stall).
+void HWVideoTexture::_render_thread_q10c_readback(RID p_texture, uint64_t p_object, uint32_t p_serial, Rect2i p_visible, int p_width) {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (rd == nullptr || !rd->texture_is_valid(p_texture)) {
+		return;
+	}
+	rd->texture_get_data_async(p_texture, 0, callable_mp_static(&HWVideoTexture::_q10c_readback_done).bind(p_object, p_serial, p_visible, p_width));
+}
+
+// Render thread: a decoded picture is smooth (neighbouring luma codes differ by a few on average); compressed data read
+// the wrong way is noise (about 340 for random 10-bit codes). The verdict goes to the main thread.
+void HWVideoTexture::_q10c_readback_done(const Vector<uint8_t> &p_data, uint64_t p_object, uint32_t p_serial, Rect2i p_visible, int p_width) {
+	int result = 0; // 1: plausible, 2: garbage, 3: flat (inconclusive), 0: no data.
+	String verdict = "no data";
+	const int64_t width = p_width;
+	if (width > 0 && p_data.size() >= width * (p_visible.position.y + p_visible.size.y) * 2) {
+		const uint16_t *samples = (const uint16_t *)p_data.ptr();
+		double diff = 0.0;
+		uint64_t pairs = 0;
+		uint64_t in_range = 0;
+		uint64_t count = 0;
+		uint32_t lowest = 1023;
+		uint32_t highest = 0;
+		for (int y = p_visible.position.y; y < p_visible.position.y + p_visible.size.y; y += 2) {
+			const uint16_t *row = samples + (int64_t)y * width;
+			uint32_t previous = row[p_visible.position.x] >> 6;
+			for (int x = p_visible.position.x; x < p_visible.position.x + p_visible.size.x; x++) {
+				const uint32_t v = row[x] >> 6;
+				if (x > p_visible.position.x) {
+					diff += v > previous ? v - previous : previous - v;
+					pairs++;
+				}
+				previous = v;
+				in_range += v >= 48 && v <= 956 ? 1 : 0;
+				lowest = MIN(lowest, v);
+				highest = MAX(highest, v);
+				count++;
+			}
+		}
+		const double mean_diff = pairs ? diff / (double)pairs : 0.0;
+		const double in_range_share = count ? (double)in_range / (double)count : 0.0;
+		verdict = vformat("luma neighbour difference %.1f codes, %.1f%% in 48-956, range %d-%d", mean_diff, in_range_share * 100.0, lowest, highest);
+		if (mean_diff > 100.0) {
+			result = 2;
+		} else if (highest - lowest < 24) {
+			result = 3;
+		} else {
+			result = 1;
+		}
+	}
+	callable_mp_static(&HWVideoTexture::_q10c_verdict_main).call_deferred(p_object, p_serial, result, verdict);
+}
+
+void HWVideoTexture::_q10c_verdict_main(uint64_t p_object, uint32_t p_serial, int p_result, const String &p_verdict) {
+	HWVideoTexture *texture = Object::cast_to<HWVideoTexture>(ObjectDB::get_instance(ObjectID(p_object)));
+	if (texture != nullptr) {
+		texture->_on_q10c_verdict(p_serial, p_result, p_verdict);
+	}
+}
+
+void HWVideoTexture::_on_q10c_verdict(uint32_t p_serial, int p_result, const String &p_verdict) {
+	if (p_serial != q10c_check_serial || q10c_description.is_empty()) {
+		return;
+	}
+	q10c_verdict = p_verdict;
+	if (p_result == 1) {
+		q10c_checks_left = 0;
+		print_line(vformat("HWVideoTexture: the Q10C picture looks right (%s).", p_verdict));
+	} else if (p_result == 2) {
+		q10c_checks_left = 0;
+		q10c_failure = vformat("The 10-bit picture through Q10C (%s) looks like noise (%s), so this Vulkan driver reads Q10C differently", q10c_description, p_verdict);
+		print_line("HWVideoTexture: " + q10c_failure + ".");
+	} else {
+		print_line(vformat("HWVideoTexture: Q10C picture check inconclusive (%s); %d more.", p_verdict, q10c_checks_left));
+	}
 }
 
 void HWVideoTexture::_return_ready_buffer(const ReadyFrame &p_frame) {
@@ -405,6 +662,15 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	}
 	if (ubwc_import_failed) {
 		_fall_back_to_nv12();
+		return;
+	}
+	if (!q10c_failure.is_empty() && source.is_valid() && software_fallback) {
+		// Q10C through the YCbCr sampler didn't work: off for the run, and this file goes on in software.
+		const String why = q10c_failure;
+		q10c_failure = String();
+		DmabufImage::disable_q10c(why);
+		_switch_to_software(why + "; decoding in software.");
+		_check_next();
 		return;
 	}
 
@@ -708,10 +974,11 @@ String HWVideoTexture::get_decode_path_text() const {
 	}
 	const bool vp9 = decoder->is_vp9();
 	const bool ten_bit = have_generation && packing != PACKING_NV12;
+	const bool q10c = ten_bit && !q10c_description.is_empty();
 	if (vp9) {
-		return ten_bit ? "hardware (VP9, 10-bit)" : "hardware (VP9)";
+		return ten_bit ? (q10c ? "hardware (VP9, 10-bit, Q10C)" : "hardware (VP9, 10-bit)") : "hardware (VP9)";
 	}
-	return ten_bit ? "hardware (10-bit)" : "hardware";
+	return ten_bit ? (q10c ? "hardware (10-bit, Q10C)" : "hardware (10-bit)") : "hardware";
 }
 
 Error HWVideoTexture::open(const String &p_path, const String &p_codec, double p_fps) {
@@ -751,7 +1018,22 @@ Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
 	// 1080p; so is VP9 when hardware VP9 is off, or another texture holds the one hardware VP9 session.
 	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
 	const bool ten_bit = MAX(info.bit_depth, (int)info.sps.bit_depth) > 8;
-	const bool allow_10bit = decoder->is_experimental_10bit() || (ten_bit && V4L2Decoder::is_p010_available(decoder->get_device_path()));
+	// 10-bit: P010 when the decoder offers it (a patched module), else Q10C through the GPU's YCbCr sampler when the Vulkan
+	// driver has a candidate and it hasn't failed in this run (DmabufImage), else software.
+	const bool p010 = ten_bit && V4L2Decoder::is_p010_available(decoder->get_device_path());
+	const bool q10c = ten_bit && !p010 && !decoder->is_experimental_10bit() && pending_software_reason.is_empty() && DmabufImage::is_q10c_available();
+	if (!decoder->is_open()) {
+		decoder->set_q10c_ycbcr(q10c);
+	}
+	q10c_description = String();
+	q10c_failure = String();
+	q10c_checks_left = 0;
+	q10c_verdict = String();
+	if (ten_bit && !p010 && !q10c && !decoder->is_experimental_10bit()) {
+		const String disabled = DmabufImage::get_q10c_disabled_reason();
+		print_line(vformat("HWVideoTexture: 10-bit without P010; Q10C through a YCbCr sampler: %s.", disabled.is_empty() ? DmabufImage::get_q10c_report() : "off after a failure: " + disabled));
+	}
+	const bool allow_10bit = decoder->is_experimental_10bit() || p010 || q10c;
 	String hw_reason = MediaSource::get_hw_unsupported_reason(info, allow_10bit);
 	bool forced = false; // Software by choice: what software can't decode still goes to the hardware.
 	bool never_hardware = false; // VP9 policy: what software can't decode fails instead.
@@ -807,7 +1089,9 @@ Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
 		last_error = decoder->get_last_error();
 		source.unref();
 	} else if (info.codec == MediaSource::VIDEO_CODEC_VP9) {
-		print_line(vformat("HWVideoTexture: hardware decode (VP9 %s, %d-bit): the one hardware VP9 session of this process.", info.profile, MAX(info.bit_depth, 8)));
+		print_line(vformat("HWVideoTexture: hardware decode (VP9 %s, %d-bit%s): the one hardware VP9 session of this process.", info.profile, MAX(info.bit_depth, 8), q10c ? ", Q10C through a YCbCr sampler" : ""));
+	} else if (q10c) {
+		print_line("HWVideoTexture: hardware decode, 10-bit as Q10C through a YCbCr sampler (no P010).");
 	}
 	return err;
 }
@@ -897,7 +1181,10 @@ void HWVideoTexture::close() {
 		if (!to_free.is_empty()) {
 			RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));
 		}
+		_free_ycbcr_textures(false);
 	}
+	q10c_description = String();
+	q10c_checks_left = 0;
 	if (software) {
 		memdelete(software); // Stops its thread.
 		software = nullptr;
@@ -1010,6 +1297,10 @@ Dictionary HWVideoTexture::get_stats() const {
 		retiring += buffer.status == BUFFER_RETIRING ? 1 : 0;
 	}
 	d["buffers_retiring"] = retiring;
+	if (!q10c_description.is_empty()) {
+		d["q10c"] = q10c_description;
+		d["q10c_check"] = q10c_verdict;
+	}
 	if (!last_error.is_empty()) {
 		d["last_error"] = last_error;
 	}

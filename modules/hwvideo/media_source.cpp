@@ -29,6 +29,8 @@
 /**************************************************************************/
 
 #include "media_source.h"
+
+#include "dmabuf_image.h"
 #include "software_video_decoder.h"
 
 #include "audio_stream_media.h"
@@ -2216,8 +2218,12 @@ Dictionary MediaSource::get_video_info() const {
 	d["is_av1"] = video.codec == VIDEO_CODEC_AV1;
 	// What the Steam Frame decodes in hardware to a format we can import (spike 01): H.264, HEVC and VP9, 4:2:0, 8-bit
 	// (10-bit with P010). VP9: one hardware session at a time (HWVideoTexture), so a second one may still go to software.
-	const String hw_reason = get_hw_unsupported_reason(video, hw_10bit_available.is_set());
+	// 10-bit: P010 (a patched module), or Q10C through the GPU's YCbCr sampler (DmabufImage, when the Vulkan driver has it).
+	const bool ten_bit = MAX(video.bit_depth, (int)video.sps.bit_depth) > 8;
+	const bool q10c = ten_bit && !hw_10bit_available.is_set() && DmabufImage::is_q10c_available();
+	const String hw_reason = get_hw_unsupported_reason(video, hw_10bit_available.is_set() || q10c);
 	d["hw_decodable"] = hw_reason.is_empty();
+	d["hw_10bit_path"] = !ten_bit ? String() : (hw_10bit_available.is_set() ? String("p010") : (q10c ? String("q10c") : String()));
 	d["hw_unsupported_reason"] = hw_reason;
 	// HWVideoTexture.open_source() decodes the rest in software up to about 1080p (its software_max_pixels can change that).
 	const String sw_reason = hw_reason.is_empty() ? String() : SoftwareVideoDecoder::get_unsupported_reason(video, SoftwareVideoDecoder::DEFAULT_MAX_PIXELS);

@@ -48,6 +48,24 @@
 				Returns the size of the image (the size of the Y plane).
 			</description>
 		</method>
+		<method name="get_q10c_candidates" qualifiers="static">
+			<return type="Array" />
+			<description>
+				The ways to import the decoder's [code]Q10C[/code] buffers (UBWC-compressed TP10) that the Vulkan driver says it can import from a dmabuf and sample, best first: one [Dictionary] each with [code]format[/code] (a VkFormat), [code]format_name[/code], [code]modifier[/code] (a DRM format modifier), [code]memory_planes[/code], [code]layout[/code] ([code]meta[/code]: each memory plane starts at its UBWC metadata; [code]data[/code]: at its pixels; [code]4plane[/code]: Y, UV, Y metadata, UV metadata; [code]1plane[/code]), [code]source[/code] and [code]description[/code]. By default every non-linear modifier the driver lists for [code]G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16[/code]; the environment variables [code]HWVIDEO_Q10C_FORMAT[/code] (a VkFormat number, or G10X6, G12X4, G16), [code]HWVIDEO_Q10C_MODIFIER[/code] (hexadecimal) and [code]HWVIDEO_Q10C_LAYOUT[/code] override, and [code]HWVIDEO_Q10C=0[/code] turns it off. Looked once per process; empty without a Vulkan [RenderingDevice] that has DRM format modifiers, dmabuf import and [code]samplerYcbcrConversion[/code] ([method get_q10c_report] says why).
+			</description>
+		</method>
+		<method name="get_q10c_disabled_reason" qualifiers="static">
+			<return type="String" />
+			<description>
+				Why Q10C through the YCbCr sampler is off for the rest of the run (no candidate imported, or the picture check of [HWVideoTexture] saw noise); empty if it isn't.
+			</description>
+		</method>
+		<method name="get_q10c_report" qualifiers="static">
+			<return type="String" />
+			<description>
+				What the driver lists for the Q10C formats, which modifiers it refused, and the candidates (see [method get_q10c_candidates]).
+			</description>
+		</method>
 		<method name="get_supported_nv12_modifiers" qualifiers="static">
 			<return type="PackedInt64Array" />
 			<description>
@@ -77,6 +95,38 @@
 			<param index="5" name="plane_pitches" type="PackedInt64Array" />
 			<description>
 				Imports the dmabuf [param fd] as a P010 image ([code]VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16[/code]: 16-bit samples, the 10 bits in the high bits), the same way as [method import_nv12]. The plane views are R16 (Y, in [code]r[/code]) and R16G16 at half size (Cb in [code]r[/code], Cr in [code]g[/code]). Give the offsets and pitches from the decoder's plane info: the pitch is its [code]bytesperline[/code] (at least twice the width).
+			</description>
+		</method>
+		<method name="get_ycbcr_description" qualifiers="const">
+			<return type="String" />
+			<description>
+				For a YCbCr import: its format, modifier and chroma siting.
+			</description>
+		</method>
+		<method name="import_ycbcr">
+			<return type="int" />
+			<param index="0" name="fd" type="int" />
+			<param index="1" name="vk_format" type="int" />
+			<param index="2" name="drm_modifier" type="int" />
+			<param index="3" name="width" type="int" />
+			<param index="4" name="height" type="int" />
+			<param index="5" name="offsets" type="PackedInt64Array" />
+			<param index="6" name="pitches" type="PackedInt64Array" />
+			<param index="7" name="out_y" type="RID" />
+			<param index="8" name="out_cbcr" type="RID" />
+			<description>
+				Imports a 2-plane 4:2:0 dmabuf as one multi-planar image of [param vk_format] with the explicit DRM format modifier and memory planes (one offset and pitch each), read only through a sampler with a YCbCr conversion (RGB_IDENTITY, full range: the raw codes). [method acquire] records a compute pass into the [RenderingDevice] graph that writes the frame into [param out_y] (R16_UNORM, full size) and [param out_cbcr] (R16G16_UNORM, half size), both [RenderingDevice] textures with storage use, as P010 holds it (each code in the high bits), so shaders read it like a P010 frame; [method release] does nothing (the pass hands the dmabuf back). [method get_plane_rid] returns the out textures, which stay the caller's. For [code]Q10C[/code], whose samples (TP10) have no plane view format: the driver decompresses and unpacks it in the sampler, if it supports it.
+			</description>
+		</method>
+		<method name="import_ycbcr_test_pattern">
+			<return type="int" />
+			<param index="0" name="width" type="int" />
+			<param index="1" name="height" type="int" />
+			<param index="2" name="out_y" type="RID" />
+			<param index="3" name="out_cbcr" type="RID" />
+			<param index="4" name="bits" type="int" default="10" />
+			<description>
+				The YCbCr pass of [method import_ycbcr] on a linear host-memory test pattern ([code]G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16[/code], or [code]G8_B8R8_2PLANE_420_UNORM[/code] with [param bits] 8), for drivers without dmabufs: after [method acquire], [param out_y] and [param out_cbcr] hold the P010 form of the pattern exactly.
 			</description>
 		</method>
 		<method name="import_planes">
@@ -117,6 +167,18 @@
 			<return type="int" enum="Error" />
 			<description>
 				Gives the image back to the producer: records a queue family ownership transfer to the foreign queue family, from the shader read-only layout to the GENERAL layout. The producer must not write to the buffer until the GPU has finished the frame in which this was recorded. Does nothing if the image is not acquired.
+			</description>
+		</method>
+		<method name="is_q10c_available" qualifiers="static">
+			<return type="bool" />
+			<description>
+				Whether 10-bit video can go to [code]Q10C[/code] through the YCbCr import: there is a candidate and it hasn't failed in this run.
+			</description>
+		</method>
+		<method name="is_ycbcr" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Whether the image is a YCbCr import ([method import_ycbcr]).
 			</description>
 		</method>
 	</methods>

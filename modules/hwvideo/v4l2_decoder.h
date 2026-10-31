@@ -45,9 +45,10 @@
 // raw Annex-B H.264/HEVC file (open()) or from a MediaSource's access units (open_source(); H.264, HEVC or VP9), on a
 // worker thread. A port of the session logic of spikes/01-decode/v4l2dec.c.
 //
-// VP9: one container packet (a frame or a superframe) per OUTPUT buffer, no Annex-B, no parameter sets; after a seek the
-// source starts at a keyframe, which resets every reference, so the session just goes on (no end-of-sequence NAL unit,
-// no flush). Two VP9 sessions at once crash the iris firmware (SteamOS #2865; device run 2026-10-31), so at most one
+// VP9: one frame per OUTPUT buffer: a superframe (a hidden alt-ref frame and a shown one in one container packet) is split
+// with FFmpeg's vp9_superframe_split first, as other players on the device do. No Annex-B, no parameter sets; after a seek
+// the source starts at a keyframe, which resets every reference, so the session just goes on (no end-of-sequence NAL
+// unit, no flush). Two VP9 sessions at once crash the iris firmware (SteamOS #2865; device run 2026-10-31), so at most one
 // V4L2Decoder holds a VP9 session at a time (is_vp9_session_live()); a second open_source() of VP9 fails with ERR_BUSY.
 // A VP9 session also stops itself, with state error, on decoder faults (DQBUF failures, a run of ERROR buffers, no
 // frame for the input fed); HWVideoTexture then goes on in software, and hardware VP9 stays off for the rest of the run.
@@ -116,6 +117,12 @@ public:
 		// NV12: where the chroma rows start. QC08C, QC10C: where the UV metadata starts (the second plane of the layout).
 		uint64_t chroma_offset = 0;
 		bool ubwc = false; // QC08C, QC10C: DRM_FORMAT_MOD_QCOM_COMPRESSED.
+		// QC08C, QC10C: where the pixels start (the metadata of each plane is in front of them: Y at 0, UV at chroma_offset),
+		// and the metadata pitches (one byte per tile).
+		uint64_t y_data_offset = 0;
+		uint64_t uv_data_offset = 0;
+		uint32_t y_meta_pitch = 0;
+		uint32_t uv_meta_pitch = 0;
 		uint64_t buffer_size = 0;
 		Rect2i visible;
 		LocalVector<int> fds; // One per buffer. get_capture_layout() returns duplicates, which the caller closes.
@@ -189,6 +196,10 @@ private:
 		uint64_t media_index = 0;
 		double input_time = 0.0; // Source mode: PTS of the last access unit fed.
 		double thread_cpu_seconds = 0.0; // CPU time of the worker thread.
+		uint64_t vp9_packets = 0; // VP9 container packets fed.
+		uint64_t vp9_superframes = 0; // Of those, superframes split into frames (vp9_superframe_split).
+		uint64_t vp9_split_frames = 0; // The frames they gave, each in an OUTPUT buffer of its own.
+		uint64_t vp9_hidden_frames = 0; // Of those, frames not shown (alt-ref).
 	};
 
 	// Settings, read by the worker thread; change them only while closed (lead_time and verbose can change any time).
@@ -204,6 +215,7 @@ private:
 	bool loop = false;
 	bool verbose = false;
 	bool experimental_10bit = false; // Decode 10-bit streams to Q10C for HWVideoTexture's experimental import.
+	bool q10c_ycbcr = false; // 10-bit without P010 goes to Q10C, for HWVideoTexture's import through a YCbCr sampler.
 	SeekEOS seek_eos = SEEK_EOS_SEPARATE; // iris rejects the NAL unit in the keyframe's buffer (1 decoder error per seek).
 
 	// The stream, read-only while the worker runs. With a MediaSource (source valid) there is no file mapping: access
@@ -304,6 +316,13 @@ private:
 	uint32_t error_run = 0; // ERROR buffers since the last good frame.
 	uint32_t fed_since_frame = 0;
 	double t_unanswered = 0.0; // When the VP9_UNANSWERED_AUS-th access unit since the last frame was fed (0: not now).
+	// VP9 superframes: FFmpeg's vp9_superframe_split (null if FFmpeg lacks it: superframes then go in whole), the frames of
+	// `held` still to feed, and the next one.
+	struct AVBSFContext *vp9_split = nullptr;
+	bool vp9_split_tried = false;
+	bool vp9_held_split = false; // `held` went through the filter (its frames are in vp9_parts, or it is one frame).
+	LocalVector<struct AVPacket *> vp9_parts;
+	uint32_t vp9_part = 0;
 
 	static double _now();
 	static String _fourcc_to_string(uint32_t p_fourcc);
@@ -334,7 +353,11 @@ private:
 	uint64_t _seq_for_timestamp(uint64_t p_usec) const;
 	double _queued_rate() const;
 	int _free_output_buffer() const;
-	int _qbuf_output(uint32_t p_index, uint64_t p_bytes);
+	int _qbuf_output(uint32_t p_index, uint64_t p_bytes, bool p_counts_as_frame = true);
+	int _queue_vp9_packet(uint32_t p_index);
+	void _split_vp9_packet();
+	void _drop_vp9_parts();
+	void _log_vp9_split_summary();
 	int _queue_access_unit(uint32_t p_index, const AnnexBSplitter::AccessUnit &p_au);
 	bool _hold_source_packet();
 	int _queue_source_packet(uint32_t p_index);
@@ -369,6 +392,9 @@ public:
 	static bool parse_vp9_packet(const uint8_t *p_data, uint64_t p_size, VP9FrameInfo &r_info);
 	// The same for scripts and tests (a packet from MediaSource.read_video_packet()); {} if it isn't VP9.
 	static Dictionary probe_vp9_packet(const PackedByteArray &p_packet);
+	// The frames of a VP9 packet as they go to the decoder (FFmpeg's vp9_superframe_split): [{"data", "hidden"}], one entry
+	// for a plain frame, none if the filter is missing or refuses the packet.
+	static Array split_vp9_packet(const PackedByteArray &p_packet);
 
 	Error open(const String &p_path, const String &p_codec, double p_fps);
 	// Decodes the video stream of an open MediaSource (H.264, HEVC or VP9). Seeks are done on the source
@@ -435,6 +461,12 @@ public:
 	void set_verbose(bool p_verbose);
 	void set_experimental_10bit(bool p_enabled);
 	bool is_experimental_10bit() const { return experimental_10bit; }
+	// 10-bit streams without P010 (or with HWVIDEO_P010=0) decode to Q10C, for HWVideoTexture's YCbCr import. HWVideoTexture
+	// sets it at open_source() when the Vulkan driver has a Q10C candidate (DmabufImage.get_q10c_candidates()).
+	void set_q10c_ycbcr(bool p_enabled);
+	bool is_q10c_ycbcr() const { return q10c_ycbcr; }
+	// HWVIDEO_P010=0: P010 isn't used even when the driver offers it (so Q10C is, on a patched module too).
+	static bool is_p010_forced_off();
 	bool is_verbose() const { return verbose; }
 	void set_seek_eos(SeekEOS p_mode);
 	SeekEOS get_seek_eos() const { return seek_eos; }
