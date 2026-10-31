@@ -1724,6 +1724,9 @@ Dictionary MediaSource::get_video_info() const {
 	d["projection_fov"] = Vector2(video.projection_fov_h, video.projection_fov_v);
 	d["projection_yaw_pitch_roll"] = Vector3(video.projection_yaw, video.projection_pitch, video.projection_roll);
 	d["projection_bounds"] = Vector4(video.projection_bounds[0], video.projection_bounds[1], video.projection_bounds[2], video.projection_bounds[3]);
+	// Matroska also keeps its StereoMode as a stream tag ("left_right", "top_bottom", "block_lr", ...).
+	const AVDictionaryEntry *stereo_tag = format && video.stream_index >= 0 ? av_dict_get(format->streams[video.stream_index]->metadata, "stereo_mode", nullptr, 0) : nullptr;
+	d["stereo_mode_tag"] = stereo_tag ? String::utf8(stereo_tag->value) : String();
 	d["is_h264"] = video.codec == VIDEO_CODEC_H264;
 	d["is_hevc"] = video.codec == VIDEO_CODEC_HEVC;
 	d["is_vp9"] = video.codec == VIDEO_CODEC_VP9;
@@ -1959,6 +1962,19 @@ String MediaSource::get_last_error() const {
 Dictionary MediaSource::get_stats() const {
 	static const char *state_names[] = { "closed", "reading", "ended", "error" };
 	Dictionary d;
+	// The video bit rate at the playback position (the last 3 known whole seconds); left out while unknown.
+	const PackedFloat32Array recent = get_video_bitrate_history(4, get_position());
+	double kbps_sum = 0.0;
+	int known = 0;
+	for (int i = recent.size() - 1; i >= 0 && known < 3; i--) {
+		if (recent[i] >= 0.0f) {
+			kbps_sum += recent[i];
+			known++;
+		}
+	}
+	if (known > 0) {
+		d["bitrate_bps"] = (int64_t)(kbps_sum / known * 1000.0);
+	}
 	MutexLock lock(mutex);
 	d["state"] = (int)state;
 	d["state_name"] = state_names[state];

@@ -182,6 +182,7 @@
 		</member>
 		<member name="software_fallback" type="bool" setter="set_software_fallback" getter="is_software_fallback" default="true">
 			When [method open_source] gets a stream the hardware path can't show (VP9, 10-bit, 4:2:2, H.264 High 10), it is decoded in software instead if it is H.264, HEVC or VP9 of at most [member software_max_pixels]: FFmpeg's decoders on threads of their own, each frame converted to 8-bit NV12 and uploaded to two textures, so [method get_plane_texture] and the NV12 shader work the same. 10-bit is rounded to 8 bits and HDR isn't tone-mapped. Bigger or other streams fail with the reason in [method get_last_error]. [method get_stats] then has [code]decode_path[/code] [code]"software"[/code], the keys of [method V4L2Decoder.get_stats] that apply, and [code]software_*[/code] keys ([code]software_thread_cpu_seconds[/code] is the feeding thread only; [code]process_cpu_seconds[/code] includes FFmpeg's worker threads). [method open] (raw Annex-B files) always uses the hardware path.
+			After opening and after a seek, the software decoder skips the pictures nothing refers to (most B-frames) until two frames before the target, since those would be thrown away: seeks settle faster and cost less CPU. The environment variable [code]HWVIDEO_SW_SEEK_NONREF=0[/code] turns that off.
 		</member>
 		<member name="software_max_pixels" type="int" setter="set_software_max_pixels" getter="get_software_max_pixels" default="2088960">
 			The largest frame (width x height) decoded in software: 1920 x 1088 by default.

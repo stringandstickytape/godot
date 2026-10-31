@@ -209,6 +209,11 @@ void SoftwareVideoDecoder::_run() {
 	bool have_held = false;
 	bool flushed = false; // The end of the input was sent (a null packet) for this serial.
 	uint32_t feed_serial = serial;
+	// After open or a seek the decoder starts at the keyframe before the target and everything before the target is
+	// thrown away: pictures nothing refers to (most B-frames) aren't decoded until then. HWVIDEO_SW_SEEK_NONREF=0 turns
+	// that off (A/B).
+	const bool skip_nonref = OS::get_singleton()->get_environment("HWVIDEO_SW_SEEK_NONREF") != "0";
+	double skip_until = skip_nonref ? source->get_seek_target() - 2.0 / MAX(fps, 1.0) : -1.0;
 
 	while (!stop.is_set()) {
 		// Take every decoded frame there is room for.
@@ -272,6 +277,7 @@ void SoftwareVideoDecoder::_run() {
 			avcodec_flush_buffers(context);
 			feed_serial = held.serial;
 			flushed = false;
+			skip_until = skip_nonref ? source->get_seek_target() - 2.0 / MAX(fps, 1.0) : -1.0;
 			MutexLock lock(mutex);
 			serial = feed_serial;
 			ended = false;
@@ -291,6 +297,10 @@ void SoftwareVideoDecoder::_run() {
 				packet->flags |= AV_PKT_FLAG_KEY;
 			}
 			send = packet;
+		}
+		const AVDiscard discard = held.pts < skip_until ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+		if (context->skip_frame != discard) {
+			context->skip_frame = discard;
 		}
 		send->pts = (int64_t)llround(held.pts * 1e6);
 		send->dts = (int64_t)llround(held.dts * 1e6);
