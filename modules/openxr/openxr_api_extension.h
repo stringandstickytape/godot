@@ -70,6 +70,7 @@ public:
 
 	//TODO workaround as GDExtensionPtr<void> return type results in build error in godot-cpp
 	uint64_t get_instance_proc_addr(const String &p_name);
+	PackedStringArray get_supported_extensions();
 	String get_error_string(uint64_t result);
 	String get_swapchain_format_name(int64_t p_swapchain_format);
 	void set_object_name(int64_t p_object_type, uint64_t p_object_handle, const String &p_object_name);

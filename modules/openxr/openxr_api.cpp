@@ -455,6 +455,14 @@ bool OpenXRAPI::is_extension_supported(const String &p_extension) const {
 	return false;
 }
 
+PackedStringArray OpenXRAPI::get_supported_extension_names() const {
+	PackedStringArray names;
+	for (const XrExtensionProperties &extension : supported_extensions) {
+		names.push_back(String::utf8(extension.extensionName));
+	}
+	return names;
+}
+
 bool OpenXRAPI::is_any_extension_enabled(const String &p_extensions) const {
 	// We allow a comma separated list of extensions here, only one needs to be supported.
 	// This allows us to check for extensions that were renamed or that were embedded in core

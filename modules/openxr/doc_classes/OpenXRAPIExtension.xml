@@ -79,6 +79,12 @@
 				[b]Note:[/b] [code]openxr/util.h[/code] contains utility macros for acquiring OpenXR functions, e.g. [code]GDEXTENSION_INIT_XR_FUNC_V(xrCreateAction)[/code].
 			</description>
 		</method>
+		<method name="get_supported_extensions">
+			<return type="PackedStringArray" />
+			<description>
+				Returns the names of the OpenXR extensions the runtime supports, enabled or not (for example [code]XR_FB_passthrough[/code]). Empty before OpenXR is initialized.
+			</description>
+		</method>
 		<method name="get_next_frame_time">
 			<return type="int" />
 			<description>

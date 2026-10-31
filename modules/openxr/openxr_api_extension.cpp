@@ -47,6 +47,7 @@ void OpenXRAPIExtension::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("xr_result", "result", "format", "args"), &OpenXRAPIExtension::xr_result);
 	ClassDB::bind_static_method("OpenXRAPIExtension", D_METHOD("openxr_is_enabled", "check_run_in_editor"), &OpenXRAPIExtension::openxr_is_enabled);
 	ClassDB::bind_method(D_METHOD("get_instance_proc_addr", "name"), &OpenXRAPIExtension::get_instance_proc_addr);
+	ClassDB::bind_method(D_METHOD("get_supported_extensions"), &OpenXRAPIExtension::get_supported_extensions);
 	ClassDB::bind_method(D_METHOD("get_error_string", "result"), &OpenXRAPIExtension::get_error_string);
 	ClassDB::bind_method(D_METHOD("get_swapchain_format_name", "swapchain_format"), &OpenXRAPIExtension::get_swapchain_format_name);
 	ClassDB::bind_method(D_METHOD("set_object_name", "object_type", "object_handle", "object_name"), &OpenXRAPIExtension::set_object_name);
@@ -157,6 +158,11 @@ uint64_t OpenXRAPIExtension::get_instance_proc_addr(const String &p_name) {
 		return 0;
 	}
 	return reinterpret_cast<uint64_t>(addr);
+}
+
+PackedStringArray OpenXRAPIExtension::get_supported_extensions() {
+	ERR_FAIL_NULL_V(OpenXRAPI::get_singleton(), PackedStringArray());
+	return OpenXRAPI::get_singleton()->get_supported_extension_names();
 }
 
 String OpenXRAPIExtension::get_error_string(uint64_t result) {

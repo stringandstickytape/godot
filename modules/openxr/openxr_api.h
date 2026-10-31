@@ -434,6 +434,7 @@ public:
 
 	XrResult try_get_instance_proc_addr(const char *p_name, PFN_xrVoidFunction *p_addr);
 	XrResult get_instance_proc_addr(const char *p_name, PFN_xrVoidFunction *p_addr);
+	PackedStringArray get_supported_extension_names() const; // What the runtime offers (enabled or not).
 	String get_error_string(XrResult result) const;
 	String get_swapchain_format_name(int64_t p_swapchain_format) const;
 	void set_object_name(XrObjectType p_object_type, uint64_t p_object_handle, const String &p_object_name);
