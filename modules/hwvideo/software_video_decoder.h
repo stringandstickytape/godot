@@ -42,7 +42,8 @@ struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
 
-// The fallback for what the hardware path can't show (VP9, 10-bit, 4:2:2 H.264/HEVC, H.264 High 10), at 1080p and below:
+// The fallback for what the hardware path can't show (10-bit without P010, 4:2:2 H.264/HEVC, H.264 High 10, a second VP9
+// session, VP9 after a decoder fault), at 1080p and below:
 // FFmpeg's software decoders (with NEON and frame threads) on a thread of their own, fed from a MediaSource. Every frame
 // is converted to 8-bit NV12 in one of a fixed pool of slots (no allocations in steady state), which HWVideoTexture
 // uploads to two textures, so the same NV12 shader shows it. 10-bit is rounded to 8 bits; HDR (PQ) isn't tone-mapped.

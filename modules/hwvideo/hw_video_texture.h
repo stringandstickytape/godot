@@ -134,7 +134,9 @@ private:
 	// Software path, for what the hardware path can't show (open_source() picks it). Null on the hardware path.
 	SoftwareVideoDecoder *software = nullptr;
 	String software_reason; // Why the hardware path wasn't used.
+	String pending_software_reason; // _switch_to_software(): the next open_source() goes to software for this reason.
 	bool software_fallback = true;
+	bool hw_vp9 = true; // HWVIDEO_HW_VP9=0/1 in the environment overrides it.
 	int software_threads = 4;
 	int64_t software_max_pixels = SoftwareVideoDecoder::DEFAULT_MAX_PIXELS;
 	RID software_rd[DmabufImage::MAX_PLANES]; // The shown frame is uploaded to these (Y R8, CbCr R8G8).
@@ -179,6 +181,9 @@ private:
 	static void _render_thread_upload(RID p_y, RID p_uv, const Vector<uint8_t> &p_y_data, const Vector<uint8_t> &p_uv_data);
 	void _point_planes();
 	void _check_next();
+	String _vp9_policy_reason() const;
+	Error _open_software(const Ref<MediaSource> &p_source, const String &p_reason);
+	Error _switch_to_software(const String &p_reason);
 
 protected:
 	static void _bind_methods();
@@ -228,9 +233,19 @@ public:
 	Packing get_packing() const { return packing; }
 	// "hardware" (V4L2 + dmabuf import), "software" (SoftwareVideoDecoder), or "" when closed.
 	String get_decode_path() const;
+	// The same for people: "hardware (VP9)", "hardware (10-bit)", "hardware (VP9, 10-bit)", "hardware", "software", "".
+	String get_decode_path_text() const;
 	String get_software_reason() const { return software_reason; }
 	void set_software_fallback(bool p_enabled) { software_fallback = p_enabled; }
 	bool is_software_fallback() const { return software_fallback; }
+	// VP9 in hardware (default on): at most one hardware VP9 session at a time in the process (V4L2Decoder), so a second
+	// VP9 texture (the next item, picture in picture, thumbnails) decodes in software; off: VP9 always in software.
+	// HWVIDEO_HW_VP9=0 or 1 in the environment overrides it. Applies at open_source().
+	void set_hw_vp9(bool p_enabled) { hw_vp9 = p_enabled; }
+	bool is_hw_vp9() const { return hw_vp9; }
+	// With a MediaSource: closes the hardware decoder and goes on in software from the current position (as after a
+	// VP9 decoder fault, which does it by itself). On the software path it restarts the software decoder there.
+	Error switch_to_software(const String &p_reason);
 	void set_software_threads(int p_threads) { software_threads = CLAMP(p_threads, 1, 16); }
 	int get_software_threads() const { return software_threads; }
 	void set_software_max_pixels(int64_t p_pixels) { software_max_pixels = MAX(p_pixels, (int64_t)64 * 64); }

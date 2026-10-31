@@ -42,8 +42,15 @@
 #include "core/variant/variant.h"
 
 // A V4L2 stateful memory-to-memory decoder session (the Steam Frame's Qualcomm iris decoder, /dev/video-dec0), fed from a
-// raw Annex-B H.264/HEVC file (open()) or from a MediaSource's access units (open_source()), on a worker thread. A port of
-// the session logic of spikes/01-decode/v4l2dec.c.
+// raw Annex-B H.264/HEVC file (open()) or from a MediaSource's access units (open_source(); H.264, HEVC or VP9), on a
+// worker thread. A port of the session logic of spikes/01-decode/v4l2dec.c.
+//
+// VP9: one container packet (a frame or a superframe) per OUTPUT buffer, no Annex-B, no parameter sets; after a seek the
+// source starts at a keyframe, which resets every reference, so the session just goes on (no end-of-sequence NAL unit,
+// no flush). Two VP9 sessions at once crash the iris firmware (SteamOS #2865; device run 2026-10-31), so at most one
+// V4L2Decoder holds a VP9 session at a time (is_vp9_session_live()); a second open_source() of VP9 fails with ERR_BUSY.
+// A VP9 session also stops itself, with state error, on decoder faults (DQBUF failures, a run of ERROR buffers, no
+// frame for the input fed); HWVideoTexture then goes on in software, and hardware VP9 stays off for the rest of the run.
 //
 // One long-lived session: OUTPUT (bitstream) buffers are mmapped and fed one access unit each, paced by a clock that the
 // consumer sets (set_clock()), so the queue rate the driver measures stays near the playback rate. CAPTURE buffers are
@@ -83,6 +90,24 @@ public:
 	};
 
 	// Layout of the CAPTURE buffers of one generation. Only single-buffer NV12, QC08C and QC10C are described.
+	// The uncompressed header of a VP9 frame (spec section 6.2), of the first keyframe in a packet (or of its first frame).
+	struct VP9FrameInfo {
+		bool valid = false;
+		bool keyframe = false;
+		bool show_existing_frame = false;
+		int profile = 0;
+		int bit_depth = 8;
+		int color_space = 0;
+		bool full_range = false;
+		int subsampling_x = 1;
+		int subsampling_y = 1;
+		uint32_t width = 0; // Keyframes only.
+		uint32_t height = 0;
+		uint32_t render_width = 0;
+		uint32_t render_height = 0;
+		int frames = 1; // Frames in the packet (a superframe has more than one).
+	};
+
 	struct CaptureLayout {
 		uint32_t generation = 0;
 		uint32_t fourcc = 0;
@@ -104,6 +129,11 @@ private:
 	static constexpr uint32_t QUEUE_RING = 1024;
 	static constexpr uint32_t RECENT_AUS = 64;
 	static constexpr uint32_t MAX_EPOCHS = 8;
+	// VP9 fault detection (the firmware crash of SteamOS #2865 shows as DQBUF EINVAL, then nothing).
+	static constexpr uint32_t VP9_DQBUF_FAILURES = 3; // Failed DQBUFs in a row (not EAGAIN/EPIPE).
+	static constexpr uint32_t VP9_ERROR_RUN = 8; // Buffers with V4L2_BUF_FLAG_ERROR in a row, without a good frame.
+	static constexpr uint32_t VP9_UNANSWERED_AUS = 3; // The no-frame timer starts when this many are fed since the last frame.
+	static constexpr double VP9_NO_FRAME_SECONDS = 4.0;
 
 	struct OutputBuffer {
 		void *map = nullptr;
@@ -183,6 +213,7 @@ private:
 	const uint8_t *file_data = nullptr;
 	uint64_t file_size = 0;
 	AnnexBSplitter::Codec codec = AnnexBSplitter::CODEC_HEVC;
+	bool vp9 = false; // Source mode only: VP9 packets (codec is unused then).
 	uint32_t codec_fourcc = 0;
 	uint32_t capture_fourcc = 0;
 	double fps = 30.0;
@@ -191,6 +222,7 @@ private:
 	Thread thread;
 	int wake_fd = -1;
 	SafeFlag exit_requested;
+	SafeFlag worker_finished; // The worker has closed the device and returned (close() won't block then).
 
 	// Shared with the main thread.
 	mutable Mutex mutex;
@@ -203,12 +235,18 @@ private:
 	CaptureLayout layout; // fds owned by the worker.
 	bool layout_valid = false;
 	Stats stats;
+	bool format_error = false; // The error is a CAPTURE format the player can't show (e.g. no P010 for 10-bit VP9).
+	bool decoder_fault = false; // The error is the decoder's (DQBUF failures, ERROR buffers, no frames, HANG).
 
 	static Mutex device_close_mutex;
 	static uint64_t device_close_usec;
 	static Mutex p010_mutex;
 	static int p010_state; // -1 not looked yet, 0 no, 1 yes.
 	static String p010_formats;
+	// The one VP9 session (see the class comment), and why hardware VP9 is off for the rest of the run ("" if it isn't).
+	static Mutex vp9_mutex;
+	static const V4L2Decoder *vp9_owner;
+	static String vp9_disabled_reason;
 
 	// Worker thread only.
 	int fd = -1;
@@ -260,6 +298,12 @@ private:
 	double last_progress = 0.0;
 	IoctlError ioctl_errors[32];
 	uint32_t ioctl_error_count = 0;
+	uint32_t vp9_bit_depth = 0; // From the uncompressed header of the latest VP9 keyframe fed (0: none yet).
+	uint32_t dqbuf_failures = 0; // In a row.
+	int dqbuf_errno = 0; // Of the last one.
+	uint32_t error_run = 0; // ERROR buffers since the last good frame.
+	uint32_t fed_since_frame = 0;
+	double t_unanswered = 0.0; // When the VP9_UNANSWERED_AUS-th access unit since the last frame was fed (0: not now).
 
 	static double _now();
 	static String _fourcc_to_string(uint32_t p_fourcc);
@@ -269,6 +313,9 @@ private:
 	void _log(const String &p_message) const;
 	void _log_verbose(const String &p_message) const;
 	void _fail(const String &p_message);
+	void _fail_decoder(const String &p_message); // _fail() for a decoder fault (decoder_fault).
+	bool _check_vp9_faults(double p_now);
+	void _release_vp9();
 	void _set_state(State p_state);
 	void _wake();
 	int _ioctl(int p_fd, unsigned long p_request, void *p_arg, const char *p_name, int p_quiet_1 = 0, int p_quiet_2 = 0);
@@ -318,14 +365,20 @@ protected:
 
 public:
 	static Dictionary probe_file(const String &p_path, const String &p_codec, int p_max_access_units = 0, int p_list_count = 6);
+	// The VP9 uncompressed header of the first keyframe in a packet (else of its first frame). False if it isn't VP9.
+	static bool parse_vp9_packet(const uint8_t *p_data, uint64_t p_size, VP9FrameInfo &r_info);
+	// The same for scripts and tests (a packet from MediaSource.read_video_packet()); {} if it isn't VP9.
+	static Dictionary probe_vp9_packet(const PackedByteArray &p_packet);
 
 	Error open(const String &p_path, const String &p_codec, double p_fps);
-	// Decodes the video stream of an open MediaSource (H.264 or HEVC). Seeks are done on the source (MediaSource.seek());
-	// the decoder follows its serial. loop is ignored.
+	// Decodes the video stream of an open MediaSource (H.264, HEVC or VP9). Seeks are done on the source
+	// (MediaSource.seek()); the decoder follows its serial. loop is ignored. VP9 while another V4L2Decoder has a VP9
+	// session: ERR_BUSY (see the class comment).
 	Error open_source(const Ref<MediaSource> &p_source);
 	Ref<MediaSource> get_media_source() const { return source; }
 	void close();
 	bool is_open() const { return thread.is_started(); }
+	bool is_worker_finished() const { return worker_finished.is_set(); }
 
 	// Main thread: feeding stops once the access units fed reach the clock + lead_time.
 	void set_clock(double p_seconds);
@@ -341,9 +394,17 @@ public:
 
 	State get_state() const;
 	String get_last_error() const;
+	// With state error: the error is a CAPTURE format the player can't show / a decoder fault (see the members).
+	bool is_format_error() const;
+	bool is_decoder_fault() const;
 	Dictionary get_stats() const;
 	Dictionary get_stream_info() const;
 	double get_fps() const { return fps; }
+	bool is_vp9() const { return vp9 && source.is_valid(); }
+	// Whether a V4L2Decoder holds the VP9 session now (open_source() of VP9 until close()).
+	static bool is_vp9_session_live();
+	// Why hardware VP9 is off for the rest of the run (a VP9 session had a decoder fault); "" if it isn't.
+	static String get_vp9_disabled_reason();
 
 	void set_device_path(const String &p_path);
 	String get_device_path() const { return device_path; }

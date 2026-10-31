@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <class name="V4L2Decoder" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
 	<brief_description>
-		A V4L2 stateful hardware video decoder session, fed from a raw H.264 or HEVC file.
+		A V4L2 stateful hardware video decoder session, fed from a raw H.264 or HEVC file or a [MediaSource] (also VP9).
 	</brief_description>
 	<description>
 		Decodes a raw Annex-B elementary stream ([code].h264[/code] or [code].h265[/code]) with a Linux V4L2 stateful memory-to-memory decoder (the Steam Frame's Qualcomm iris decoder, [code]/dev/video-dec0[/code]) on a worker thread. The input is split into access units, one per OUTPUT buffer, and fed no further than [member lead_time] ahead of the clock set with [method set_clock]. Decoded CAPTURE buffers are exported as dmabufs once per CAPTURE setup.
@@ -37,7 +37,7 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns counters: [code]frames_decoded[/code], [code]frames_error[/code], [code]aus_queued[/code], [code]aus_skipped[/code], [code]queued_rate[/code] (the driver's estimate of the input rate), [code]latency_avg_ms[/code] and [code]latency_max_ms[/code] (OUTPUT QBUF to CAPTURE DQBUF), [code]source_changes[/code], [code]restarts[/code], the buffer counts, [code]state_name[/code] and [code]last_error[/code].
+				Returns counters: [code]frames_decoded[/code], [code]frames_error[/code], [code]aus_queued[/code], [code]aus_skipped[/code], [code]queued_rate[/code] (the driver's estimate of the input rate), [code]latency_avg_ms[/code] and [code]latency_max_ms[/code] (OUTPUT QBUF to CAPTURE DQBUF), [code]source_changes[/code], [code]restarts[/code], the buffer counts, [code]state_name[/code], [code]last_error[/code], [code]codec[/code], [code]format_error[/code] and [code]decoder_fault[/code].
 			</description>
 		</method>
 		<method name="get_stream_info" qualifiers="const">
@@ -88,7 +88,45 @@
 			<return type="int" enum="Error" />
 			<param index="0" name="source" type="MediaSource" />
 			<description>
-				Decodes the video stream of an open [MediaSource] (H.264 or HEVC) instead of a raw file. Access units are popped from the source's queue, paced by their DTS against the clock, and each decoded frame's time is the PTS of the access unit it came from (the driver copies the OUTPUT timestamp to the CAPTURE buffer). Seek with [method MediaSource.seek]: the decoder drops access units of an older serial and starts a new epoch with the keyframe the source delivers; after the end of the stream was drained, it restarts the session. [member loop] is ignored.
+				Decodes the video stream of an open [MediaSource] (H.264, HEVC or VP9) instead of a raw file. Access units are popped from the source's queue, paced by their DTS against the clock, and each decoded frame's time is the PTS of the access unit it came from (the driver copies the OUTPUT timestamp to the CAPTURE buffer). Seek with [method MediaSource.seek]: the decoder drops access units of an older serial and starts a new epoch with the keyframe the source delivers; after the end of the stream was drained, it restarts the session. [member loop] is ignored.
+				VP9 (profiles 0 and 2): one container packet (a frame or a superframe) per OUTPUT buffer, [code]VP90[/code] on OUTPUT, the container's frame size for its format; after a seek the keyframe resets every reference, so there is no end-of-sequence NAL unit and no flush ([member seek_eos] doesn't apply). Only one [V4L2Decoder] in the process holds a VP9 session at a time (two at once crash the Frame's decoder firmware): another one's [method open_source] of VP9 fails with [constant ERR_BUSY] until the first is closed ([method is_vp9_session_live]). A VP9 session stops itself with state [constant STATE_ERROR] when the decoder looks broken: 3 failed DQBUFs in a row, 8 buffers in a row flagged as errors, no picture 4 s after 3 access units were fed, or the general hang check ([member timeout_ms]); [method is_decoder_fault] is then [code]true[/code] and hardware VP9 stays off for the rest of the run ([method get_vp9_disabled_reason]). A 10-bit VP9 stream that is offered no P010 on CAPTURE fails with [method is_format_error] [code]true[/code], and later 10-bit VP9 streams get the 10-bit reason in [code]hw_unsupported_reason[/code]. [HWVideoTexture] goes on in software in both cases.
+			</description>
+		</method>
+		<method name="probe_vp9_packet" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="packet" type="PackedByteArray" />
+			<description>
+				The uncompressed header of a VP9 packet (for example [code]data[/code] from [method MediaSource.read_video_packet]): of its first keyframe, or else of its first frame. Keys: [code]keyframe[/code], [code]show_existing_frame[/code], [code]profile[/code], [code]bit_depth[/code], [code]color_space[/code], [code]full_range[/code], [code]subsampling[/code], [code]width[/code], [code]height[/code], [code]render_width[/code], [code]render_height[/code] (keyframes only) and [code]frames[/code] (more than 1 for a superframe). Empty if it isn't VP9.
+			</description>
+		</method>
+		<method name="is_vp9" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Whether this session decodes VP9 from a [MediaSource].
+			</description>
+		</method>
+		<method name="is_vp9_session_live" qualifiers="static">
+			<return type="bool" />
+			<description>
+				Whether a [V4L2Decoder] in this process holds the VP9 session (from its [method open_source] of VP9 until its [method close]).
+			</description>
+		</method>
+		<method name="get_vp9_disabled_reason" qualifiers="static">
+			<return type="String" />
+			<description>
+				Why hardware VP9 is off for the rest of the run (a VP9 session had a decoder fault), as a sentence; empty if it isn't.
+			</description>
+		</method>
+		<method name="is_decoder_fault" qualifiers="const">
+			<return type="bool" />
+			<description>
+				With state [constant STATE_ERROR]: the decoder failed (DQBUF failures, a run of error buffers, no picture for the input, a hang), as opposed to an input or format problem.
+			</description>
+		</method>
+		<method name="is_format_error" qualifiers="const">
+			<return type="bool" />
+			<description>
+				With state [constant STATE_ERROR]: the decoder's CAPTURE format can't be shown (for example 10-bit VP9 without P010).
 			</description>
 		</method>
 		<method name="get_media_source" qualifiers="const">

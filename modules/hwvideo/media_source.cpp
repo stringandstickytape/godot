@@ -2131,15 +2131,20 @@ String MediaSource::get_hw_unsupported_reason(const VideoInfo &p_info, bool p_al
 		case VIDEO_CODEC_HEVC:
 			break;
 		case VIDEO_CODEC_VP9:
-			// Policy, not a driver refusal: the device is never opened for VP9 (docs/research-device.md, SteamOS #2865).
-			return "VP9 video isn't played in hardware: on this SteamOS kernel the video decoder's firmware crashes on VP9 (from the second VP9 session after boot), which can restart the headset.";
+			// Sequential VP9 sessions work on the device; two at once crash the firmware (SteamOS #2865). HWVideoTexture
+			// keeps it to one hardware VP9 session at a time (V4L2Decoder.is_vp9_session_live()). Profiles 1 and 3 are
+			// 4:2:2 / 4:4:4, which the decoder doesn't take.
+			if (p_info.profile == "Profile 1" || p_info.profile == "Profile 3" || p_info.pixel_format.contains("422") || p_info.pixel_format.contains("444") || p_info.pixel_format.contains("440")) {
+				return vformat("VP9 %s (%s) can't be decoded in hardware (VP9 profiles 0 and 2, 4:2:0, only).", p_info.profile.is_empty() ? String("4:2:2/4:4:4") : p_info.profile, p_info.pixel_format);
+			}
+			break;
 		case VIDEO_CODEC_AV1:
 			return "AV1 video can't be decoded in hardware: this SteamOS kernel doesn't expose the AV1 decoder.";
 		default:
-			return vformat("%s video can't be decoded in hardware (the Frame decodes H.264 and HEVC).", p_info.codec_name.to_upper());
+			return vformat("%s video can't be decoded in hardware (the Frame decodes H.264, HEVC and VP9).", p_info.codec_name.to_upper());
 	}
 	const int bit_depth = MAX(p_info.bit_depth, (int)p_info.sps.bit_depth);
-	if (bit_depth > 8 && !p_allow_10bit) {
+	if (bit_depth > 8 && (!p_allow_10bit || (p_info.codec == VIDEO_CODEC_VP9 && hw_vp9_p010_refused.is_set()))) {
 		return vformat("%d-bit video is not supported yet on this kernel: the decoder writes it only in a compressed 10-bit format (Q10C) that the player can't display yet.", bit_depth);
 	}
 	if (bit_depth > 10) {
@@ -2209,7 +2214,8 @@ Dictionary MediaSource::get_video_info() const {
 	d["is_hevc"] = video.codec == VIDEO_CODEC_HEVC;
 	d["is_vp9"] = video.codec == VIDEO_CODEC_VP9;
 	d["is_av1"] = video.codec == VIDEO_CODEC_AV1;
-	// What the Steam Frame decodes in hardware to a format we can import (spike 01): H.264 and HEVC, 8-bit, 4:2:0.
+	// What the Steam Frame decodes in hardware to a format we can import (spike 01): H.264, HEVC and VP9, 4:2:0, 8-bit
+	// (10-bit with P010). VP9: one hardware session at a time (HWVideoTexture), so a second one may still go to software.
 	const String hw_reason = get_hw_unsupported_reason(video, hw_10bit_available.is_set());
 	d["hw_decodable"] = hw_reason.is_empty();
 	d["hw_unsupported_reason"] = hw_reason;

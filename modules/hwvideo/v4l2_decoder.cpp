@@ -55,6 +55,9 @@
 #ifndef V4L2_PIX_FMT_P010
 #define V4L2_PIX_FMT_P010 v4l2_fourcc('P', '0', '1', '0')
 #endif
+#ifndef V4L2_PIX_FMT_VP9
+#define V4L2_PIX_FMT_VP9 v4l2_fourcc('V', 'P', '9', '0')
+#endif
 
 static constexpr uint32_t OUTPUT_TYPE = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 static constexpr uint32_t CAPTURE_TYPE = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -67,6 +70,9 @@ uint64_t V4L2Decoder::device_close_usec = 0;
 Mutex V4L2Decoder::p010_mutex;
 int V4L2Decoder::p010_state = -1;
 String V4L2Decoder::p010_formats;
+Mutex V4L2Decoder::vp9_mutex;
+const V4L2Decoder *V4L2Decoder::vp9_owner = nullptr;
+String V4L2Decoder::vp9_disabled_reason;
 
 #define IOCTL(m_request, m_arg) _ioctl(fd, (m_request), (m_arg), #m_request)
 #define IOCTL_QUIET(m_request, m_arg, m_quiet_1, m_quiet_2) _ioctl(fd, (m_request), (m_arg), #m_request, (m_quiet_1), (m_quiet_2))
@@ -142,6 +148,69 @@ void V4L2Decoder::_fail(const String &p_message) {
 		last_error = p_message;
 	}
 	ERR_PRINT("V4L2Decoder: " + p_message);
+}
+
+void V4L2Decoder::_fail_decoder(const String &p_message) {
+	{
+		MutexLock lock(mutex);
+		decoder_fault = true;
+	}
+	_fail(p_message);
+}
+
+// VP9 only: true (and state error) when the decoder looks broken. The firmware crash of two VP9 sessions showed as
+// DQBUF EINVAL on both; a wedged firmware also shows as input taken and nothing coming out.
+bool V4L2Decoder::_check_vp9_faults(double p_now) {
+	if (!vp9) {
+		return false;
+	}
+	if (dqbuf_failures >= VP9_DQBUF_FAILURES) {
+		_fail_decoder(vformat("VP9 decoder fault: %d DQBUFs in a row failed (%s). Firmware crash? Check 'sudo dmesg | grep -iE \"iris|0x5000003\"'. Stopping the hardware session.", dqbuf_failures, strerror(dqbuf_errno)));
+		return true;
+	}
+	if (error_run >= VP9_ERROR_RUN) {
+		_fail_decoder(vformat("VP9 decoder fault: %d buffers in a row came back with V4L2_BUF_FLAG_ERROR and no picture. Stopping the hardware session.", error_run));
+		return true;
+	}
+	if (t_unanswered > 0.0) {
+		if (pending_reconfig || ended || (capture_configured && capture_in_driver == 0)) {
+			// Not the decoder's doing: a resolution change, the end, or the consumer holds every CAPTURE buffer.
+			t_unanswered = p_now;
+		} else if (p_now - t_unanswered > VP9_NO_FRAME_SECONDS) {
+			_fail_decoder(vformat("VP9 decoder fault: no picture for %.1f s after %d access units were fed (%d OUTPUT and %d CAPTURE buffers in the driver). Stopping the hardware session.",
+					p_now - t_unanswered, fed_since_frame, output_in_driver, capture_in_driver));
+			return true;
+		}
+	}
+	return false;
+}
+
+void V4L2Decoder::_release_vp9() {
+	MutexLock lock(vp9_mutex);
+	if (vp9_owner == this) {
+		vp9_owner = nullptr;
+		_log("VP9 session released.");
+	}
+}
+
+bool V4L2Decoder::is_vp9_session_live() {
+	MutexLock lock(vp9_mutex);
+	return vp9_owner != nullptr;
+}
+
+String V4L2Decoder::get_vp9_disabled_reason() {
+	MutexLock lock(vp9_mutex);
+	return vp9_disabled_reason;
+}
+
+bool V4L2Decoder::is_format_error() const {
+	MutexLock lock(mutex);
+	return format_error;
+}
+
+bool V4L2Decoder::is_decoder_fault() const {
+	MutexLock lock(mutex);
+	return decoder_fault;
 }
 
 void V4L2Decoder::_set_state(State p_state) {
@@ -408,6 +477,8 @@ Error V4L2Decoder::_restart_session_source(const char *p_why) {
 	if (last_sps_size.width > 0) {
 		output_size = last_sps_size;
 	}
+	dqbuf_failures = error_run = fed_since_frame = 0;
+	t_unanswered = 0.0;
 	need_setup = false;
 	pending_reconfig = false;
 	got_last = false;
@@ -512,6 +583,9 @@ int V4L2Decoder::_qbuf_output(uint32_t p_index, uint64_t p_bytes) {
 	output_in_driver++;
 	seq++;
 	wstats.aus_queued++;
+	if (++fed_since_frame == VP9_UNANSWERED_AUS) {
+		t_unanswered = queue_time[(seq - 1) % QUEUE_RING];
+	}
 	return 1;
 }
 
@@ -534,10 +608,30 @@ bool V4L2Decoder::_hold_source_packet() {
 			have_held = false;
 			continue;
 		}
+		if (vp9 && held.keyframe && held.sps_width == 0) {
+			// A VP9 keyframe carries the frame size (and bit depth) in its uncompressed header: the "SPS" of this stream,
+			// where a session restart can resume.
+			VP9FrameInfo vp9_info;
+			if (parse_vp9_packet(held.data, held.size, vp9_info) && vp9_info.keyframe && vp9_info.width > 0) {
+				held.sps_width = vp9_info.width;
+				held.sps_height = vp9_info.height;
+				if ((uint32_t)vp9_info.bit_depth != vp9_bit_depth) {
+					_log_verbose(vformat("VP9 keyframe at %.3f s: profile %d, %dx%d, %d-bit.", held.pts, vp9_info.profile, vp9_info.width, vp9_info.height, vp9_info.bit_depth));
+				}
+				vp9_bit_depth = (uint32_t)vp9_info.bit_depth;
+			}
+		}
 		if (held.serial != serial) {
 			serial = held.serial;
 			media_index = 0;
 			_begin_epoch(serial, 0);
+			if (vp9) {
+				// A VP9 keyframe resets every reference and VP9 holds no pictures for reordering: nothing to flush.
+				eos_pending = false;
+				_log(vformat("seek (serial %d): first VP9 packet at %.3f s, %s%s; no flush needed.", serial, held.pts, held.keyframe ? "keyframe" : "NOT a keyframe",
+						held.sps_width ? vformat(" %dx%d", held.sps_width, held.sps_height) : String()));
+				return true;
+			}
 			// Only mid-session: a session starts with a clean decoder anyway.
 			eos_pending = seek_eos != SEEK_EOS_OFF && seq > seq_at_open;
 			static const char *nal_names_h264[] = { "?", "I (non-IDR)", "?", "?", "?", "IDR" };
@@ -549,7 +643,7 @@ bool V4L2Decoder::_hold_source_packet() {
 					nal = held.nal_type == 19 || held.nal_type == 20 ? "IDR" : held.nal_type == 21 ? "CRA" : (held.nal_type >= 16 && held.nal_type <= 18) ? "BLA" : itos(held.nal_type);
 				}
 			}
-			_log(vformat("seek (serial %d): first access unit at %.3f s, %s%s, %s.", serial, held.pts, held.keyframe ? "keyframe " : "", nal,
+			_log(vformat("seek (serial %d): first access unit at %.3f s, %s%s%s, %s.", serial, held.pts, held.keyframe ? "keyframe " : "", nal,
 					held.sps_width ? " with SPS" : "", eos_pending ? (seek_eos == SEEK_EOS_PREPEND ? "end-of-sequence NAL unit in front" : "end-of-sequence NAL unit in its own buffer") : "no end-of-sequence NAL unit"));
 		}
 		return true;
@@ -731,14 +825,20 @@ int V4L2Decoder::_dequeue_output() {
 		buffer.m.planes = planes;
 		buffer.length = VIDEO_MAX_PLANES;
 		if (IOCTL_QUIET(VIDIOC_DQBUF, &buffer, EAGAIN, 0) < 0) {
+			if (errno != EAGAIN) {
+				dqbuf_failures++;
+				dqbuf_errno = errno;
+			}
 			break;
 		}
+		dqbuf_failures = 0;
 		if (buffer.index < output_count && output[buffer.index].queued) {
 			output[buffer.index].queued = false;
 			output_in_driver--;
 		}
 		if (buffer.flags & V4L2_BUF_FLAG_ERROR) {
 			wstats.output_errors++;
+			error_run++;
 		}
 		count++;
 	}
@@ -785,7 +885,9 @@ Error V4L2Decoder::_setup_capture() {
 	}
 	_log_verbose(vformat("G_FMT CAPTURE after SOURCE_CHANGE: %s %dx%d, %d plane(s).", _fourcc_to_string(format.fmt.pix_mp.pixelformat), format.fmt.pix_mp.width, format.fmt.pix_mp.height, format.fmt.pix_mp.num_planes));
 	// What the driver offers for this stream. Always logged for 10-bit streams: is a linear 10-bit format (P010) there?
-	const bool is_10bit = stream_sps.bit_depth > 8;
+	// VP9: also the depth in the keyframe header (profile 2), in case the container didn't say.
+	const uint32_t bit_depth = MAX(stream_sps.bit_depth, vp9 ? vp9_bit_depth : 0u);
+	const bool is_10bit = bit_depth > 8;
 	String offered;
 	bool offers_p010 = false;
 	for (uint32_t i = 0;; i++) {
@@ -802,10 +904,23 @@ Error V4L2Decoder::_setup_capture() {
 		}
 	}
 	if (is_10bit && capture_setups == 0) {
-		_log(vformat("CAPTURE formats offered for this %d-bit stream: %s.", stream_sps.bit_depth, offered));
+		_log(vformat("CAPTURE formats offered for this %d-bit %s stream: %s.", bit_depth, vp9 ? "VP9" : (codec == AnnexBSplitter::CODEC_H264 ? "H.264" : "HEVC"), offered));
+	} else if (vp9 && capture_setups == 0) {
+		_log(vformat("CAPTURE formats offered for this VP9 stream: %s.", offered));
 	}
 
-	if (is_10bit) {
+	if (is_10bit && vp9) {
+		// The patched module's P010 may be there for HEVC and not for VP9: keep the HEVC answer, note the VP9 one.
+		if (!offers_p010 && !experimental_10bit) {
+			MediaSource::set_hw_vp9_p010_refused(true);
+			{
+				MutexLock lock(mutex);
+				format_error = true;
+			}
+			_fail(vformat("%d-bit VP9: the decoder offers no P010 for it (offered: %s), so the player can't show it in hardware.", bit_depth, offered));
+			return ERR_UNAVAILABLE;
+		}
+	} else if (is_10bit) {
 		_note_p010_offered(offers_p010, offered);
 	}
 	// 10-bit: linear P010 when the driver offers it (a patched module); Q10C otherwise (experiment), the only correct 10-bit
@@ -830,16 +945,22 @@ Error V4L2Decoder::_setup_capture() {
 		_fail(vformat("CAPTURE format %s has %d planes; only single-plane formats (NV12 with chroma after luma) are supported.", _fourcc_to_string(pf.pixelformat), pf.num_planes));
 		return ERR_UNAVAILABLE;
 	}
-	if (capture_setups == 0 && stream_sps.valid && (pf.width < stream_sps.display_width || pf.height < stream_sps.display_height || pf.plane_fmt[0].sizeimage < stream_sps.display_width * stream_sps.display_height)) {
+	// VP9: the frame size of the keyframe fed (the container's size can be the display size, not the frame's).
+	const Size2i stream_size = vp9 && last_sps_size.width > 0 ? last_sps_size : Size2i(stream_sps.display_width, stream_sps.display_height);
+	if (capture_setups == 0 && stream_sps.valid && (pf.width < (uint32_t)stream_size.width || pf.height < (uint32_t)stream_size.height || pf.plane_fmt[0].sizeimage < (uint32_t)(stream_size.width * stream_size.height))) {
 		_fail(vformat("CAPTURE format %dx%d (sizeimage %d) is smaller than the stream's %dx%d; refusing to allocate (risk of an SMMU fault). Still the placeholder?",
-				pf.width, pf.height, pf.plane_fmt[0].sizeimage, stream_sps.display_width, stream_sps.display_height));
+				pf.width, pf.height, pf.plane_fmt[0].sizeimage, stream_size.width, stream_size.height));
 		return FAILED;
 	}
 	// Only formats HWVideoTexture can show: anything else would be garbage on screen.
 	const bool importable = is_10bit ? (pf.pixelformat == V4L2_PIX_FMT_P010 || (experimental_10bit && pf.pixelformat == V4L2_PIX_FMT_QC10C)) : (pf.pixelformat == V4L2_PIX_FMT_NV12 || pf.pixelformat == V4L2_PIX_FMT_QC08C);
 	if (!importable) {
+		{
+			MutexLock lock(mutex);
+			format_error = true;
+		}
 		if (is_10bit) {
-			_fail(vformat("%d-bit video is not supported yet on this kernel: the decoder writes it as %s (offered: %s), which the player can't display yet.", stream_sps.bit_depth, _fourcc_to_string(pf.pixelformat), offered));
+			_fail(vformat("%d-bit video is not supported yet on this kernel: the decoder writes it as %s (offered: %s), which the player can't display yet.", bit_depth, _fourcc_to_string(pf.pixelformat), offered));
 		} else {
 			_fail(vformat("The decoder chose the CAPTURE format %s (offered: %s), which the player can't display (NV12 and Q08C only for 8-bit).", _fourcc_to_string(pf.pixelformat), offered));
 		}
@@ -858,7 +979,7 @@ Error V4L2Decoder::_setup_capture() {
 	if (visible_ok && selection.r.width > 0 && selection.r.height > 0) {
 		visible = Rect2i(selection.r.left, selection.r.top, selection.r.width, selection.r.height);
 	} else if (stream_sps.valid) {
-		visible = Rect2i(0, 0, MIN(stream_sps.display_width, pf.width), MIN(stream_sps.display_height, pf.height));
+		visible = Rect2i(0, 0, MIN((uint32_t)stream_size.width, pf.width), MIN((uint32_t)stream_size.height, pf.height));
 	} else {
 		visible = Rect2i(0, 0, pf.width, pf.height);
 	}
@@ -1075,9 +1196,13 @@ int V4L2Decoder::_dequeue_capture() {
 				_log_verbose("DQBUF CAPTURE: EPIPE (the LAST buffer was already dequeued).");
 				got_last = true;
 				t_last_seen = _now();
+			} else if (errno != EAGAIN) {
+				dqbuf_failures++;
+				dqbuf_errno = errno;
 			}
 			break;
 		}
+		dqbuf_failures = 0;
 		const double now = _now();
 		count++;
 		if (buffer.index >= capture_count) {
@@ -1093,11 +1218,17 @@ int V4L2Decoder::_dequeue_capture() {
 		bool keep = false;
 		if (buffer.flags & V4L2_BUF_FLAG_ERROR) {
 			wstats.frames_error++;
+			error_run++;
+			fed_since_frame = 0; // The decoder answered, if badly (error_run judges that).
+			t_unanswered = 0.0;
 			Epoch *epoch = _find_epoch(frame_seq);
 			if (epoch) {
 				epoch->frames++; // It still takes a display slot.
 			}
 		} else if (planes[0].bytesused > 0) {
+			error_run = 0;
+			fed_since_frame = 0;
+			t_unanswered = 0.0;
 			if (planes[0].data_offset != 0 && !data_offset_logged) {
 				// The import assumes the picture starts at the buffer's start (iris: data_offset 0).
 				data_offset_logged = true;
@@ -1385,11 +1516,14 @@ void V4L2Decoder::_run() {
 			OS::get_singleton()->delay_usec(1000); // Something we couldn't consume.
 		}
 		_publish_stats();
+		if (_check_vp9_faults(now)) {
+			break;
+		}
 
 		// Waiting on the decoder: it holds input and has somewhere to put the output, or a drain is in progress.
 		const bool waiting = (output_in_driver > 0 && (capture_in_driver > 0 || !capture_configured)) || (stop_sent && !ended) || pending_reconfig;
 		if (waiting && now - last_progress > timeout) {
-			_fail(vformat("HANG: the decoder made no progress for %.1f s (%d OUTPUT and %d CAPTURE buffers in the driver, stop sent %s, reconfig %s). Firmware hang? Check 'sudo dmesg | grep -iE \"iris|0x5000003\"'. Closing the session; don't SIGKILL a process stuck in a decoder ioctl.",
+			_fail_decoder(vformat("HANG: the decoder made no progress for %.1f s (%d OUTPUT and %d CAPTURE buffers in the driver, stop sent %s, reconfig %s). Firmware hang? Check 'sudo dmesg | grep -iE \"iris|0x5000003\"'. Closing the session; don't SIGKILL a process stuck in a decoder ioctl.",
 					now - last_progress, output_in_driver, capture_in_driver, stop_sent ? "yes" : "no", pending_reconfig ? "yes" : "no"));
 			break;
 		}
@@ -1403,6 +1537,15 @@ void V4L2Decoder::_thread_func(void *p_userdata) {
 	}
 	self->_close_device("session end");
 	self->_publish_stats();
+	if (self->vp9 && self->is_decoder_fault()) {
+		// The firmware may have crashed (the rebind service reloads it): no more hardware VP9 in this run.
+		MutexLock lock(vp9_mutex);
+		if (vp9_disabled_reason.is_empty()) {
+			vp9_disabled_reason = "The hardware decoder failed on VP9 earlier in this run, so VP9 decodes in software until the player restarts.";
+			self->_log("hardware VP9 is off for the rest of this run (after: " + self->get_last_error() + ").");
+		}
+	}
+	self->worker_finished.set();
 }
 
 /* Public API */
@@ -1413,11 +1556,13 @@ Error V4L2Decoder::open(const String &p_path, const String &p_codec, double p_fp
 	ERR_FAIL_COND_V_MSG(p_fps <= 0.0 || p_fps > 1000.0, ERR_INVALID_PARAMETER, "V4L2Decoder: fps must be in (0, 1000].");
 	fps = p_fps;
 	source.unref();
+	vp9 = false;
 
 	{
 		MutexLock lock(mutex);
 		state = STATE_CLOSED;
 		last_error = String();
+		format_error = decoder_fault = false;
 	}
 	Error err = _map_file(p_path, file_data, file_size);
 	if (err != OK) {
@@ -1458,6 +1603,7 @@ Error V4L2Decoder::open_source(const Ref<MediaSource> &p_source) {
 		MutexLock lock(mutex);
 		state = STATE_CLOSED;
 		last_error = String();
+		format_error = decoder_fault = false;
 	}
 	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
 	const String path = p_source->get_path();
@@ -1465,39 +1611,67 @@ Error V4L2Decoder::open_source(const Ref<MediaSource> &p_source) {
 		_fail(vformat("%s has no video stream.", path));
 		return ERR_INVALID_DATA;
 	}
-	// Refuse what can't be shown before the device is opened: VP9 (firmware crashes), AV1, 10-bit (unless P010 is offered),
-	// 4:2:2.
+	// Refuse what can't be shown before the device is opened: AV1, 10-bit (unless P010 is offered), 4:2:2, VP9 profiles
+	// 1 and 3.
 	const bool ten_bit = MAX(info.bit_depth, (int)info.sps.bit_depth) > 8;
 	const String reason = MediaSource::get_hw_unsupported_reason(info, experimental_10bit || (ten_bit && is_p010_available(device_path)));
 	if (!reason.is_empty()) {
 		_fail(reason);
 		return ERR_UNAVAILABLE;
 	}
-	if (!info.sps.valid) {
-		_fail(vformat("%s: no SPS found for the %s stream, so the coded size is unknown.", path, info.codec_name));
-		return ERR_FILE_UNRECOGNIZED;
+	vp9 = info.codec == MediaSource::VIDEO_CODEC_VP9;
+	if (vp9) {
+		// No SPS: the container's frame size is the OUTPUT format's (a hint: the driver reports the real one at
+		// SOURCE_CHANGE, from the first keyframe's header), its pixel format the bit depth.
+		stream_sps = AnnexBSplitter::SPSInfo();
+		stream_sps.width = stream_sps.display_width = (uint32_t)MAX(info.width, 0);
+		stream_sps.height = stream_sps.display_height = (uint32_t)MAX(info.height, 0);
+		stream_sps.bit_depth = (uint32_t)MAX(info.bit_depth, 8);
+		stream_sps.chroma_format = 1;
+		stream_sps.valid = info.width > 0 && info.height > 0;
+		if (!stream_sps.valid) {
+			// Placeholder size; the keyframe header and SOURCE_CHANGE give the real one.
+			stream_sps.width = 1920;
+			stream_sps.height = 1088;
+		}
+		MutexLock lock(vp9_mutex);
+		if (!vp9_disabled_reason.is_empty()) {
+			_fail(vp9_disabled_reason);
+			return ERR_UNAVAILABLE;
+		}
+		if (vp9_owner != nullptr && vp9_owner != this) {
+			_fail("Another video is decoding VP9 in hardware: two VP9 sessions at once crash the decoder firmware (SteamOS #2865), so only one is opened.");
+			return ERR_BUSY;
+		}
+		vp9_owner = this;
+	} else {
+		if (!info.sps.valid) {
+			_fail(vformat("%s: no SPS found for the %s stream, so the coded size is unknown.", path, info.codec_name));
+			return ERR_FILE_UNRECOGNIZED;
+		}
+		codec = info.codec == MediaSource::VIDEO_CODEC_H264 ? AnnexBSplitter::CODEC_H264 : AnnexBSplitter::CODEC_HEVC;
+		stream_sps = info.sps;
 	}
-	codec = info.codec == MediaSource::VIDEO_CODEC_H264 ? AnnexBSplitter::CODEC_H264 : AnnexBSplitter::CODEC_HEVC;
 	fps = info.fps >= 1.0 && info.fps <= 240.0 ? info.fps : 30.0;
-	stream_sps = info.sps;
 	file_path = path;
 	source = p_source;
 	if (loop) {
 		_log("loop is ignored with a MediaSource; seek to 0 at the end instead.");
 	}
-	_log(vformat("%s: %s %dx%d (display %dx%d), %d-bit, %.3f fps, from a MediaSource (frame times from PTS).", path, codec == AnnexBSplitter::CODEC_H264 ? "H.264" : "HEVC", stream_sps.width, stream_sps.height,
-			stream_sps.display_width, stream_sps.display_height, stream_sps.bit_depth, fps));
+	_log(vformat("%s: %s %dx%d (display %dx%d), %d-bit, %.3f fps, from a MediaSource (frame times from PTS)%s.", path, vp9 ? "VP9 " + info.profile : String(codec == AnnexBSplitter::CODEC_H264 ? "H.264" : "HEVC"),
+			stream_sps.width, stream_sps.height, stream_sps.display_width, stream_sps.display_height, stream_sps.bit_depth, fps, vp9 ? "; the one hardware VP9 session" : ""));
 	const Error err = _start_worker();
 	if (err != OK) {
 		source->set_video_wake_fd(-1);
 		source.unref();
+		_release_vp9();
 	}
 	return err;
 }
 
 // Resets the worker state, opens the device (so a missing decoder fails here, synchronously) and starts the worker.
 Error V4L2Decoder::_start_worker() {
-	codec_fourcc = codec == AnnexBSplitter::CODEC_H264 ? V4L2_PIX_FMT_H264 : V4L2_PIX_FMT_HEVC;
+	codec_fourcc = vp9 ? V4L2_PIX_FMT_VP9 : (codec == AnnexBSplitter::CODEC_H264 ? V4L2_PIX_FMT_H264 : V4L2_PIX_FMT_HEVC);
 	const CharString capture_name = capture_format.utf8();
 	capture_fourcc = capture_name.length() == 4 ? v4l2_fourcc(capture_name[0], capture_name[1], capture_name[2], capture_name[3]) : 0;
 
@@ -1519,6 +1693,12 @@ Error V4L2Decoder::_start_worker() {
 	eos_events = 0;
 	recent_count = 0;
 	ioctl_error_count = 0;
+	vp9_bit_depth = 0;
+	dqbuf_failures = 0;
+	dqbuf_errno = 0;
+	error_run = 0;
+	fed_since_frame = 0;
+	t_unanswered = 0.0;
 	epochs.clear();
 	_begin_epoch(serial, 0);
 	have_held = false;
@@ -1544,6 +1724,7 @@ Error V4L2Decoder::_start_worker() {
 	}
 	_set_state(STATE_STARTING);
 	exit_requested.clear();
+	worker_finished.clear();
 	thread.start(&V4L2Decoder::_thread_func, this);
 	return OK;
 }
@@ -1556,6 +1737,7 @@ void V4L2Decoder::close() {
 		thread.wait_to_finish();
 	}
 	_close_device("close");
+	_release_vp9(); // After the device is closed: the next VP9 session may open now.
 	if (source.is_valid()) {
 		source->set_video_wake_fd(-1); // Before the eventfd is closed: the source writes to it under its lock.
 		if (have_held) {
@@ -1694,6 +1876,9 @@ Dictionary V4L2Decoder::get_stats() const {
 	d["thread_cpu_seconds"] = stats.thread_cpu_seconds;
 	d["input_position"] = source.is_valid() ? stats.input_time : (double)stats.media_index / fps;
 	d["last_error"] = last_error;
+	d["codec"] = vp9 ? "vp9" : (codec == AnnexBSplitter::CODEC_H264 ? "h264" : "hevc");
+	d["format_error"] = format_error;
+	d["decoder_fault"] = decoder_fault;
 	return d;
 }
 
@@ -1701,13 +1886,174 @@ Dictionary V4L2Decoder::get_stream_info() const {
 	Dictionary d;
 	d["path"] = file_path;
 	d["media_source"] = source.is_valid();
-	d["codec"] = codec == AnnexBSplitter::CODEC_H264 ? "h264" : "hevc";
+	d["codec"] = vp9 ? "vp9" : (codec == AnnexBSplitter::CODEC_H264 ? "h264" : "hevc");
 	d["fps"] = fps;
 	d["width"] = stream_sps.width;
 	d["height"] = stream_sps.height;
 	d["display_width"] = stream_sps.display_width;
 	d["display_height"] = stream_sps.display_height;
 	d["bit_depth"] = stream_sps.bit_depth;
+	return d;
+}
+
+namespace {
+
+// MSB-first bit reader for the VP9 uncompressed header. Reads past the end give 0 and set `overrun`.
+struct VP9Bits {
+	const uint8_t *data;
+	uint64_t size;
+	uint64_t bit = 0;
+	bool overrun = false;
+	uint32_t read(int p_bits) {
+		uint32_t value = 0;
+		for (int i = 0; i < p_bits; i++) {
+			const uint64_t byte = bit >> 3;
+			uint32_t b = 0;
+			if (byte < size) {
+				b = (data[byte] >> (7 - (bit & 7))) & 1;
+			} else {
+				overrun = true;
+			}
+			value = (value << 1) | b;
+			bit++;
+		}
+		return value;
+	}
+};
+
+// One frame's uncompressed header (VP9 spec 6.2: frame_marker, profile, show_existing_frame, frame_type, ...,
+// frame_sync_code, color_config(), frame_size(), render_size()). False if it isn't a VP9 frame header.
+bool parse_vp9_frame(const uint8_t *p_data, uint64_t p_size, V4L2Decoder::VP9FrameInfo &r_info) {
+	VP9Bits bits{ p_data, p_size };
+	if (bits.read(2) != 2) {
+		return false; // frame_marker
+	}
+	const uint32_t profile_low = bits.read(1);
+	const uint32_t profile_high = bits.read(1);
+	r_info.profile = (int)((profile_high << 1) | profile_low);
+	if (r_info.profile == 3) {
+		bits.read(1); // reserved_zero
+	}
+	r_info.show_existing_frame = bits.read(1);
+	if (r_info.show_existing_frame) {
+		r_info.keyframe = false;
+		return !bits.overrun;
+	}
+	r_info.keyframe = bits.read(1) == 0; // frame_type: 0 is KEY_FRAME.
+	bits.read(1); // show_frame
+	bits.read(1); // error_resilient_mode
+	if (!r_info.keyframe) {
+		return !bits.overrun; // Inter and intra-only frames: the size needs the reference state; not parsed.
+	}
+	if (bits.read(8) != 0x49 || bits.read(8) != 0x83 || bits.read(8) != 0x42) {
+		return false; // frame_sync_code
+	}
+	r_info.bit_depth = r_info.profile >= 2 ? (bits.read(1) ? 12 : 10) : 8;
+	r_info.color_space = (int)bits.read(3);
+	if (r_info.color_space != 7) { // Not CS_RGB.
+		r_info.full_range = bits.read(1);
+		if (r_info.profile == 1 || r_info.profile == 3) {
+			r_info.subsampling_x = (int)bits.read(1);
+			r_info.subsampling_y = (int)bits.read(1);
+			bits.read(1); // reserved_zero
+		} else {
+			r_info.subsampling_x = r_info.subsampling_y = 1;
+		}
+	} else {
+		r_info.full_range = true;
+		r_info.subsampling_x = r_info.subsampling_y = 0;
+		if (r_info.profile == 1 || r_info.profile == 3) {
+			bits.read(1); // reserved_zero
+		}
+	}
+	r_info.width = bits.read(16) + 1;
+	r_info.height = bits.read(16) + 1;
+	if (bits.read(1)) { // render_and_frame_size_different
+		r_info.render_width = bits.read(16) + 1;
+		r_info.render_height = bits.read(16) + 1;
+	} else {
+		r_info.render_width = r_info.width;
+		r_info.render_height = r_info.height;
+	}
+	return !bits.overrun;
+}
+
+} // namespace
+
+bool V4L2Decoder::parse_vp9_packet(const uint8_t *p_data, uint64_t p_size, VP9FrameInfo &r_info) {
+	r_info = VP9FrameInfo();
+	if (p_data == nullptr || p_size == 0) {
+		return false;
+	}
+	// A superframe (several frames in one packet, e.g. a hidden alt-ref frame and a shown one) ends with an index:
+	// marker byte 0b110mmfff, frame sizes (mm + 1 bytes each, little-endian, fff + 1 of them), the marker again.
+	uint64_t offsets[8] = { 0 };
+	uint64_t sizes[8] = { p_size };
+	int frames = 1;
+	const uint8_t marker = p_data[p_size - 1];
+	if ((marker & 0xe0) == 0xc0) {
+		const int count = (marker & 7) + 1;
+		const int magnitude = ((marker >> 3) & 3) + 1;
+		const uint64_t index_size = 2 + (uint64_t)magnitude * count;
+		if (p_size >= index_size && p_data[p_size - index_size] == marker) {
+			const uint8_t *index = p_data + p_size - index_size + 1;
+			uint64_t offset = 0;
+			bool fits = true;
+			for (int i = 0; i < count; i++) {
+				uint64_t size = 0;
+				for (int b = 0; b < magnitude; b++) {
+					size |= (uint64_t)index[i * magnitude + b] << (8 * b);
+				}
+				if (offset + size > p_size - index_size) {
+					fits = false;
+					break;
+				}
+				offsets[i] = offset;
+				sizes[i] = size;
+				offset += size;
+			}
+			if (fits) {
+				frames = count;
+			}
+		}
+	}
+	bool any = false;
+	for (int i = 0; i < frames; i++) {
+		VP9FrameInfo frame;
+		if (!parse_vp9_frame(p_data + offsets[i], sizes[i], frame)) {
+			continue;
+		}
+		if (!any || (frame.keyframe && !r_info.keyframe)) {
+			r_info = frame;
+		}
+		any = true;
+		if (frame.keyframe) {
+			break;
+		}
+	}
+	r_info.frames = frames;
+	r_info.valid = any;
+	return any;
+}
+
+Dictionary V4L2Decoder::probe_vp9_packet(const PackedByteArray &p_packet) {
+	Dictionary d;
+	VP9FrameInfo info;
+	if (!parse_vp9_packet(p_packet.ptr(), (uint64_t)p_packet.size(), info)) {
+		return d;
+	}
+	d["keyframe"] = info.keyframe;
+	d["show_existing_frame"] = info.show_existing_frame;
+	d["profile"] = info.profile;
+	d["bit_depth"] = info.bit_depth;
+	d["color_space"] = info.color_space;
+	d["full_range"] = info.full_range;
+	d["subsampling"] = Vector2i(info.subsampling_x, info.subsampling_y);
+	d["width"] = info.width;
+	d["height"] = info.height;
+	d["render_width"] = info.render_width;
+	d["render_height"] = info.render_height;
+	d["frames"] = info.frames;
 	return d;
 }
 
@@ -1913,6 +2259,12 @@ V4L2Decoder::~V4L2Decoder() {
 
 void V4L2Decoder::_bind_methods() {
 	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("probe_file", "path", "codec", "max_access_units", "list_count"), &V4L2Decoder::probe_file, DEFVAL(0), DEFVAL(6));
+	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("probe_vp9_packet", "packet"), &V4L2Decoder::probe_vp9_packet);
+	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("is_vp9_session_live"), &V4L2Decoder::is_vp9_session_live);
+	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("get_vp9_disabled_reason"), &V4L2Decoder::get_vp9_disabled_reason);
+	ClassDB::bind_method(D_METHOD("is_vp9"), &V4L2Decoder::is_vp9);
+	ClassDB::bind_method(D_METHOD("is_format_error"), &V4L2Decoder::is_format_error);
+	ClassDB::bind_method(D_METHOD("is_decoder_fault"), &V4L2Decoder::is_decoder_fault);
 
 	ClassDB::bind_method(D_METHOD("open", "path", "codec", "fps"), &V4L2Decoder::open);
 	ClassDB::bind_method(D_METHOD("open_source", "source"), &V4L2Decoder::open_source);

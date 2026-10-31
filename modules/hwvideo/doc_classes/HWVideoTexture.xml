@@ -59,6 +59,12 @@
 				Returns [code]"hardware"[/code] (the V4L2 decoder, frames imported without copies), [code]"software"[/code] (the fallback, see [member software_fallback]), or an empty string when nothing is open.
 			</description>
 		</method>
+		<method name="get_decode_path_text" qualifiers="const">
+			<return type="String" />
+			<description>
+				[method get_decode_path] for people: [code]"hardware (VP9)"[/code], [code]"hardware (VP9, 10-bit)"[/code], [code]"hardware (10-bit)"[/code], [code]"hardware"[/code], [code]"software"[/code] or an empty string. Also [code]decode_path_text[/code] in [method get_stats] and [method get_overlay_stats].
+			</description>
+		</method>
 		<method name="get_software_reason" qualifiers="const">
 			<return type="String" />
 			<description>
@@ -194,6 +200,13 @@
 				Exchanges the plane textures ([method get_plane_texture]) with [param other]'s and points each set at its new owner's current frame (the placeholder if it has none yet). A material that samples the textures this one had now shows [param other]'s frames, and the other way round. [signal format_changed] is emitted on both, since the two may differ in size and packing. [method set_next] uses it at the end of an item; call it directly to change items somewhere else.
 			</description>
 		</method>
+		<method name="switch_to_software">
+			<return type="int" enum="Error" />
+			<param index="0" name="reason" type="String" default="&quot;&quot;" />
+			<description>
+				With a [MediaSource]: closes the decoder, seeks the source to the current position and goes on there in software (up to [member software_max_pixels]), keeping play or pause and the next item ([method set_next]). [method get_software_reason] is then [param reason]. The picture is black until the first software frame is up (tens of milliseconds). [method update] does this by itself when a VP9 hardware session fails (see [member hw_vp9]); on the software path it restarts the software decoder at the position.
+			</description>
+		</method>
 		<method name="update">
 			<return type="void" />
 			<param index="0" name="delta" type="float" />
@@ -204,11 +217,14 @@
 		</method>
 	</methods>
 	<members>
+		<member name="hw_vp9" type="bool" setter="set_hw_vp9" getter="is_hw_vp9" default="true">
+			VP9 (profiles 0 and 2) in hardware. On the Frame, sequential VP9 sessions work but two at once crash the decoder firmware (SteamOS #2865), so the process keeps at most one hardware VP9 session ([method V4L2Decoder.is_vp9_session_live]): [method open_source] of VP9 while another texture holds it (the next item, picture in picture, thumbnails, a crossfade) decodes in software, with a log line and the reason in [method get_software_reason], or fails if software can't take it. A VP9 hardware session that fails (DQBUF errors, a run of decoder errors, no picture for the input fed, a hang; or 10-bit without P010) stops cleanly and [method update] goes on in software from the current position ([method switch_to_software]); after a decoder fault, hardware VP9 stays off until the process ends ([method V4L2Decoder.get_vp9_disabled_reason]). [code]false[/code]: VP9 always in software. The environment variable [code]HWVIDEO_HW_VP9=0[/code] or [code]1[/code] overrides it. Applies at [method open_source].
+		</member>
 		<member name="playback_speed" type="float" setter="set_playback_speed" getter="get_playback_speed" default="1.0">
 			0.25 to 4. Without a master clock ([method update] with [code]master_clock[/code] below 0), the frame clock runs this much faster or slower. With the audio as the master clock, set [member MediaSource.playback_speed] instead: the video follows the audio.
 		</member>
 		<member name="software_fallback" type="bool" setter="set_software_fallback" getter="is_software_fallback" default="true">
-			When [method open_source] gets a stream the hardware path can't show (VP9, 10-bit, 4:2:2, H.264 High 10), or there is no hardware decoder (no [member V4L2Decoder.device_path], as on a desktop), it is decoded in software instead if it is H.264, HEVC or VP9 of at most [member software_max_pixels]: FFmpeg's decoders on threads of their own, each frame converted to 8-bit NV12 and uploaded to two textures, so [method get_plane_texture] and the NV12 shader work the same. 10-bit is rounded to 8 bits and HDR isn't tone-mapped. Bigger or other streams fail with the reason in [method get_last_error]. [method get_stats] then has [code]decode_path[/code] [code]"software"[/code], the keys of [method V4L2Decoder.get_stats] that apply, and [code]software_*[/code] keys ([code]software_thread_cpu_seconds[/code] is the feeding thread only; [code]process_cpu_seconds[/code] includes FFmpeg's worker threads). [method open] (raw Annex-B files) always uses the hardware path.
+			When [method open_source] gets a stream the hardware path can't show (10-bit without P010, 4:2:2, H.264 High 10, VP9 under the rules of [member hw_vp9]), or there is no hardware decoder (no [member V4L2Decoder.device_path], as on a desktop), it is decoded in software instead if it is H.264, HEVC or VP9 of at most [member software_max_pixels]: FFmpeg's decoders on threads of their own, each frame converted to 8-bit NV12 and uploaded to two textures, so [method get_plane_texture] and the NV12 shader work the same. 10-bit is rounded to 8 bits and HDR isn't tone-mapped. Bigger or other streams fail with the reason in [method get_last_error]. [method get_stats] then has [code]decode_path[/code] [code]"software"[/code], the keys of [method V4L2Decoder.get_stats] that apply, and [code]software_*[/code] keys ([code]software_thread_cpu_seconds[/code] is the feeding thread only; [code]process_cpu_seconds[/code] includes FFmpeg's worker threads). [method open] (raw Annex-B files) always uses the hardware path.
 			After opening and after a seek, the software decoder skips the pictures nothing refers to (most B-frames) until two frames before the target, since those would be thrown away: seeks settle faster and cost less CPU. The environment variable [code]HWVIDEO_SW_SEEK_NONREF=0[/code] turns that off.
 			The environment variable [code]HWVIDEO_FORCE_SW=1[/code] decodes in software every stream it can, also on the Frame, to compare the two paths; bigger streams still go to the hardware.
 		</member>

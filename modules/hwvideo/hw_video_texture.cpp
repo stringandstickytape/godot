@@ -344,6 +344,21 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	if (decoder.is_null() || !decoder->is_open()) {
 		return;
 	}
+	if (decoder->is_vp9() && software_fallback && decoder->get_state() == V4L2Decoder::STATE_ERROR && decoder->is_worker_finished()) {
+		// A VP9 decoder fault (or 10-bit VP9 without P010): the worker has closed the device (so close() doesn't wait on
+		// a stuck ioctl here); go on in software.
+		String why;
+		if (decoder->is_format_error()) {
+			const MediaSource::VideoInfo &info = source->get_video_stream_info();
+			why = MediaSource::get_hw_unsupported_reason(info, decoder->is_experimental_10bit() || V4L2Decoder::is_p010_available(decoder->get_device_path()));
+		}
+		if (why.is_empty()) {
+			why = "The hardware decoder failed on VP9 (" + decoder->get_last_error() + ").";
+		}
+		_switch_to_software(why);
+		_check_next();
+		return;
+	}
 	_check_seek();
 	if (playing) {
 		// Trick play (keyframes only, no audio): the source sets the pace.
@@ -686,6 +701,19 @@ String HWVideoTexture::get_decode_path() const {
 	return decoder.is_valid() && decoder->is_open() ? "hardware" : "";
 }
 
+String HWVideoTexture::get_decode_path_text() const {
+	const String path = get_decode_path();
+	if (path != "hardware") {
+		return path;
+	}
+	const bool vp9 = decoder->is_vp9();
+	const bool ten_bit = have_generation && packing != PACKING_NV12;
+	if (vp9) {
+		return ten_bit ? "hardware (VP9, 10-bit)" : "hardware (VP9)";
+	}
+	return ten_bit ? "hardware (10-bit)" : "hardware";
+}
+
 Error HWVideoTexture::open(const String &p_path, const String &p_codec, double p_fps) {
 	close();
 	last_error = String();
@@ -719,50 +747,138 @@ Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
 	settling = true;
 	software_reason = String();
 
-	// What the hardware path can't show (VP9, 10-bit, 4:2:2, H.264 High 10) is decoded in software, up to about 1080p.
+	// What the hardware path can't show (10-bit without P010, 4:2:2, H.264 High 10) is decoded in software, up to about
+	// 1080p; so is VP9 when hardware VP9 is off, or another texture holds the one hardware VP9 session.
 	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
 	const bool ten_bit = MAX(info.bit_depth, (int)info.sps.bit_depth) > 8;
 	const bool allow_10bit = decoder->is_experimental_10bit() || (ten_bit && V4L2Decoder::is_p010_available(decoder->get_device_path()));
 	String hw_reason = MediaSource::get_hw_unsupported_reason(info, allow_10bit);
 	bool forced = false; // Software by choice: what software can't decode still goes to the hardware.
-	if (hw_reason.is_empty()) {
+	bool never_hardware = false; // VP9 policy: what software can't decode fails instead.
+	if (!pending_software_reason.is_empty()) {
+		// _switch_to_software(): the hardware session has just failed.
+		hw_reason = pending_software_reason;
+		pending_software_reason = String();
+		never_hardware = true;
+	} else if (hw_reason.is_empty()) {
 		// A machine without the decoder (a desktop) decodes in software too; HWVIDEO_FORCE_SW=1 does it anywhere (A/B).
 		struct stat device;
 		if (OS::get_singleton()->get_environment("HWVIDEO_FORCE_SW") == "1") {
 			hw_reason = "Software decode forced (HWVIDEO_FORCE_SW=1).";
 			forced = true;
+			// What software can't take goes to the hardware then, but VP9 only within its rules.
+			never_hardware = info.codec == MediaSource::VIDEO_CODEC_VP9 && !_vp9_policy_reason().is_empty();
 		} else if (stat(decoder->get_device_path().utf8().get_data(), &device) != 0) {
 			hw_reason = vformat("There is no hardware video decoder on this machine (no %s).", decoder->get_device_path());
+		} else if (info.codec == MediaSource::VIDEO_CODEC_VP9) {
+			hw_reason = _vp9_policy_reason();
+			never_hardware = !hw_reason.is_empty();
 		}
 	}
 	const String sw_reason = hw_reason.is_empty() ? String() : SoftwareVideoDecoder::get_unsupported_reason(info, software_max_pixels);
+	if (never_hardware && (!software_fallback || !sw_reason.is_empty())) {
+		last_error = software_fallback ? hw_reason + " " + sw_reason : hw_reason + " (software_fallback is off)";
+		print_line("HWVideoTexture: can't play VP9: " + last_error);
+		source.unref();
+		return ERR_UNAVAILABLE;
+	}
 	if (!hw_reason.is_empty() && software_fallback && !(forced && !sw_reason.is_empty())) {
 		if (!sw_reason.is_empty()) {
 			last_error = hw_reason + " " + sw_reason;
 			source.unref();
 			return ERR_UNAVAILABLE;
 		}
-		software = memnew(SoftwareVideoDecoder);
-		String error;
-		const Error err = software->open(p_source, software_threads, error);
-		if (err != OK) {
-			memdelete(software);
-			software = nullptr;
-			last_error = error;
-			source.unref();
-			return err;
-		}
-		software_reason = hw_reason;
-		print_line(vformat("HWVideoTexture: software decode (%s): %s", software->get_description(), hw_reason));
-		return OK;
+		return _open_software(p_source, hw_reason);
 	}
 
 	const Error err = decoder->open_source(p_source);
+	if (err == ERR_BUSY && info.codec == MediaSource::VIDEO_CODEC_VP9 && software_fallback) {
+		// Opened elsewhere since the check above (another thread): the one-session rule holds, this one goes to software.
+		const String busy_reason = decoder->get_last_error();
+		const String busy_sw_reason = SoftwareVideoDecoder::get_unsupported_reason(info, software_max_pixels);
+		if (!busy_sw_reason.is_empty()) {
+			last_error = busy_reason + " " + busy_sw_reason;
+			source.unref();
+			return ERR_UNAVAILABLE;
+		}
+		return _open_software(p_source, busy_reason);
+	}
 	if (err != OK) {
 		last_error = decoder->get_last_error();
 		source.unref();
+	} else if (info.codec == MediaSource::VIDEO_CODEC_VP9) {
+		print_line(vformat("HWVideoTexture: hardware decode (VP9 %s, %d-bit): the one hardware VP9 session of this process.", info.profile, MAX(info.bit_depth, 8)));
 	}
 	return err;
+}
+
+// Why this VP9 stream doesn't go to the hardware now ("" if it does): hw_vp9 / HWVIDEO_HW_VP9, a decoder fault earlier
+// in the run, or the one hardware VP9 session is taken (two at once crash the iris firmware, SteamOS #2865).
+String HWVideoTexture::_vp9_policy_reason() const {
+	const String env = OS::get_singleton()->get_environment("HWVIDEO_HW_VP9");
+	if (env == "0") {
+		return "Hardware VP9 decode is off (HWVIDEO_HW_VP9=0).";
+	}
+	if (env != "1" && !hw_vp9) {
+		return "Hardware VP9 decode is off (the hw_vp9 setting).";
+	}
+	const String disabled = V4L2Decoder::get_vp9_disabled_reason();
+	if (!disabled.is_empty()) {
+		return disabled;
+	}
+	if (V4L2Decoder::is_vp9_session_live()) {
+		return "Another video is decoding VP9 in hardware: two VP9 sessions at once crash the decoder firmware (SteamOS #2865), so this one decodes in software.";
+	}
+	return String();
+}
+
+Error HWVideoTexture::_open_software(const Ref<MediaSource> &p_source, const String &p_reason) {
+	software = memnew(SoftwareVideoDecoder);
+	String error;
+	const Error err = software->open(p_source, software_threads, error);
+	if (err != OK) {
+		memdelete(software);
+		software = nullptr;
+		last_error = error;
+		source.unref();
+		return err;
+	}
+	software_reason = p_reason;
+	print_line(vformat("HWVideoTexture: software decode (%s): %s", software->get_description(), p_reason));
+	return OK;
+}
+
+// Closes the decoder (hardware or software), opens the software path on the same source and seeks it to where playback
+// is, keeping play/pause and the next item. The picture is black until the first software frame is up.
+Error HWVideoTexture::_switch_to_software(const String &p_reason) {
+	ERR_FAIL_COND_V_MSG(source.is_null(), ERR_UNCONFIGURED, "HWVideoTexture: switching to software decode needs a MediaSource.");
+	const Ref<MediaSource> resume_source = source;
+	const double resume_time = clock;
+	const bool was_playing = playing;
+	const Ref<HWVideoTexture> keep_next = next;
+	const uint64_t keep_next_usec = next_set_usec;
+	const double keep_next_preroll = next_preroll_seconds;
+	print_line(vformat("HWVideoTexture: switching to software decode at %.3f s: %s", resume_time, p_reason));
+	close();
+	// Seek first: the new decoder then starts at the keyframe before resume_time (open_source() takes the serial and the
+	// target), instead of being fed the rest of a GOP it has no references for.
+	resume_source->seek(resume_time);
+	pending_software_reason = p_reason;
+	const Error err = open_source(resume_source);
+	pending_software_reason = String();
+	next = keep_next;
+	next_set_usec = keep_next_usec;
+	next_preroll_seconds = keep_next_preroll;
+	if (err != OK) {
+		ERR_PRINT("HWVideoTexture: the software path couldn't take over: " + last_error);
+		return err;
+	}
+	playing = was_playing;
+	return OK;
+}
+
+Error HWVideoTexture::switch_to_software(const String &p_reason) {
+	return _switch_to_software(p_reason.is_empty() ? String("Switched to software decode.") : p_reason);
 }
 
 void HWVideoTexture::close() {
@@ -861,7 +977,13 @@ Rect2 HWVideoTexture::get_visible_uv_rect() const {
 
 Dictionary HWVideoTexture::get_stats() const {
 	Dictionary d = software ? _get_software_stats() : decoder->get_stats();
+	if (!software && !decoder->is_open() && !last_error.is_empty()) {
+		// Opening failed, or the software path couldn't take over from a failed hardware session.
+		d["state"] = V4L2Decoder::STATE_ERROR;
+		d["state_name"] = "error";
+	}
 	d["decode_path"] = get_decode_path();
+	d["decode_path_text"] = get_decode_path_text();
 	// CPU time of the whole process (all threads, FFmpeg's decoder threads included), to compare the two paths.
 	struct timespec cpu;
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
@@ -1053,6 +1175,7 @@ Dictionary HWVideoTexture::get_overlay_stats() {
 	const Dictionary stats = get_stats();
 	Dictionary d;
 	d["decode_path"] = stats["decode_path"];
+	d["decode_path_text"] = stats["decode_path_text"];
 	d["position"] = clock;
 	d["frame_size"] = decoded_size;
 	d["packing"] = packing;
@@ -1167,7 +1290,12 @@ void HWVideoTexture::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_visible_uv_rect"), &HWVideoTexture::get_visible_uv_rect);
 	ClassDB::bind_method(D_METHOD("get_packing"), &HWVideoTexture::get_packing);
 	ClassDB::bind_method(D_METHOD("get_decode_path"), &HWVideoTexture::get_decode_path);
+	ClassDB::bind_method(D_METHOD("get_decode_path_text"), &HWVideoTexture::get_decode_path_text);
 	ClassDB::bind_method(D_METHOD("get_software_reason"), &HWVideoTexture::get_software_reason);
+	ClassDB::bind_method(D_METHOD("set_hw_vp9", "enabled"), &HWVideoTexture::set_hw_vp9);
+	ClassDB::bind_method(D_METHOD("is_hw_vp9"), &HWVideoTexture::is_hw_vp9);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "hw_vp9"), "set_hw_vp9", "is_hw_vp9");
+	ClassDB::bind_method(D_METHOD("switch_to_software", "reason"), &HWVideoTexture::switch_to_software, DEFVAL(""));
 	ClassDB::bind_method(D_METHOD("set_software_fallback", "enabled"), &HWVideoTexture::set_software_fallback);
 	ClassDB::bind_method(D_METHOD("is_software_fallback"), &HWVideoTexture::is_software_fallback);
 	ClassDB::bind_method(D_METHOD("set_software_threads", "threads"), &HWVideoTexture::set_software_threads);
