@@ -854,6 +854,29 @@ void WorkerThreadPool::exit_languages_threads() {
 	while (runlevel_data.exit_languages.num_exited_threads != threads.size()) {
 		control_cond_var.wait(lock);
 	}
+
+	// Fork (frame/player): tasks that finished but were never waited for still hold their Callables, and finish()
+	// would free them after ScriptServer::finish_languages(); a GDScript lambda freed then corrupts the heap. The
+	// queues are empty and the threads idle here, so release those Callables now, while the languages are alive,
+	// outside the lock (a captured object's destructor may need it).
+	LocalVector<Callable> unclaimed;
+	String names;
+	for (KeyValue<TaskID, Task *> &E : tasks) {
+		if (!E.value->callable.is_null()) {
+			if (unclaimed.size() < 3) {
+				names += (names.is_empty() ? "" : ", ") + (E.value->description.is_empty() ? String("(no description)") : E.value->description);
+			}
+			unclaimed.push_back(E.value->callable);
+			E.value->callable = Callable();
+		}
+	}
+	if (!unclaimed.is_empty()) {
+		WARN_PRINT(vformat("WorkerThreadPool: %d task(s) were never waited for (%s%s); their callables are released before the script languages shut down. Call wait_for_task_completion() for every task.",
+				unclaimed.size(), names, unclaimed.size() > 3 ? ", ..." : ""));
+		lock.temp_unlock();
+		unclaimed.clear();
+		lock.temp_relock();
+	}
 }
 
 void WorkerThreadPool::finish() {
