@@ -92,7 +92,7 @@ float AudioDynamics::_target_gain() const {
 	return Math::db_to_linear(total_db);
 }
 
-void AudioDynamics::process(float *p_samples, uint32_t p_frames, int p_channels) {
+void AudioDynamics::process(float *p_samples, uint32_t p_frames, int p_channels, float *r_gains) {
 	if (!is_active() || p_channels <= 0) {
 		return;
 	}
@@ -144,6 +144,9 @@ void AudioDynamics::process(float *p_samples, uint32_t p_frames, int p_channels)
 					}
 				}
 				lowest_limiter = MIN(lowest_limiter, limiter_gain);
+			}
+			if (r_gains) {
+				r_gains[done + f] = limit && limiter_gain < 0.9999f ? g * limiter_gain : g;
 			}
 		}
 		gain = target;

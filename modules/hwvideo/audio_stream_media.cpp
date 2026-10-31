@@ -43,11 +43,13 @@ Ref<AudioStreamPlayback> AudioStreamMedia::instantiate_playback() {
 	ERR_FAIL_COND_V_MSG(source.is_null(), playback, "AudioStreamMedia: no MediaSource.");
 	playback.instantiate();
 	playback->source = source;
+	playback->channel = channel;
 	return playback;
 }
 
 String AudioStreamMedia::get_stream_name() const {
-	return source.is_valid() ? source->get_path().get_file() : String("AudioStreamMedia");
+	const String file = source.is_valid() ? source->get_path().get_file() : String("AudioStreamMedia");
+	return channel < 0 ? file : vformat("%s (channel %d)", file, channel);
 }
 
 double AudioStreamMedia::get_length() const {
@@ -57,6 +59,9 @@ double AudioStreamMedia::get_length() const {
 void AudioStreamMedia::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_media_source", "source"), &AudioStreamMedia::set_media_source);
 	ClassDB::bind_method(D_METHOD("get_media_source"), &AudioStreamMedia::get_media_source);
+	ClassDB::bind_method(D_METHOD("set_channel", "channel"), &AudioStreamMedia::set_channel);
+	ClassDB::bind_method(D_METHOD("get_channel"), &AudioStreamMedia::get_channel);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "channel", PROPERTY_HINT_RANGE, "-1,7,1"), "set_channel", "get_channel");
 }
 
 /* AudioStreamPlaybackMedia */
@@ -97,6 +102,10 @@ int AudioStreamPlaybackMedia::mix(AudioFrame *p_buffer, float p_rate_scale, int 
 		}
 		return p_frames;
 	}
-	source->mix_audio(p_buffer, p_frames);
+	if (channel < 0) {
+		source->mix_audio(p_buffer, p_frames);
+	} else {
+		source->mix_audio_channel(p_buffer, p_frames, channel);
+	}
 	return p_frames;
 }

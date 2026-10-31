@@ -5,6 +5,7 @@
 	</brief_description>
 	<description>
 		Plays the audio a [MediaSource] decodes (stereo, already at the mix rate). [method AudioStreamPlayer.get_playback_position] is the media time of the audio mixed, so [code]get_playback_position() + AudioServer.get_time_since_last_mix() - AudioServer.get_output_latency()[/code] is the A/V master clock. When no audio is decoded yet the playback outputs silence and the position stays put. [member AudioStreamPlayer.pitch_scale] is ignored. Get one with [method MediaSource.get_audio_stream].
+		With [member channel] 0 to 7 ([method MediaSource.get_audio_channel_stream], which needs [member MediaSource.discrete_channels]) it plays one channel of the 7.1 audio instead, as mono (left = right): one [AudioStreamPlayer3D] per virtual speaker. The stereo stream and any channel streams can play at the same time; they stay frame-locked and the clock moves once per mix step.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -23,4 +24,9 @@
 			</description>
 		</method>
 	</methods>
+	<members>
+		<member name="channel" type="int" setter="set_channel" getter="get_channel" default="-1">
+			-1: the stereo mix. 0 to 7: one channel of [member MediaSource.discrete_channels]' 7.1, in FFmpeg's order: 0 FL (front left), 1 FR (front right), 2 FC (front centre), 3 LFE (low frequency), 4 BL (back left), 5 BR (back right), 6 SL (side left), 7 SR (side right). Silent without discrete channels, and while [member MediaSource.playback_speed] isn't 1.
+		</member>
+	</members>
 </class>

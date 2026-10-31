@@ -494,8 +494,9 @@ void MediaSource::_update_audio_dsp() {
 bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	const int channels = p_frame->ch_layout.nb_channels;
 	const uint64_t mask = p_frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? p_frame->ch_layout.u.mask : 0;
-	// Downmix to stereo (ITU-R BS.775): centre at -3 dB, plus the dialogue boost.
-	const double center_level = SQRT_HALF * Math::db_to_linear((double)dsp_dialogue_boost);
+	// Downmix to stereo (ITU-R BS.775): centre at -3 dB, plus the dialogue boost. With discrete channels swr makes 7.1 and
+	// _downmix_discrete() the stereo, with the boost.
+	const double center_level = discrete_channels ? SQRT_HALF : SQRT_HALF * Math::db_to_linear((double)dsp_dialogue_boost);
 	if (swr && swr_in_format == p_frame->format && swr_in_rate == p_frame->sample_rate && swr_in_channels == channels && swr_in_mask == mask && swr_center_level == center_level) {
 		return true;
 	}
@@ -510,7 +511,13 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 		av_channel_layout_copy(&in_layout, &p_frame->ch_layout);
 	}
 	AVChannelLayout out_layout = {};
-	av_channel_layout_default(&out_layout, 2);
+	if (discrete_channels) {
+		// Other layouts' channels land on these slots (exact matches 1:1; wide and back centre channels are mixed in).
+		const AVChannelLayout layout_7_1 = AV_CHANNEL_LAYOUT_7POINT1;
+		av_channel_layout_copy(&out_layout, &layout_7_1);
+	} else {
+		av_channel_layout_default(&out_layout, 2);
+	}
 	int r = swr_alloc_set_opts2(&swr, &out_layout, AV_SAMPLE_FMT_FLT, output_rate, &in_layout, (AVSampleFormat)p_frame->format, p_frame->sample_rate, 0, nullptr);
 	if (r >= 0) {
 		// Downmix to stereo (ITU-R BS.775): centre and surrounds at -3 dB, LFE dropped. Not normalised by default (like
@@ -528,6 +535,14 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	av_channel_layout_describe(&in_layout, in_name, sizeof(in_name));
 	dstats.dialogue_boost_applies = av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_CENTER) >= 0 &&
 			av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_LEFT) >= 0 && av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_RIGHT) >= 0;
+	static const AVChannel slots[DISCRETE_CHANNELS] = { AV_CHAN_FRONT_LEFT, AV_CHAN_FRONT_RIGHT, AV_CHAN_FRONT_CENTER, AV_CHAN_LOW_FREQUENCY,
+		AV_CHAN_BACK_LEFT, AV_CHAN_BACK_RIGHT, AV_CHAN_SIDE_LEFT, AV_CHAN_SIDE_RIGHT };
+	dstats.audio_channel_mask = 0;
+	for (int i = 0; i < DISCRETE_CHANNELS; i++) {
+		if (av_channel_layout_index_from_channel(&in_layout, slots[i]) >= 0) {
+			dstats.audio_channel_mask |= 1u << i;
+		}
+	}
 	av_channel_layout_uninit(&in_layout);
 	av_channel_layout_uninit(&out_layout);
 	if (r < 0) {
@@ -542,13 +557,42 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	swr_in_channels = channels;
 	swr_in_mask = mask;
 	swr_center_level = center_level;
-	const String description = vformat("MediaSource: audio %s, %s, %d Hz -> stereo float, %d Hz%s.", av_get_sample_fmt_name((AVSampleFormat)p_frame->format), in_name, p_frame->sample_rate, output_rate,
-			downmix_normalize ? " (normalised downmix)" : "");
+	const String description = vformat("MediaSource: audio %s, %s, %d Hz -> %s float, %d Hz%s.", av_get_sample_fmt_name((AVSampleFormat)p_frame->format), in_name, p_frame->sample_rate,
+			discrete_channels ? "7.1 and stereo" : "stereo", output_rate, downmix_normalize ? " (normalised downmix)" : "");
 	if (description != swr_description) {
 		swr_description = description;
 		print_line(description);
 	}
 	return true;
+}
+
+// discrete_channels: the stereo mix of 7.1 frames, as swr makes it without discrete channels (ITU-R BS.775: centre and
+// surrounds at -3 dB, LFE dropped; mono spread at -3 dB). The dialogue boost raises the centre channel itself, so the
+// channel streams get it too.
+void MediaSource::_downmix_discrete(float *p_channels, float *r_stereo, uint32_t p_frames) {
+	const uint32_t mask = dstats.audio_channel_mask;
+	const float s = (float)SQRT_HALF;
+	if (dstats.dialogue_boost_applies && dsp_dialogue_boost > 0.0f) {
+		const float boost = (float)Math::db_to_linear((double)dsp_dialogue_boost);
+		for (uint32_t f = 0; f < p_frames; f++) {
+			p_channels[(uint64_t)f * DISCRETE_CHANNELS + 2] *= boost;
+		}
+	}
+	float scale = 1.0f;
+	if (downmix_normalize) {
+		// As swr's rematrix_maxval 1: the largest sum of one output's coefficients is 1.
+		const float row = ((mask & 1) ? 1.0f : 0.0f) + ((mask & 4) ? s : 0.0f) + ((mask & 16) ? s : 0.0f) + ((mask & 64) ? s : 0.0f);
+		scale = row > 1.0f ? 1.0f / row : 1.0f;
+	}
+	const float front = scale;
+	const float centre = s * scale;
+	const float surround = s * scale;
+	for (uint32_t f = 0; f < p_frames; f++) {
+		const float *c = p_channels + (uint64_t)f * DISCRETE_CHANNELS; // FL FR FC LFE BL BR SL SR
+		const float middle = centre * c[2];
+		r_stereo[f * 2] = front * c[0] + middle + surround * (c[4] + c[6]);
+		r_stereo[f * 2 + 1] = front * c[1] + middle + surround * (c[5] + c[7]);
+	}
 }
 
 // p_frame null: flush what the resampler still holds (end of the file).
@@ -578,17 +622,41 @@ void MediaSource::_resample_frame(const AVFrame *p_frame) {
 	if (scratch_frames == 0) {
 		scratch_offset = 0;
 	}
-	const uint64_t needed = (uint64_t)(scratch_offset + scratch_frames + (uint32_t)max_out) * 2;
-	if (scratch.size() < needed) {
-		scratch.resize(needed); // Grows to the largest packet once; no allocation in steady state.
+	const uint64_t frames_needed = (uint64_t)scratch_offset + scratch_frames + (uint32_t)max_out;
+	if (scratch.size() < frames_needed * 2) {
+		scratch.resize(frames_needed * 2); // Grows to the largest packet once; no allocation in steady state.
 	}
-	uint8_t *out = (uint8_t *)(scratch.ptr() + (uint64_t)(scratch_offset + scratch_frames) * 2);
+	float *stereo = scratch.ptr() + (uint64_t)(scratch_offset + scratch_frames) * 2;
+	float *channels = nullptr;
+	if (discrete_channels) {
+		if (channel_scratch.size() < frames_needed * DISCRETE_CHANNELS) {
+			channel_scratch.resize(frames_needed * DISCRETE_CHANNELS);
+		}
+		if (gain_trace.size() < (uint32_t)max_out) {
+			gain_trace.resize(max_out);
+		}
+		channels = channel_scratch.ptr() + (uint64_t)(scratch_offset + scratch_frames) * DISCRETE_CHANNELS;
+	}
+	uint8_t *out = (uint8_t *)(channels ? channels : stereo);
 	const int converted = swr_convert(swr, &out, max_out, p_frame ? (const uint8_t **)p_frame->extended_data : nullptr, in_samples);
 	if (converted <= 0) {
 		return;
 	}
+	if (channels) {
+		_downmix_discrete(channels, stereo, (uint32_t)converted);
+	}
 	if (dynamics.is_active()) {
-		dynamics.process((float *)out, (uint32_t)converted, 2);
+		dynamics.process(stereo, (uint32_t)converted, 2, channels ? gain_trace.ptr() : nullptr);
+		if (channels) {
+			// The channels get the gain the stereo mix got.
+			for (int f = 0; f < converted; f++) {
+				float *frame = channels + (uint64_t)f * DISCRETE_CHANNELS;
+				const float g = gain_trace[f];
+				for (int c = 0; c < DISCRETE_CHANNELS; c++) {
+					frame[c] *= g;
+				}
+			}
+		}
 		dstats.audio_gain_db = dynamics.get_gain_db();
 		dstats.audio_limiter_db = dynamics.get_limiter_db();
 		dstats.audio_typical_level_db = dynamics.get_typical_level_db();
@@ -626,7 +694,7 @@ void MediaSource::_decode_audio(const AVPacket *p_packet) {
 }
 
 // audio_mutex held. p_samples null writes silence.
-void MediaSource::_write_ring_locked(const float *p_samples, uint32_t p_frames, double p_time) {
+void MediaSource::_write_ring_locked(const float *p_samples, const float *p_channels, uint32_t p_frames, double p_time) {
 	if (p_frames == 0) {
 		return;
 	}
@@ -648,6 +716,7 @@ void MediaSource::_write_ring_locked(const float *p_samples, uint32_t p_frames, 
 		markers[marker_count].time = p_time;
 		marker_count++;
 	}
+	const bool channels = !channel_ring.is_empty();
 	uint32_t done = 0;
 	while (done < p_frames) {
 		const uint64_t at = (ring_write + done) % ring_capacity;
@@ -656,6 +725,14 @@ void MediaSource::_write_ring_locked(const float *p_samples, uint32_t p_frames, 
 			memcpy((void *)&ring[at], p_samples + (uint64_t)done * 2, (size_t)run * sizeof(AudioFrame));
 		} else {
 			memset((void *)&ring[at], 0, (size_t)run * sizeof(AudioFrame));
+		}
+		if (channels) {
+			float *destination = channel_ring.ptr() + at * DISCRETE_CHANNELS;
+			if (p_channels) {
+				memcpy((void *)destination, p_channels + (uint64_t)done * DISCRETE_CHANNELS, (size_t)run * DISCRETE_CHANNELS * sizeof(float));
+			} else {
+				memset((void *)destination, 0, (size_t)run * DISCRETE_CHANNELS * sizeof(float));
+			}
 		}
 		done += run;
 	}
@@ -702,12 +779,12 @@ void MediaSource::_flush_scratch() {
 		return;
 	}
 	if (silence > 0 && ring_capacity - (ring_write - ring_read) >= silence) {
-		_write_ring_locked(nullptr, silence, silence_time);
+		_write_ring_locked(nullptr, nullptr, silence, silence_time);
 		dstats.audio_silence_frames += silence;
 	}
 	const uint32_t room = (uint32_t)MIN((uint64_t)scratch_frames, ring_capacity - (ring_write - ring_read));
 	if (room > 0) {
-		_write_ring_locked(scratch.ptr() + (uint64_t)scratch_offset * 2, room, scratch_time);
+		_write_ring_locked(scratch.ptr() + (uint64_t)scratch_offset * 2, channel_ring.is_empty() ? nullptr : channel_scratch.ptr() + (uint64_t)scratch_offset * DISCRETE_CHANNELS, room, scratch_time);
 		scratch_offset += room;
 		scratch_frames -= room;
 		scratch_time += room / rate;
@@ -718,6 +795,49 @@ void MediaSource::_flush_scratch() {
 }
 
 void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
+	_mix(0, p_buffer, p_frames);
+}
+
+void MediaSource::mix_audio_channel(AudioFrame *p_buffer, int p_frames, int p_channel) {
+	if (p_channel < 0 || p_channel >= DISCRETE_CHANNELS) {
+		memset((void *)p_buffer, 0, (size_t)MAX(p_frames, 0) * sizeof(AudioFrame));
+		return;
+	}
+	_mix(1 + p_channel, p_buffer, p_frames);
+}
+
+// audio_mutex held, speed 1. Where reader p_reader (0: the stereo mix, 1 + n: channel n) reads next, and how many frames
+// it gets. Without discrete channels the stereo mix is the only reader and moves ring_read. With them, every reader in
+// one mix step of the audio server reads the same frames: a step starts when a reader comes back for more (it has read
+// in this step already), which also commits what the step read (ring_read = step_end). r_first: this reader started the
+// step (it counts the frames and moves the clock).
+uint32_t MediaSource::_take_frames_locked(int p_reader, uint32_t p_frames, uint64_t &r_from, bool &r_first) {
+	if (channel_ring.is_empty()) {
+		r_from = ring_read;
+		r_first = true;
+		const uint32_t got = (uint32_t)MIN((uint64_t)p_frames, ring_write - ring_read);
+		ring_read += got;
+		return got;
+	}
+	r_first = false;
+	if (step_serial != audio_serial || reader_step[p_reader] == mix_step) {
+		if (step_serial == audio_serial) {
+			ring_read = CLAMP(step_end, ring_read, ring_write);
+		}
+		step_serial = audio_serial;
+		mix_step++;
+		step_start = ring_read;
+		step_end = ring_read;
+		r_first = true;
+	}
+	reader_step[p_reader] = mix_step;
+	r_from = step_start;
+	const uint32_t got = (uint32_t)MIN((uint64_t)p_frames, ring_write - step_start);
+	step_end = MAX(step_end, step_start + got);
+	return got;
+}
+
+void MediaSource::_mix(int p_reader, AudioFrame *p_buffer, int p_frames) {
 	if (p_frames <= 0) {
 		return;
 	}
@@ -725,9 +845,16 @@ void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
 	bool wake = false;
 	{
 		MutexLock audio_lock(audio_mutex);
+		bool counts = true; // The reader that starts a mix step counts frames, underruns and moves the clock.
 		if (ring_capacity > 0) {
 			if (playback_speed != 1.0 && tempo != nullptr) {
-				got = _mix_tempo_locked(p_buffer, (uint32_t)p_frames);
+				// The time stretch is for the stereo mix only: channel streams are silent at other speeds.
+				if (p_reader == 0) {
+					got = _mix_tempo_locked(p_buffer, (uint32_t)p_frames);
+					step_serial = UINT32_MAX; // ring_read moved: the next step starts from it.
+				} else {
+					counts = false;
+				}
 			} else {
 				if (tempo_active) {
 					// Back to 1: go on from the last frame heard (what the time stretch made but didn't hand out is dropped).
@@ -735,39 +862,60 @@ void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
 					if (tempo_serial == audio_serial) {
 						ring_read = CLAMP((uint64_t)MAX(tempo->get_heard_position(), 0.0), ring_read, ring_write);
 					}
+					step_serial = UINT32_MAX;
 				}
-				got = (uint32_t)MIN((uint64_t)p_frames, ring_write - ring_read);
-				uint32_t done = 0;
-				while (done < got) {
-					const uint64_t at = (ring_read + done) % ring_capacity;
-					const uint32_t run = (uint32_t)MIN((uint64_t)(got - done), ring_capacity - at);
-					memcpy((void *)(p_buffer + done), (const void *)&ring[at], (size_t)run * sizeof(AudioFrame));
-					done += run;
+				uint64_t from = 0;
+				got = _take_frames_locked(p_reader, (uint32_t)p_frames, from, counts);
+				if (p_reader == 0) {
+					uint32_t done = 0;
+					while (done < got) {
+						const uint64_t at = (from + done) % ring_capacity;
+						const uint32_t run = (uint32_t)MIN((uint64_t)(got - done), ring_capacity - at);
+						memcpy((void *)(p_buffer + done), (const void *)&ring[at], (size_t)run * sizeof(AudioFrame));
+						done += run;
+					}
+				} else if (!channel_ring.is_empty()) {
+					const float *channel = channel_ring.ptr() + (p_reader - 1);
+					for (uint32_t i = 0; i < got; i++) {
+						const float v = channel[((from + i) % ring_capacity) * DISCRETE_CHANNELS];
+						p_buffer[i] = AudioFrame(v, v);
+					}
+				} else {
+					got = 0; // No discrete channels: a channel stream is silent.
+					counts = false;
 				}
-				ring_read += got;
 			}
-			audio_frames_mixed += got;
-			if (got > 0) {
-				audio_mixed_since_seek = true;
-			}
-			while (marker_count > 1 && markers[1].frame <= ring_read) {
-				for (uint32_t i = 1; i < marker_count; i++) {
-					markers[i - 1] = markers[i];
+			if (counts) {
+				audio_frames_mixed += got;
+				if (got > 0) {
+					audio_mixed_since_seek = true;
 				}
-				marker_count--;
-			}
-			// The frame being heard: the time stretch's input position is ahead of ring_read (which keeps what its next
-			// step may still look at).
-			const uint64_t heard = tempo_active ? CLAMP((uint64_t)MAX(tempo->get_heard_position(), 0.0), ring_read, ring_write) : ring_read;
-			uint32_t m = 0;
-			while (m + 1 < marker_count && markers[m + 1].frame <= heard) {
-				m++;
-			}
-			if (marker_count > 0 && heard >= markers[m].frame) {
-				audio_position = markers[m].time + (double)(heard - markers[m].frame) / output_rate;
+				while (marker_count > 1 && markers[1].frame <= ring_read) {
+					for (uint32_t i = 1; i < marker_count; i++) {
+						markers[i - 1] = markers[i];
+					}
+					marker_count--;
+				}
+				// The frame being heard: the time stretch's input position is ahead of ring_read (which keeps what its
+				// next step may still look at); with discrete channels the end of this mix step.
+				uint64_t heard = ring_read;
+				if (tempo_active) {
+					heard = CLAMP((uint64_t)MAX(tempo->get_heard_position(), 0.0), ring_read, ring_write);
+				} else if (!channel_ring.is_empty() && step_serial == audio_serial) {
+					heard = step_end;
+				}
+				uint32_t m = 0;
+				while (m + 1 < marker_count && markers[m + 1].frame <= heard) {
+					m++;
+				}
+				if (marker_count > 0 && heard >= markers[m].frame) {
+					audio_position = markers[m].time + (double)(heard - markers[m].frame) / output_rate;
+				}
 			}
 		}
-		if (got < (uint32_t)p_frames && !audio_eof) {
+		if (!counts) {
+			// Another reader of this step keeps the counts.
+		} else if (got < (uint32_t)p_frames && !audio_eof) {
 			if (!audio_in_underrun) {
 				if (audio_mixed_since_seek) {
 					audio_underruns++;
@@ -1563,6 +1711,12 @@ Error MediaSource::open(const String &p_path) {
 	ring.resize(ring_capacity);
 	{
 		MutexLock audio_lock(audio_mutex);
+		if (discrete_channels) {
+			channel_ring.resize(ring_capacity * DISCRETE_CHANNELS);
+		} else {
+			channel_ring.clear();
+		}
+		step_serial = UINT32_MAX;
 		ring_read = ring_write = 0;
 		marker_count = 0;
 		audio_position = 0.0;
@@ -1701,6 +1855,7 @@ void MediaSource::_close_internal() {
 	{
 		MutexLock audio_lock(audio_mutex);
 		ring.clear();
+		channel_ring.clear();
 		ring_capacity = 0;
 		ring_read = ring_write = 0;
 		marker_count = 0;
@@ -2220,6 +2375,43 @@ void MediaSource::set_audio_queue_seconds(double p_seconds) {
 	audio_queue_seconds = CLAMP(p_seconds, 0.1, AUDIO_RING_SECONDS - 1.0);
 }
 
+void MediaSource::set_discrete_channels(bool p_enabled) {
+	SETTING_GUARD();
+	discrete_channels = p_enabled;
+}
+
+Ref<AudioStreamMedia> MediaSource::get_audio_channel_stream(int p_channel) {
+	Ref<AudioStreamMedia> stream;
+	ERR_FAIL_INDEX_V_MSG(p_channel, DISCRETE_CHANNELS, stream, "MediaSource: channels are 0-7 (FL FR FC LFE BL BR SL SR).");
+	if (!discrete_channels) {
+		WARN_PRINT("MediaSource: get_audio_channel_stream() without discrete_channels: the stream is silent.");
+	}
+	stream.instantiate();
+	stream->set_media_source(this);
+	stream->set_channel(p_channel);
+	return stream;
+}
+
+Array MediaSource::get_audio_channels() const {
+	static const char *names[DISCRETE_CHANNELS] = { "FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR" };
+	static const char *labels[DISCRETE_CHANNELS] = { "front left", "front right", "front centre", "low frequency", "back left", "back right", "side left", "side right" };
+	uint32_t mask;
+	{
+		MutexLock lock(mutex);
+		mask = stats.audio_channel_mask;
+	}
+	Array channels;
+	for (int i = 0; i < DISCRETE_CHANNELS; i++) {
+		Dictionary d;
+		d["index"] = i;
+		d["name"] = names[i];
+		d["label"] = labels[i];
+		d["present"] = (mask & (1u << i)) != 0;
+		channels.push_back(d);
+	}
+	return channels;
+}
+
 void MediaSource::set_night_mode(bool p_enabled) {
 	MutexLock lock(mutex);
 	night_mode = p_enabled;
@@ -2339,6 +2531,10 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_video_queue_seconds"), &MediaSource::get_video_queue_seconds);
 	ClassDB::bind_method(D_METHOD("set_audio_queue_seconds", "seconds"), &MediaSource::set_audio_queue_seconds);
 	ClassDB::bind_method(D_METHOD("get_audio_queue_seconds"), &MediaSource::get_audio_queue_seconds);
+	ClassDB::bind_method(D_METHOD("set_discrete_channels", "enabled"), &MediaSource::set_discrete_channels);
+	ClassDB::bind_method(D_METHOD("is_discrete_channels"), &MediaSource::is_discrete_channels);
+	ClassDB::bind_method(D_METHOD("get_audio_channel_stream", "channel"), &MediaSource::get_audio_channel_stream);
+	ClassDB::bind_method(D_METHOD("get_audio_channels"), &MediaSource::get_audio_channels);
 	ClassDB::bind_method(D_METHOD("set_night_mode", "enabled"), &MediaSource::set_night_mode);
 	ClassDB::bind_method(D_METHOD("is_night_mode"), &MediaSource::is_night_mode);
 	ClassDB::bind_method(D_METHOD("set_night_mode_strength", "strength"), &MediaSource::set_night_mode_strength);
@@ -2360,6 +2556,7 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_speed", PROPERTY_HINT_RANGE, "0.5,2,0.05"), "set_playback_speed", "get_playback_speed");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "discrete_channels"), "set_discrete_channels", "is_discrete_channels");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "night_mode"), "set_night_mode", "is_night_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "night_mode_strength", PROPERTY_HINT_RANGE, "0,1,0.05"), "set_night_mode_strength", "get_night_mode_strength");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "dialogue_boost", PROPERTY_HINT_RANGE, "0,12,0.5,suffix:dB"), "set_dialogue_boost", "get_dialogue_boost");

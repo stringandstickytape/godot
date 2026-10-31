@@ -41,6 +41,19 @@
 				Returns the media time of the next audio frame to be mixed: the time of the last frame mixed plus one frame. Right after [method seek] it is the seek target.
 			</description>
 		</method>
+		<method name="get_audio_channel_stream">
+			<return type="AudioStreamMedia" />
+			<param index="0" name="channel" type="int" />
+			<description>
+				Returns a new [AudioStreamMedia] that plays one channel of the audio as mono, for an [AudioStreamPlayer3D] placed where that speaker would be. Needs [member discrete_channels]. [param channel]: 0 FL, 1 FR, 2 FC, 3 LFE, 4 BL, 5 BR, 6 SL, 7 SR (FFmpeg's 7.1 order); [method get_audio_channels] says which the track has. A 5.1 track has either the back pair (FFmpeg's "5.1") or the side pair ("5.1(side)", as on most Blu-rays); other layouts' channels are mixed into the nearest of the eight. Night mode's gain and the dialogue boost (on FC) apply to the channels as to the stereo mix. Silent while [member playback_speed] isn't 1.
+			</description>
+		</method>
+		<method name="get_audio_channels" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns the eight channel slots of [method get_audio_channel_stream], one Dictionary each: [code]index[/code], [code]name[/code] ("FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"), [code]label[/code] ("front left", ...) and [code]present[/code] (the playing track has it; all false until its first audio is decoded).
+			</description>
+		</method>
 		<method name="get_audio_stream">
 			<return type="AudioStreamMedia" />
 			<description>
@@ -300,6 +313,9 @@
 		</member>
 		<member name="dialogue_boost" type="float" setter="set_dialogue_boost" getter="get_dialogue_boost" default="0.0">
 			Dialogue boost in dB (0 to 12): the centre channel, where films put the dialogue, is that much louder in the downmix to stereo. Only for audio with a centre channel next to front left and right (5.1, 7.1, 3.0, ...; see [code]dialogue_boost_applies[/code] in [method get_stats]); stereo and mono stay as they are. A limiter keeps the peaks below -1 dBFS while it is above 0. Can be changed at any time; it is heard after the audio queue ([member audio_queue_seconds]), at once after a seek.
+		</member>
+		<member name="discrete_channels" type="bool" setter="set_discrete_channels" getter="is_discrete_channels" default="false">
+			If [code]true[/code], the audio is also kept as 7.1 float channels (FL FR FC LFE BL BR SL SR), each playable through [method get_audio_channel_stream]. The resampler then makes 7.1 and the stereo mix is the downmix of those channels (the same mix as without). It costs a second ring of 8 channels (about 5.6 MB at 44.1 kHz) and, on x86, about 0.1 % of a core. Set before [method open].
 		</member>
 		<member name="downmix_normalize" type="bool" setter="set_downmix_normalize" getter="is_downmix_normalize" default="false">
 			If [code]true[/code], the downmix to stereo is scaled so no sum can exceed full scale (about 7.7 dB quieter for 5.1). Set before [method open].

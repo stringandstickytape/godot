@@ -38,10 +38,13 @@
 // ring buffer (stereo, already at the AudioServer mix rate) and reports the media time of the last sample mixed, so
 // get_playback_position() (plus AudioServer.get_time_since_last_mix() - AudioServer.get_output_latency()) is the A/V
 // master clock. Play it from one player at a time: playbacks share the source's buffer.
+// channel 0-7 (MediaSource.get_audio_channel_stream(), with discrete_channels): one channel of the 7.1 audio as mono,
+// for an AudioStreamPlayer3D per virtual speaker. The stereo stream and the channel streams can play together.
 class AudioStreamMedia : public AudioStream {
 	GDCLASS(AudioStreamMedia, AudioStream);
 
 	Ref<MediaSource> source;
+	int channel = -1; // -1: the stereo mix.
 
 protected:
 	static void _bind_methods();
@@ -49,6 +52,8 @@ protected:
 public:
 	void set_media_source(const Ref<MediaSource> &p_source);
 	Ref<MediaSource> get_media_source() const { return source; }
+	void set_channel(int p_channel) { channel = CLAMP(p_channel, -1, 7); }
+	int get_channel() const { return channel; }
 
 	virtual Ref<AudioStreamPlayback> instantiate_playback() override;
 	virtual String get_stream_name() const override;
@@ -61,6 +66,7 @@ class AudioStreamPlaybackMedia : public AudioStreamPlayback {
 	friend class AudioStreamMedia;
 
 	Ref<MediaSource> source;
+	int channel = -1;
 	bool active = false;
 
 protected:

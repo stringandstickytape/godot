@@ -228,6 +228,7 @@ private:
 		float audio_gain_db = 0.0f; // Night mode: leveller and compressor gain of the last block.
 		float audio_limiter_db = 0.0f; // Limiter reduction in the last buffer (0 or negative).
 		float audio_typical_level_db = 0.0f; // Night mode: the typical level the compressor works from.
+		uint32_t audio_channel_mask = 0; // Which of the DISCRETE_CHANNELS slots the audio has (bit n: slot n).
 	};
 
 	static constexpr uint32_t VIDEO_QUEUE_MAX = 512;
@@ -240,6 +241,7 @@ private:
 	static constexpr uint32_t SUBTITLE_QUEUE_MAX = 512;
 	static constexpr int SEEK_RETRIES_MAX = 6;
 	static constexpr uint32_t BITRATE_SECONDS = 128; // Seconds of video bytes kept (behind and ahead of the read position).
+	static constexpr int DISCRETE_CHANNELS = 8; // 7.1 in FFmpeg's order: FL FR FC LFE BL BR SL SR.
 
 	struct BitrateSecond {
 		int64_t second = INT64_MIN; // Media second (floor of the PTS).
@@ -251,6 +253,7 @@ private:
 	double video_queue_seconds = 1.0;
 	double audio_queue_seconds = 1.0;
 	bool downmix_normalize = false;
+	bool discrete_channels = false;
 	Dictionary audio_decoder_options; // FFmpeg decoder AVOptions, e.g. {"core_only": "1"} for DTS without its extensions.
 
 	// Set up by open(), read-only while the thread runs.
@@ -338,6 +341,15 @@ private:
 	AudioTempo *tempo = nullptr; // Made the first time the speed isn't 1.
 	bool tempo_active = false;
 	uint32_t tempo_serial = 0;
+	// discrete_channels (audio_mutex): the channels of the frames in the ring, DISCRETE_CHANNELS per frame. Readers: 0 is
+	// the stereo mix, 1 + n channel n. All readers in one mix step of the audio server read the same frames, from
+	// step_start; a step ends when a reader comes back for more, and then ring_read moves to step_end.
+	LocalVector<float> channel_ring;
+	uint32_t mix_step = 1;
+	uint64_t step_start = 0;
+	uint64_t step_end = 0;
+	uint32_t step_serial = UINT32_MAX;
+	uint32_t reader_step[1 + DISCRETE_CHANNELS] = {};
 
 	// Demux thread only (and open(), before the thread starts).
 	Stats dstats;
@@ -385,6 +397,8 @@ private:
 	uint32_t audio_fifo_count = 0;
 	uint64_t audio_fifo_bytes = 0;
 	LocalVector<float> scratch; // Interleaved stereo.
+	LocalVector<float> channel_scratch; // discrete_channels: the same frames as 7.1, DISCRETE_CHANNELS per frame.
+	LocalVector<float> gain_trace; // discrete_channels: the gain night mode gave each stereo frame, for the channels.
 	uint32_t scratch_frames = 0;
 	uint32_t scratch_offset = 0;
 	double scratch_time = 0.0;
@@ -433,7 +447,10 @@ private:
 	void _resample_frame(const AVFrame *p_frame);
 	void _flush_scratch();
 	uint32_t _mix_tempo_locked(AudioFrame *p_buffer, uint32_t p_frames);
-	void _write_ring_locked(const float *p_samples, uint32_t p_frames, double p_time);
+	void _write_ring_locked(const float *p_samples, const float *p_channels, uint32_t p_frames, double p_time);
+	void _downmix_discrete(float *p_channels, float *r_stereo, uint32_t p_frames);
+	uint32_t _take_frames_locked(int p_reader, uint32_t p_frames, uint64_t &r_from, bool &r_first);
+	void _mix(int p_reader, AudioFrame *p_buffer, int p_frames);
 
 	void _open_subtitle_track(int p_track);
 	void _handle_subtitle_packet();
@@ -575,6 +592,14 @@ public:
 	double get_night_mode_strength() const;
 	void set_dialogue_boost(double p_db);
 	double get_dialogue_boost() const;
+
+	// Discrete channels (set before open()): the audio is also kept as 7.1, one AudioStream per channel.
+	void set_discrete_channels(bool p_enabled);
+	bool is_discrete_channels() const { return discrete_channels; }
+	Ref<AudioStreamMedia> get_audio_channel_stream(int p_channel);
+	Array get_audio_channels() const;
+	// AudioStreamPlaybackMedia of a channel stream: p_channel 0-7, as mono (left = right).
+	void mix_audio_channel(AudioFrame *p_buffer, int p_frames, int p_channel);
 
 	void set_downmix_normalize(bool p_normalize);
 	bool is_downmix_normalize() const { return downmix_normalize; }

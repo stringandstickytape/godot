@@ -52,8 +52,9 @@ public:
 	void configure(bool p_compress, float p_strength, bool p_limit, int p_rate);
 	void reset();
 	bool is_active() const { return compress || limit; }
-	// Interleaved float samples, p_channels per frame.
-	void process(float *p_samples, uint32_t p_frames, int p_channels);
+	// Interleaved float samples, p_channels per frame. r_gains (optional, p_frames long): the gain each frame got, to
+	// apply the same to other channels of the same audio.
+	void process(float *p_samples, uint32_t p_frames, int p_channels, float *r_gains = nullptr);
 
 	// The gain of the last block: leveller and compressor (dB), and the limiter's reduction (dB, 0 or negative).
 	float get_gain_db() const { return last_gain_db; }
