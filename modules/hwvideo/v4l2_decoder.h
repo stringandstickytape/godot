@@ -170,7 +170,7 @@ private:
 	int timeout_ms = 5000;
 	bool loop = false;
 	bool verbose = false;
-	SeekEOS seek_eos = SEEK_EOS_PREPEND;
+	SeekEOS seek_eos = SEEK_EOS_SEPARATE; // iris rejects the NAL unit in the keyframe's buffer (1 decoder error per seek).
 
 	// The stream, read-only while the worker runs. With a MediaSource (source valid) there is no file mapping: access
 	// units are popped from the source, and their PTS become the frame times.
