@@ -32,6 +32,7 @@
 #include "software_video_decoder.h"
 
 #include "audio_stream_media.h"
+#include "audio_tempo.h"
 #include "smb_client.h"
 
 #include "core/config/project_settings.h"
@@ -349,7 +350,8 @@ bool MediaSource::_needs_input_locked() const {
 	if (video_count + 4 >= VIDEO_QUEUE_MAX || video_queued_bytes >= VIDEO_QUEUE_MAX_BYTES || audio_fifo_count + 1 >= AUDIO_FIFO_MAX || audio_fifo_bytes >= AUDIO_FIFO_MAX_BYTES) {
 		return false;
 	}
-	const bool video_enough = video.stream_index < 0 || video_count >= video_queue_target;
+	const uint32_t target = current_subtitle_stream >= 0 ? MAX(video_queue_target, subtitle_video_target) : video_queue_target;
+	const bool video_enough = video.stream_index < 0 || video_count >= target;
 	bool audio_enough = true;
 	if (current_audio_stream >= 0 && audio_fifo_count == 0 && scratch_frames == 0) {
 		MutexLock audio_lock(audio_mutex);
@@ -678,15 +680,26 @@ void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
 	{
 		MutexLock audio_lock(audio_mutex);
 		if (ring_capacity > 0) {
-			got = (uint32_t)MIN((uint64_t)p_frames, ring_write - ring_read);
-			uint32_t done = 0;
-			while (done < got) {
-				const uint64_t at = (ring_read + done) % ring_capacity;
-				const uint32_t run = (uint32_t)MIN((uint64_t)(got - done), ring_capacity - at);
-				memcpy((void *)(p_buffer + done), (const void *)&ring[at], (size_t)run * sizeof(AudioFrame));
-				done += run;
+			if (playback_speed != 1.0 && tempo != nullptr) {
+				got = _mix_tempo_locked(p_buffer, (uint32_t)p_frames);
+			} else {
+				if (tempo_active) {
+					// Back to 1: go on from the last frame heard (what the time stretch made but didn't hand out is dropped).
+					tempo_active = false;
+					if (tempo_serial == audio_serial) {
+						ring_read = CLAMP((uint64_t)MAX(tempo->get_heard_position(), 0.0), ring_read, ring_write);
+					}
+				}
+				got = (uint32_t)MIN((uint64_t)p_frames, ring_write - ring_read);
+				uint32_t done = 0;
+				while (done < got) {
+					const uint64_t at = (ring_read + done) % ring_capacity;
+					const uint32_t run = (uint32_t)MIN((uint64_t)(got - done), ring_capacity - at);
+					memcpy((void *)(p_buffer + done), (const void *)&ring[at], (size_t)run * sizeof(AudioFrame));
+					done += run;
+				}
+				ring_read += got;
 			}
-			ring_read += got;
 			audio_frames_mixed += got;
 			if (got > 0) {
 				audio_mixed_since_seek = true;
@@ -697,8 +710,15 @@ void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
 				}
 				marker_count--;
 			}
-			if (marker_count > 0 && ring_read >= markers[0].frame) {
-				audio_position = markers[0].time + (double)(ring_read - markers[0].frame) / output_rate;
+			// The frame being heard: the time stretch's input position is ahead of ring_read (which keeps what its next
+			// step may still look at).
+			const uint64_t heard = tempo_active ? CLAMP((uint64_t)MAX(tempo->get_heard_position(), 0.0), ring_read, ring_write) : ring_read;
+			uint32_t m = 0;
+			while (m + 1 < marker_count && markers[m + 1].frame <= heard) {
+				m++;
+			}
+			if (marker_count > 0 && heard >= markers[m].frame) {
+				audio_position = markers[m].time + (double)(heard - markers[m].frame) / output_rate;
 			}
 		}
 		if (got < (uint32_t)p_frames && !audio_eof) {
@@ -724,6 +744,92 @@ void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
 		MutexLock lock(mutex);
 		condition.notify_one();
 	}
+}
+
+// audio_mutex held. Fills p_buffer through the time stretch; returns the frames made (fewer on an underrun).
+uint32_t MediaSource::_mix_tempo_locked(AudioFrame *p_buffer, uint32_t p_frames) {
+	if (!tempo_active || tempo_serial != audio_serial) {
+		tempo->reset((double)ring_read);
+		tempo_serial = audio_serial;
+		tempo_active = true;
+	}
+	uint32_t done = 0;
+	while (done < p_frames) {
+		if (tempo->pending_count > 0) {
+			const uint32_t n = MIN(tempo->pending_count, p_frames - done);
+			memcpy((void *)(p_buffer + done), (const void *)(tempo->pending + tempo->pending_offset), (size_t)n * sizeof(AudioFrame));
+			tempo->pending_offset += n;
+			tempo->pending_count -= n;
+			done += n;
+			continue;
+		}
+		const int64_t start = tempo->window_start();
+		const int64_t end = tempo->window_end();
+		if (end > (int64_t)ring_write) {
+			if (audio_eof) {
+				ring_read = ring_write; // The last few milliseconds are dropped: the stream is finished.
+			}
+			break; // Underrun, or the end.
+		}
+		// The window, out of the ring; frames before ring_read (just after a reset) are silence.
+		int64_t frame = start;
+		while (frame < end) {
+			AudioFrame *destination = tempo->window + (frame - start);
+			if (frame < (int64_t)ring_read) {
+				const int64_t n = MIN(end, (int64_t)ring_read) - frame;
+				memset((void *)destination, 0, (size_t)n * sizeof(AudioFrame));
+				frame += n;
+				continue;
+			}
+			const uint64_t at = (uint64_t)frame % ring_capacity;
+			const int64_t n = MIN(end - frame, (int64_t)(ring_capacity - at));
+			memcpy((void *)destination, (const void *)&ring[at], (size_t)n * sizeof(AudioFrame));
+			frame += n;
+		}
+		if (p_frames - done >= AudioTempo::SEGMENT) {
+			tempo->step(tempo->window, p_buffer + done, playback_speed);
+			done += AudioTempo::SEGMENT;
+		} else {
+			tempo->step(tempo->window, tempo->pending, playback_speed);
+			tempo->pending_count = AudioTempo::SEGMENT;
+			tempo->pending_offset = 0;
+		}
+		// What comes before the next window isn't needed any more.
+		const int64_t keep = tempo->window_start();
+		if (keep > (int64_t)ring_read) {
+			ring_read = MIN((uint64_t)keep, ring_write);
+		}
+	}
+	return done;
+}
+
+void MediaSource::set_playback_speed(double p_speed) {
+	const double speed = CLAMP(p_speed, 0.5, 2.0);
+	AudioTempo *created = nullptr;
+	if (speed != 1.0) {
+		bool needed;
+		{
+			MutexLock audio_lock(audio_mutex);
+			needed = tempo == nullptr;
+		}
+		if (needed) {
+			created = memnew(AudioTempo); // Outside the lock the mixer takes.
+		}
+	}
+	MutexLock audio_lock(audio_mutex);
+	if (created != nullptr && tempo == nullptr) {
+		tempo = created;
+		created = nullptr;
+	}
+	playback_speed = tempo != nullptr ? speed : 1.0;
+	if (created != nullptr) {
+		memdelete(created); // Another thread made one meanwhile.
+	}
+}
+
+double MediaSource::get_playback_speed() const {
+	MutexLock audio_lock(audio_mutex);
+	return playback_speed;
 }
 
 double MediaSource::get_audio_position() const {
@@ -770,8 +876,10 @@ void MediaSource::_open_subtitle_track(int p_track) {
 		}
 	}
 	_apply_discard();
-	MutexLock lock(mutex);
-	subtitle_header = header;
+	if (p_track < (int)subtitle_tracks.size()) {
+		MutexLock lock(mutex);
+		subtitle_header = header;
+	}
 }
 
 void MediaSource::_push_subtitle(SubtitleEvent &p_event) {
@@ -806,44 +914,12 @@ void MediaSource::_handle_subtitle_packet() {
 		_push_subtitle(event);
 		return;
 	}
-	AVSubtitle subtitle = {};
-	int got = 0;
-	const int r = avcodec_decode_subtitle2(subtitle_codec, &subtitle, &got, read_packet);
-	if (r < 0) {
-		dstats.subtitle_decode_errors++;
-		return;
-	}
-	if (!got) {
-		return;
-	}
 	SubtitleEvent event;
-	event.start = start + subtitle.start_display_time / 1000.0;
-	if (packet_duration > 0.0) {
-		event.end = start + packet_duration;
-	} else if (subtitle.end_display_time > subtitle.start_display_time && subtitle.end_display_time != UINT32_MAX) {
-		event.end = start + subtitle.end_display_time / 1000.0;
-	}
-	for (unsigned i = 0; i < subtitle.num_rects; i++) {
-		const AVSubtitleRect *rect = subtitle.rects[i];
-		String line;
-		if (rect->ass) {
-			line = String::utf8(rect->ass);
-		} else if (rect->text) {
-			line = String::utf8(rect->text);
-		}
-		if (line.is_empty()) {
-			continue;
-		}
-		if (!event.ass.is_empty()) {
-			event.ass += "\n";
-			event.text += "\n";
-		}
-		event.ass += line;
-		event.text += rect->ass ? _ass_to_text(line) : line;
-	}
-	avsubtitle_free(&subtitle);
-	if (!event.ass.is_empty()) {
+	bool error = false;
+	if (_decode_text_subtitle(subtitle_codec, read_packet, start, packet_duration, event, error)) {
 		_push_subtitle(event);
+	} else if (error) {
+		dstats.subtitle_decode_errors++;
 	}
 }
 
@@ -939,6 +1015,7 @@ void MediaSource::_deliver_video(AVPacket *p_packet) {
 	video_queue[(video_head + video_count) % VIDEO_QUEUE_MAX] = out;
 	video_count++;
 	video_queued_bytes += out.size;
+	_count_video_bytes_locked(out.pts, out.size);
 	if (video_count == 1) {
 		_wake_consumer_locked();
 	}
@@ -1231,6 +1308,9 @@ Error MediaSource::open(const String &p_path) {
 		seek_count = 0;
 		video_head = video_count = 0;
 		video_queued_bytes = 0;
+		for (BitrateSecond &entry : bitrate_seconds) {
+			entry = BitrateSecond();
+		}
 	}
 	dstats = Stats();
 	path = p_path;
@@ -1280,6 +1360,7 @@ Error MediaSource::open(const String &p_path) {
 	start_time = format->start_time != AV_NOPTS_VALUE ? (double)format->start_time / AV_TIME_BASE : 0.0;
 	duration = format->duration != AV_NOPTS_VALUE ? (double)format->duration / AV_TIME_BASE : 0.0;
 	bit_rate = format->bit_rate;
+	_read_chapters();
 
 	const int best_video = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
 	const int best_audio = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, best_video >= 0 ? best_video : -1, nullptr, 0);
@@ -1302,6 +1383,9 @@ Error MediaSource::open(const String &p_path) {
 			track.language = language ? String::utf8(language->value) : String();
 			track.title = title ? String::utf8(title->value) : String();
 			track.is_default = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
+			const String lower_title = track.title.to_lower();
+			track.commentary = (stream->disposition & AV_DISPOSITION_COMMENT) != 0 || lower_title.contains("commentary");
+			track.visual_impaired = (stream->disposition & AV_DISPOSITION_VISUAL_IMPAIRED) != 0 || lower_title.contains("description") || lower_title.contains("descriptive");
 			if ((int)i == best_audio) {
 				default_track = (int)audio_tracks.size();
 			}
@@ -1315,7 +1399,9 @@ Error MediaSource::open(const String &p_path) {
 			track.language = language ? String::utf8(language->value) : String();
 			track.title = title ? String::utf8(title->value) : String();
 			track.is_default = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
-			track.forced = (stream->disposition & AV_DISPOSITION_FORCED) != 0;
+			const String lower_title = track.title.to_lower();
+			track.forced = (stream->disposition & AV_DISPOSITION_FORCED) != 0 || lower_title.contains("forced");
+			track.hearing_impaired = (stream->disposition & AV_DISPOSITION_HEARING_IMPAIRED) != 0 || lower_title.contains("sdh") || lower_title.contains("hearing");
 			subtitle_tracks.push_back(track);
 		}
 	}
@@ -1345,6 +1431,7 @@ Error MediaSource::open(const String &p_path) {
 		}
 		video.width = par->width;
 		video.height = par->height;
+		_read_stream_metadata(stream);
 		const AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
 		video.fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
 		const AVRational sar = av_guess_sample_aspect_ratio(format, format->streams[best_video], nullptr);
@@ -1401,6 +1488,10 @@ Error MediaSource::open(const String &p_path) {
 		}
 	}
 	video_queue_target = _video_queue_target();
+	{
+		MutexLock lock(mutex);
+		subtitle_video_target = _subtitle_video_target();
+	}
 
 	output_rate = AudioServer::get_singleton() ? (int)AudioServer::get_singleton()->get_mix_rate() : 48000;
 	if (output_rate <= 0) {
@@ -1478,6 +1569,13 @@ Error MediaSource::open(const String &p_path) {
 			summary += vformat(" (SPS %dx%d)", video.sps.width, video.sps.height);
 		}
 	}
+	if (video.valid && (!video.stereo_mode.is_empty() || !video.projection.is_empty())) {
+		summary += vformat(" (stereo %s%s, projection %s)", video.stereo_mode.is_empty() ? String("not given") : video.stereo_mode, video.stereo_inverted ? " inverted" : "",
+				video.projection.is_empty() ? String("flat") : vformat("%s %.0fx%.0f", video.projection, video.projection_fov_h, video.projection_fov_v));
+	}
+	if (!chapters.is_empty()) {
+		summary += vformat(", %d chapters", chapters.size());
+	}
 	if (default_track >= 0) {
 		const AudioTrack &track = audio_tracks[default_track];
 		summary += vformat(", audio track %d of %d: %s %s %d Hz", default_track, audio_tracks.size(), track.codec, track.channel_layout, track.sample_rate);
@@ -1533,6 +1631,7 @@ void MediaSource::_close_internal() {
 	swr_description = String();
 	audio_tracks.clear();
 	subtitle_tracks.clear();
+	chapters.clear();
 	config_parameter_sets.clear();
 	inband_parameter_sets.clear();
 	current_audio_track = -1;
@@ -1557,6 +1656,8 @@ void MediaSource::close() {
 	subtitle_track = -1;
 	subtitle_queue.clear();
 	subtitle_header = String();
+	external_subtitles.clear();
+	external_cursor = 0;
 }
 
 String MediaSource::get_hw_unsupported_reason(const VideoInfo &p_info, bool p_allow_10bit) {
@@ -1614,6 +1715,15 @@ Dictionary MediaSource::get_video_info() const {
 	d["matrix_bt2020"] = video.color_matrix.begins_with("bt2020");
 	d["full_range"] = video.color_range == "pc";
 	d["hdr"] = video.color_transfer == "smpte2084" || video.color_transfer == "arib-std-b67";
+	// Stereo and spherical metadata of the container ("" when it says nothing: guess from the name, as before).
+	d["stereo_mode"] = video.stereo_mode;
+	d["stereo_inverted"] = video.stereo_inverted;
+	d["stereo_baseline_mm"] = video.stereo_baseline_mm;
+	d["stereo_fov"] = video.stereo_fov;
+	d["projection"] = video.projection;
+	d["projection_fov"] = Vector2(video.projection_fov_h, video.projection_fov_v);
+	d["projection_yaw_pitch_roll"] = Vector3(video.projection_yaw, video.projection_pitch, video.projection_roll);
+	d["projection_bounds"] = Vector4(video.projection_bounds[0], video.projection_bounds[1], video.projection_bounds[2], video.projection_bounds[3]);
 	d["is_h264"] = video.codec == VIDEO_CODEC_H264;
 	d["is_hevc"] = video.codec == VIDEO_CODEC_HEVC;
 	d["is_vp9"] = video.codec == VIDEO_CODEC_VP9;
@@ -1651,8 +1761,11 @@ Array MediaSource::get_audio_tracks() const {
 		d["sample_rate"] = track.sample_rate;
 		d["bit_rate"] = track.bit_rate;
 		d["language"] = track.language;
+		d["language_code"] = normalize_language(track.language);
 		d["title"] = track.title;
 		d["default"] = track.is_default;
+		d["commentary"] = track.commentary;
+		d["visual_impaired"] = track.visual_impaired;
 		tracks.push_back(d);
 	}
 	return tracks;
@@ -1661,18 +1774,11 @@ Array MediaSource::get_audio_tracks() const {
 Array MediaSource::get_subtitle_tracks() const {
 	Array tracks;
 	for (uint32_t i = 0; i < subtitle_tracks.size(); i++) {
-		const SubtitleTrack &track = subtitle_tracks[i];
-		Dictionary d;
-		d["index"] = i;
-		d["stream_index"] = track.stream_index;
-		d["codec"] = track.codec;
-		d["text"] = track.text;
-		d["bitmap"] = track.bitmap;
-		d["language"] = track.language;
-		d["title"] = track.title;
-		d["default"] = track.is_default;
-		d["forced"] = track.forced;
-		tracks.push_back(d);
+		tracks.push_back(_subtitle_track_to_dictionary(subtitle_tracks[i], (int)i, false));
+	}
+	MutexLock lock(mutex);
+	for (uint32_t i = 0; i < external_subtitles.size(); i++) {
+		tracks.push_back(_subtitle_track_to_dictionary(external_subtitles[i].track, (int)(subtitle_tracks.size() + i), true));
 	}
 	return tracks;
 }
@@ -1687,6 +1793,7 @@ Dictionary MediaSource::get_info() const {
 	d["video"] = get_video_info();
 	d["audio_tracks"] = get_audio_tracks();
 	d["subtitle_tracks"] = get_subtitle_tracks();
+	d["chapters"] = get_chapters();
 	d["audio_track"] = get_audio_track();
 	d["subtitle_track"] = get_subtitle_track();
 	d["output_rate"] = output_rate;
@@ -1716,12 +1823,16 @@ int MediaSource::get_audio_track() const {
 
 Error MediaSource::select_subtitle_track(int p_track) {
 	ERR_FAIL_COND_V_MSG(!is_open(), ERR_UNCONFIGURED, "MediaSource: not open.");
-	ERR_FAIL_COND_V_MSG(p_track < -1 || p_track >= (int)subtitle_tracks.size(), ERR_INVALID_PARAMETER, vformat("MediaSource: no subtitle track %d (%d tracks).", p_track, subtitle_tracks.size()));
 	MutexLock lock(mutex);
+	const int count = (int)(subtitle_tracks.size() + external_subtitles.size());
+	ERR_FAIL_COND_V_MSG(p_track < -1 || p_track >= count, ERR_INVALID_PARAMETER, vformat("MediaSource: no subtitle track %d (%d tracks).", p_track, count));
 	if (subtitle_track != p_track) {
 		subtitle_track = p_track;
 		subtitle_queue.clear();
-		subtitle_header = String();
+		const int external = p_track - (int)subtitle_tracks.size();
+		subtitle_header = external >= 0 ? external_subtitles[external].header : String();
+		external_cursor = 0;
+		external_serial = serial;
 		condition.notify_one();
 	}
 	return OK;
@@ -1737,11 +1848,30 @@ Dictionary MediaSource::read_subtitle_event() {
 	SubtitleEvent event;
 	{
 		MutexLock lock(mutex);
-		if (subtitle_queue.is_empty()) {
-			return d;
+		const int external = subtitle_track - (int)subtitle_tracks.size();
+		if (subtitle_track >= 0 && external >= 0) {
+			// A subtitle file: everything at once; after a seek, again from the events still showing at the target.
+			const LocalVector<SubtitleEvent> &events = external_subtitles[external].events;
+			if (external_serial != serial) {
+				external_serial = serial;
+				external_cursor = 0;
+				// Events without an end show until the next one: count them as 10 s long here.
+				while (external_cursor < events.size() && (events[external_cursor].end >= 0.0 ? events[external_cursor].end : events[external_cursor].start + 10.0) < seek_target) {
+					external_cursor++;
+				}
+			}
+			if (external_cursor >= events.size()) {
+				return d;
+			}
+			event = events[external_cursor++];
+			event.serial = serial;
+		} else {
+			if (subtitle_queue.is_empty()) {
+				return d;
+			}
+			event = subtitle_queue[0];
+			subtitle_queue.remove_at(0);
 		}
-		event = subtitle_queue[0];
-		subtitle_queue.remove_at(0);
 	}
 	d["start"] = event.start;
 	d["end"] = event.end;
@@ -2000,6 +2130,10 @@ void MediaSource::set_audio_decoder_options(const Dictionary &p_options) {
 
 MediaSource::~MediaSource() {
 	_close_internal();
+	if (tempo) {
+		memdelete(tempo);
+		tempo = nullptr;
+	}
 	for (AVPacket *packet : packet_pool) {
 		av_packet_free(&packet);
 	}
@@ -2035,6 +2169,20 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_audio_stream"), &MediaSource::get_audio_stream);
 	ClassDB::bind_method(D_METHOD("get_output_rate"), &MediaSource::get_output_rate);
 	ClassDB::bind_method(D_METHOD("read_video_packet"), &MediaSource::read_video_packet);
+	ClassDB::bind_method(D_METHOD("get_chapters"), &MediaSource::get_chapters);
+	ClassDB::bind_method(D_METHOD("set_playback_speed", "speed"), &MediaSource::set_playback_speed);
+	ClassDB::bind_method(D_METHOD("get_playback_speed"), &MediaSource::get_playback_speed);
+	ClassDB::bind_method(D_METHOD("get_video_bitrate_history", "seconds", "at"), &MediaSource::get_video_bitrate_history);
+	ClassDB::bind_method(D_METHOD("get_bit_rate"), &MediaSource::get_bit_rate);
+	ClassDB::bind_method(D_METHOD("get_chapter_at", "seconds"), &MediaSource::get_chapter_at);
+	ClassDB::bind_method(D_METHOD("add_external_subtitle", "path", "language", "title"), &MediaSource::add_external_subtitle, DEFVAL(String()), DEFVAL(String()));
+	ClassDB::bind_method(D_METHOD("get_external_subtitle_count"), &MediaSource::get_external_subtitle_count);
+	ClassDB::bind_method(D_METHOD("set_subtitle_read_ahead", "seconds"), &MediaSource::set_subtitle_read_ahead);
+	ClassDB::bind_method(D_METHOD("get_subtitle_read_ahead"), &MediaSource::get_subtitle_read_ahead);
+	ClassDB::bind_static_method("MediaSource", D_METHOD("normalize_language", "code"), &MediaSource::normalize_language);
+	ClassDB::bind_static_method("MediaSource", D_METHOD("language_name", "code"), &MediaSource::language_name);
+	ClassDB::bind_method(D_METHOD("pick_audio_track", "languages"), &MediaSource::pick_audio_track);
+	ClassDB::bind_method(D_METHOD("pick_subtitle_track", "languages", "forced_only"), &MediaSource::pick_subtitle_track, DEFVAL(false));
 
 	ClassDB::bind_method(D_METHOD("set_video_queue_seconds", "seconds"), &MediaSource::set_video_queue_seconds);
 	ClassDB::bind_method(D_METHOD("get_video_queue_seconds"), &MediaSource::get_video_queue_seconds);
@@ -2054,6 +2202,8 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "audio_queue_seconds"), "set_audio_queue_seconds", "get_audio_queue_seconds");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_speed", PROPERTY_HINT_RANGE, "0.5,2,0.05"), "set_playback_speed", "get_playback_speed");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "subtitle_read_ahead", PROPERTY_HINT_RANGE, "0,30,0.1,suffix:s"), "set_subtitle_read_ahead", "get_subtitle_read_ahead");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "network_buffer_size", PROPERTY_HINT_RANGE, "4194304,268435456,1048576,suffix:B"), "set_network_buffer_size", "get_network_buffer_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "network_requests", PROPERTY_HINT_RANGE, "1,16,1"), "set_network_requests", "get_network_requests");
 

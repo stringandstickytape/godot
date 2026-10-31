@@ -20,6 +20,15 @@
 	<tutorials>
 	</tutorials>
 	<methods>
+		<method name="add_external_subtitle">
+			<return type="int" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="language" type="String" default="&quot;&quot;" />
+			<param index="2" name="title" type="String" default="&quot;&quot;" />
+			<description>
+				Loads a subtitle file (SubRip, ASS/SSA or WebVTT; a local path or smb://) as one more subtitle track after the file's own, and returns its index, or -1 if it can't be read ([method get_last_error] says why; the source keeps playing). Blocking: it reads the whole file (up to 16 MiB). Text in UTF-8, UTF-16 with a byte order mark, or anything else read as Windows-1252. [param language] and [param title] default to what the file name says ([method MediaBrowser.parse_subtitle_name]) and the file name. The track is selected like any other; its events are all handed out by [method read_subtitle_event] at once, in time order, and again from the events still showing at the target after a [method seek]. [method close] drops the files. Find the files with [method MediaBrowser.find_subtitles].
+			</description>
+		</method>
 		<method name="close">
 			<return type="void" />
 			<description>
@@ -44,10 +53,29 @@
 				Returns the selected audio track (index into [method get_audio_tracks]), or -1.
 			</description>
 		</method>
+		<method name="get_bit_rate" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the container's overall bit rate in bit/s (all streams), or 0 if it doesn't say.
+			</description>
+		</method>
+		<method name="get_chapter_at" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="seconds" type="float" />
+			<description>
+				Returns the index of the chapter playing at [param seconds], or -1 before the first chapter, after the last one ends, or when the file has none.
+			</description>
+		</method>
+		<method name="get_chapters" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns the file's chapters (Matroska, MP4): one Dictionary each, [code]index[/code], [code]start[/code], [code]end[/code] (media seconds, like every time here) and [code]title[/code] (may be empty), sorted by start. A chapter without an end lasts until the next one. Empty if the file has none.
+			</description>
+		</method>
 		<method name="get_audio_tracks" qualifiers="const">
 			<return type="Array" />
 			<description>
-				Returns one Dictionary per audio stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]channels[/code], [code]channel_layout[/code] (for example "5.1(side)"), [code]sample_rate[/code], [code]bit_rate[/code], [code]language[/code], [code]title[/code], [code]default[/code].
+				Returns one Dictionary per audio stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]channels[/code], [code]channel_layout[/code] (for example "5.1(side)"), [code]sample_rate[/code], [code]bit_rate[/code], [code]language[/code] (as the file says it), [code]language_code[/code] ([method normalize_language]), [code]title[/code], [code]default[/code], [code]commentary[/code] and [code]visual_impaired[/code] (audio description; both from the stream's flags or its title).
 			</description>
 		</method>
 		<method name="get_duration" qualifiers="const">
@@ -59,7 +87,13 @@
 		<method name="get_info" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns [code]path[/code], [code]format[/code], [code]duration[/code], [code]start_time[/code], [code]bit_rate[/code], [code]video[/code] ([method get_video_info]), [code]audio_tracks[/code], [code]subtitle_tracks[/code], [code]audio_track[/code] and [code]output_rate[/code].
+				Returns [code]path[/code], [code]format[/code], [code]duration[/code], [code]start_time[/code], [code]bit_rate[/code], [code]video[/code] ([method get_video_info]), [code]audio_tracks[/code], [code]subtitle_tracks[/code], [code]chapters[/code] ([method get_chapters]), [code]audio_track[/code], [code]subtitle_track[/code] and [code]output_rate[/code].
+			</description>
+		</method>
+		<method name="get_external_subtitle_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns how many subtitle files [method add_external_subtitle] has added since [method open].
 			</description>
 		</method>
 		<method name="get_last_error" qualifiers="const">
@@ -132,19 +166,28 @@
 		<method name="get_subtitle_tracks" qualifiers="const">
 			<return type="Array" />
 			<description>
-				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]text[/code] (decoded to text: SubRip, ASS/SSA, MP4 timed text, WebVTT), [code]bitmap[/code] (PGS, VobSub, DVB, XSUB: passed through), [code]language[/code], [code]title[/code], [code]default[/code], [code]forced[/code].
+				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]text[/code] (decoded to text: SubRip, ASS/SSA, MP4 timed text, WebVTT), [code]bitmap[/code] (PGS, VobSub, DVB, XSUB: passed through), [code]language[/code], [code]language_code[/code] ([method normalize_language]), [code]title[/code], [code]default[/code], [code]forced[/code], [code]hearing_impaired[/code] (both also from the title), [code]external[/code], and for subtitle files ([method add_external_subtitle]) [code]path[/code]. The file's own tracks come first.
+			</description>
+		</method>
+		<method name="get_video_bitrate_history" qualifiers="const">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="seconds" type="int" />
+			<param index="1" name="at" type="float" />
+			<description>
+				Returns the video bit rate in kbit/s of each of the [param seconds] whole media seconds before [param at] (the playback position), oldest first, from the sizes of the packets read; -1 where it isn't known (not read since the last [method seek], or more than about 64 s from the read position). At most 64 values. For a bitrate graph; [method HWVideoTexture.get_overlay_stats] includes the last 60 s.
 			</description>
 		</method>
 		<method name="get_video_info" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
 				Returns the video stream: [code]codec[/code] ("h264", "hevc", "vp9", "av1" or FFmpeg's name), [code]is_h264[/code], [code]is_hevc[/code], [code]is_vp9[/code], [code]is_av1[/code], [code]width[/code], [code]height[/code] (the cropped picture size, before any pixel aspect; the exact visible rectangle comes from [method HWVideoTexture.get_visible_rect]), [code]sample_aspect_ratio[/code] (pixel aspect, 1 if square or unknown), [code]display_aspect[/code], [code]fps[/code], [code]bit_depth[/code], [code]profile[/code], [code]pixel_format[/code], the colour description [code]color_primaries[/code], [code]color_transfer[/code], [code]color_matrix[/code], [code]color_range[/code] (FFmpeg's names such as "bt709", "bt2020nc", "smpte2084", "tv"; empty if unspecified) and from it [code]matrix_bt2020[/code], [code]full_range[/code] and [code]hdr[/code] (PQ or HLG transfer: needs tone mapping), [code]hw_decodable[/code] (the Frame can decode and show it in hardware: H.264 or HEVC, 4:2:0, 8-bit, or 10-bit when the decoder offers P010), [code]hw_unsupported_reason[/code] (why not, as a sentence for the user; empty if it can), [code]software_decodable[/code] (not in hardware, but [HWVideoTexture] decodes it in software: H.264, HEVC or VP9 up to about 1080p), [code]playable[/code] (one or the other), [code]unplayable_reason[/code] (why neither), [code]annexb_filter[/code], and from the SPS [code]coded_width[/code], [code]coded_height[/code], [code]display_width[/code], [code]display_height[/code], [code]chroma_format[/code]. Empty if there is no video.
+				The container's stereo 3D and spherical metadata (Matroska StereoMode and Projection, MP4 st3d and sv3d), empty or zero when it says nothing (then guess from the file name): [code]stereo_mode[/code] ("2d", "sbs", "tb", "frame_sequence", "checkerboard", "sbs_quincunx", "lines", "columns", or "unspecified" when the file says only that it has two views, as Apple's MP4 boxes do), [code]stereo_inverted[/code] (the right eye's picture comes first), [code]stereo_baseline_mm[/code], [code]stereo_fov[/code] (degrees), [code]projection[/code] ("equirectangular", "half_equirectangular", "cubemap", "fisheye", "rectilinear", "parametric_immersive", "other"), [code]projection_fov[/code] (degrees across and down, a [Vector2]: 360x180 for a full equirectangular sphere, 180x180 for VR180, 0 if unknown), [code]projection_yaw_pitch_roll[/code] (degrees, a [Vector3]) and [code]projection_bounds[/code] (the equirectangular crop: left, top, right, bottom as fractions of the full sphere, a [Vector4]).
 			</description>
 		</method>
 		<method name="read_subtitle_event">
 			<return type="Dictionary" />
 			<description>
-				Takes the next event of the selected subtitle track: [code]start[/code] and [code]end[/code] (media seconds; [code]end[/code] is -1 when unknown, as for most bitmap tracks, where the next event ends it), [code]text[/code] (plain text, lines separated by [code]\n[/code], ASS override tags removed), [code]ass[/code] (FFmpeg's ASS event line(s): ReadOrder, Layer, Style, Name, margins, Effect, Text), [code]bitmap[/code], [code]data[/code] (bitmap tracks: the raw packet), [code]serial[/code]. Returns an empty Dictionary when none is queued. Events come in file order, about the queue length ahead of the playback position; keep them until their time. At most 512 are queued (the oldest are dropped).
+				Takes the next event of the selected subtitle track: [code]start[/code] and [code]end[/code] (media seconds; [code]end[/code] is -1 when unknown, as for most bitmap tracks, where the next event ends it), [code]text[/code] (plain text, lines separated by [code]\n[/code], ASS override tags removed), [code]ass[/code] (FFmpeg's ASS event line(s): ReadOrder, Layer, Style, Name, margins, Effect, Text), [code]bitmap[/code], [code]data[/code] (bitmap tracks: the raw packet), [code]serial[/code]. Returns an empty Dictionary when none is queued. Events come in file order, about the queue length ahead of the playback position; keep them until their time. At most 512 are queued (the oldest are dropped). Subtitle files ([method add_external_subtitle]) hand out all their events at once instead. For a negative subtitle delay, see [member subtitle_read_ahead].
 			</description>
 		</method>
 		<method name="select_subtitle_track">
@@ -166,12 +209,41 @@
 				Returns [code]true[/code] between a successful [method open] and [method close].
 			</description>
 		</method>
+		<method name="language_name" qualifiers="static">
+			<return type="String" />
+			<param index="0" name="code" type="String" />
+			<description>
+				Returns the English name of a language code or name, normalized first: [code]"ger"[/code] gives [code]"German"[/code], [code]"pt-BR"[/code] gives [code]"Portuguese (BR)"[/code]. Unknown codes come back as given.
+			</description>
+		</method>
+		<method name="normalize_language" qualifiers="static">
+			<return type="String" />
+			<param index="0" name="code" type="String" />
+			<description>
+				Returns the ISO 639-1 code for a language as containers and file names give it: ISO 639-2/B and /T codes ([code]"ger"[/code], [code]"deu"[/code]), ISO 639-1 codes, and English names ([code]"German"[/code]) all give [code]"de"[/code]. Lower case, with a region kept after a hyphen ([code]"pt_BR"[/code] gives [code]"pt-br"[/code]). [code]"und"[/code] and other "no language" codes give an empty string; unknown codes come back lower case.
+			</description>
+		</method>
 		<method name="open">
 			<return type="int" enum="Error" />
 			<param index="0" name="path" type="String" />
 			<description>
 				Opens a file, reads its stream information, selects the default audio track and starts reading. Blocks while it reads the start of the file.
 				[param path] is a local path, a [code]res://[/code] or [code]user://[/code] path, or [code]smb://host/share/path/file[/code] (not URL-encoded: names are written as they are). For an smb:// file, the host is connected and logged into with the credentials of [method set_smb_credentials] (else as guest), which can take up to about 8 s per step when the host doesn't answer: open from a worker thread if the caller must not stall. Errors are sentences for the user in [method get_last_error], for example "Access denied: HOST refused the user name or password." or "Not found: share/path on HOST.".
+			</description>
+		</method>
+		<method name="pick_audio_track" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="languages" type="PackedStringArray" />
+			<description>
+				Language memory: returns the audio track that fits [param languages] (codes or names, the most preferred first) best, or -1 if none is in any of them. Among tracks of the same language: not a commentary, not audio description, the default flag, then more channels. A preference without a region matches every region; one with a region matches only that region.
+			</description>
+		</method>
+		<method name="pick_subtitle_track" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="languages" type="PackedStringArray" />
+			<param index="1" name="forced_only" type="bool" default="false" />
+			<description>
+				Language memory: returns the subtitle track (the file's own and the added files) that fits [param languages] best, or -1. Among tracks of the same language: text before bitmap (only text is drawn so far), full before forced, without before with hearing-impaired notes, the default flag, the file's own before a file. With [param forced_only], only forced tracks count (the foreign parts of a film whose audio is in the viewer's language).
 			</description>
 		</method>
 		<method name="read_video_packet">
@@ -220,6 +292,12 @@
 		</member>
 		<member name="network_requests" type="int" setter="set_network_requests" getter="get_network_requests" default="4">
 			Read requests (of up to 1 MiB) in flight at once for smb:// files, 1 to 16; applies at the next [method open]. More keeps a link with more latency busy.
+		</member>
+		<member name="playback_speed" type="float" setter="set_playback_speed" getter="get_playback_speed" default="1.0">
+			0.5 to 2. The audio plays faster or slower with its pitch kept (a WSOLA time stretch in the mixer: about 0.3 % of an x86 core at any speed other than 1, nothing at 1), and as the audio clock is the master clock, the video follows; the decoder then has to decode that much faster. Takes effect at the next mix, any time. The output latency corrections of the clock ([method AudioServer.get_time_since_last_mix], [method AudioServer.get_output_latency]) are in real seconds: multiply them by the speed. Without an audio track, set [member HWVideoTexture.playback_speed] instead.
+		</member>
+		<member name="subtitle_read_ahead" type="float" setter="set_subtitle_read_ahead" getter="get_subtitle_read_ahead" default="0.0">
+			Seconds (0 to 30). The events of a file's own subtitle tracks come with its packets, about [member video_queue_seconds] ahead of the playback. A negative subtitle delay (showing lines earlier) needs them earlier than that: set this to the largest such delay, and while a subtitle track of the file is selected the video is read that far ahead (plus 0.5 s), within the queue's limits of 512 packets and 96 MiB (about 20 s at 24 fps). Costs memory, not CPU. The delay itself is applied by whoever shows the lines. Subtitle files don't need it.
 		</member>
 		<member name="video_queue_seconds" type="float" setter="set_video_queue_seconds" getter="get_video_queue_seconds" default="1.0">
 			Video access units to keep queued, in seconds of frames. Set before [method open].

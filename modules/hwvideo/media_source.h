@@ -47,12 +47,14 @@ struct AVCodecContext;
 struct AVFormatContext;
 struct AVFrame;
 struct AVPacket;
+struct AVStream;
 struct SwrContext;
 struct AVIOContext;
 
 class SmbFile;
 
 class AudioStreamMedia;
+class AudioTempo;
 
 // A media file (Matroska/WebM, MP4/MOV, MPEG-TS, AVI) opened with FFmpeg's libavformat, read on a worker thread.
 // Video is only demuxed: access units go, in Annex-B for H.264/HEVC, through a bounded queue to a consumer (V4L2Decoder).
@@ -99,6 +101,18 @@ public:
 		String color_transfer; // "bt709", "smpte2084" (PQ), "arib-std-b67" (HLG), ...
 		String color_matrix; // "bt709", "bt2020nc", "bt470bg" / "smpte170m" (BT.601), ...
 		String color_range; // "tv" (limited) or "pc" (full).
+		// Stereo 3D and spherical metadata from the container (Matroska StereoMode and Projection, MP4 st3d and sv3d).
+		String stereo_mode; // "" (the container says nothing), "2d", "sbs", "tb", "frame_sequence", "checkerboard", ...
+		bool stereo_inverted = false; // The right eye's picture comes first (left half, or top).
+		double stereo_baseline_mm = 0.0; // Distance between the cameras, if given.
+		double stereo_fov = 0.0; // Horizontal field of view in degrees, if given.
+		String projection; // "" (flat: the container says nothing), "equirectangular", "half_equirectangular", "fisheye", ...
+		double projection_fov_h = 0.0; // Degrees covered (equirectangular: from the crop bounds); 0 if unknown.
+		double projection_fov_v = 0.0;
+		double projection_yaw = 0.0; // Degrees.
+		double projection_pitch = 0.0;
+		double projection_roll = 0.0;
+		double projection_bounds[4] = {}; // Equirectangular crop: left, top, right, bottom, as fractions of the full sphere.
 		AnnexBSplitter::SPSInfo sps; // H.264/HEVC: the first SPS (coded size, cropped size, bit depth).
 	};
 
@@ -144,6 +158,8 @@ private:
 		String language;
 		String title;
 		bool is_default = false;
+		bool commentary = false;
+		bool visual_impaired = false; // Audio description.
 	};
 
 	struct SubtitleTrack {
@@ -155,6 +171,21 @@ private:
 		String title;
 		bool is_default = false;
 		bool forced = false;
+		bool hearing_impaired = false;
+		String path; // External files: where it was loaded from.
+	};
+
+	struct Chapter {
+		double start = 0.0; // Media seconds.
+		double end = 0.0;
+		String title;
+	};
+
+	// A subtitle file loaded next to the video: all its events, in memory (add_external_subtitle()).
+	struct ExternalSubtitle {
+		SubtitleTrack track;
+		LocalVector<SubtitleEvent> events; // Sorted by start.
+		String header;
 	};
 
 	struct AudioMarker {
@@ -190,6 +221,13 @@ private:
 	static constexpr double AUDIO_RING_SECONDS = 4.0;
 	static constexpr uint32_t SUBTITLE_QUEUE_MAX = 512;
 	static constexpr int SEEK_RETRIES_MAX = 6;
+	static constexpr uint32_t BITRATE_SECONDS = 128; // Seconds of video bytes kept (behind and ahead of the read position).
+
+	struct BitrateSecond {
+		int64_t second = INT64_MIN; // Media second (floor of the PTS).
+		uint32_t serial = 0; // Counted under this serial; others are stale.
+		uint64_t bytes = 0;
+	};
 
 	// Settings: change them before open().
 	double video_queue_seconds = 1.0;
@@ -207,6 +245,7 @@ private:
 	VideoInfo video;
 	LocalVector<AudioTrack> audio_tracks;
 	LocalVector<SubtitleTrack> subtitle_tracks;
+	LocalVector<Chapter> chapters;
 	LocalVector<uint8_t> config_parameter_sets; // Annex-B VPS/SPS/PPS from the codec configuration (avcC/hvcC).
 	int output_rate = 48000;
 	uint64_t ring_capacity = 0;
@@ -232,6 +271,12 @@ private:
 	int subtitle_track = -1;
 	LocalVector<SubtitleEvent> subtitle_queue;
 	String subtitle_header;
+	LocalVector<ExternalSubtitle> external_subtitles; // Tracks subtitle_tracks.size() and up.
+	uint32_t external_cursor = 0; // The next event of the selected external track to hand out.
+	uint32_t external_serial = 0; // The serial it was handed out under.
+	double subtitle_read_ahead = 0.0;
+	uint32_t subtitle_video_target = 0; // Video queue target while a subtitle stream is read (covers the read-ahead).
+	BitrateSecond bitrate_seconds[BITRATE_SECONDS];
 	int wake_fd = -1;
 	VideoPacket video_queue[VIDEO_QUEUE_MAX];
 	uint32_t video_head = 0;
@@ -262,6 +307,11 @@ private:
 	uint64_t audio_underruns = 0;
 	uint64_t audio_seek_waits = 0;
 	uint64_t audio_frames_mixed = 0;
+	// Playback speed (audio_mutex): the ring is read faster or slower through a time stretch that keeps the pitch.
+	double playback_speed = 1.0;
+	AudioTempo *tempo = nullptr; // Made the first time the speed isn't 1.
+	bool tempo_active = false;
+	uint32_t tempo_serial = 0;
 
 	// Demux thread only (and open(), before the thread starts).
 	Stats dstats;
@@ -313,6 +363,16 @@ private:
 	static bool _is_text_subtitle(int p_codec_id);
 	static bool _is_bitmap_subtitle(int p_codec_id);
 	static void _config_to_annexb(const uint8_t *p_data, int p_size, bool p_hevc, LocalVector<uint8_t> &r_out);
+	// One decoded text subtitle packet as an event (p_start, p_duration: the packet's media time and duration, -1 if
+	// none). False if it decoded to nothing; r_error set if the decoder failed.
+	static bool _decode_text_subtitle(AVCodecContext *p_codec, AVPacket *p_packet, double p_start, double p_duration, SubtitleEvent &r_event, bool &r_error);
+	static String _subtitle_file_to_utf8(const PackedByteArray &p_bytes, String &r_charset);
+	static Error _read_whole_file(const String &p_path, int64_t p_max_bytes, PackedByteArray &r_bytes, String &r_error);
+	void _read_stream_metadata(const AVStream *p_stream);
+	void _read_chapters();
+	uint32_t _subtitle_video_target() const;
+	void _count_video_bytes_locked(double p_pts, uint32_t p_bytes);
+	static Dictionary _subtitle_track_to_dictionary(const SubtitleTrack &p_track, int p_index, bool p_external);
 
 	void _set_error(const String &p_message);
 	void _close_network();
@@ -336,6 +396,7 @@ private:
 	void _audio_fifo_clear();
 	void _resample_frame(const AVFrame *p_frame);
 	void _flush_scratch();
+	uint32_t _mix_tempo_locked(AudioFrame *p_buffer, uint32_t p_frames);
 	void _write_ring_locked(const float *p_samples, uint32_t p_frames, double p_time);
 
 	void _open_subtitle_track(int p_track);
@@ -379,6 +440,31 @@ public:
 	// The ASS header (styles) of the selected text track, for libass ([Script Info], [V4+ Styles], [Events]).
 	String get_subtitle_header() const;
 
+	// Chapters of the file: [{index, start, end, title}] in media seconds; empty if it has none.
+	Array get_chapters() const;
+	// The chapter playing at p_seconds, or -1 (before the first, or none).
+	int get_chapter_at(double p_seconds) const;
+
+	// Loads a subtitle file (SubRip, ASS/SSA, WebVTT; local or smb://) as one more subtitle track, after the file's own,
+	// and returns its index (-1 on failure, get_last_error() says why). Blocking (reads the whole file). The language and
+	// title default to what the file name says (MediaBrowser.parse_subtitle_name()). Selected like any other track; its
+	// events are all handed out by read_subtitle_event() at once, again from the seek target after a seek.
+	int add_external_subtitle(const String &p_path, const String &p_language = String(), const String &p_title = String());
+	int get_external_subtitle_count() const;
+	// Subtitle events of a file's own tracks come with the packets, about video_queue_seconds ahead of the playback. A
+	// negative subtitle delay shows them earlier than that: set this to the largest such delay (seconds) and the video is
+	// read that far ahead while a subtitle track is selected (within the queue's limits: 512 packets, 96 MiB).
+	void set_subtitle_read_ahead(double p_seconds);
+	double get_subtitle_read_ahead() const;
+
+	// Language memory: "ger", "deu", "de" and "German" -> "de" (see MediaLanguages), and the track that fits a list of
+	// preferred languages best (-1: none of them).
+	static String normalize_language(const String &p_code);
+	static String language_name(const String &p_code);
+	int pick_audio_track(const PackedStringArray &p_languages) const;
+	// p_forced_only: only forced tracks (the foreign parts of a film in the audio's language).
+	int pick_subtitle_track(const PackedStringArray &p_languages, bool p_forced_only = false) const;
+
 	// Any thread. Drops everything queued and reads again from the keyframe at or before p_seconds; decoded audio before
 	// p_seconds is dropped. Returns the new serial.
 	int seek(double p_seconds);
@@ -398,6 +484,10 @@ public:
 	void set_network_requests(int p_requests);
 	int get_network_requests() const { return network_requests; }
 	Dictionary get_stats() const;
+	// Video bitrate in kbit/s for each of the p_seconds whole media seconds before p_at (oldest first), from the sizes of
+	// the packets read; -1 where unknown (not read since the last seek, or too long ago). For a graph in an overlay.
+	PackedFloat32Array get_video_bitrate_history(int p_seconds, double p_at) const;
+	int64_t get_bit_rate() const { return bit_rate; }
 
 	Ref<AudioStreamMedia> get_audio_stream();
 	int get_output_rate() const { return output_rate; }
@@ -427,6 +517,12 @@ public:
 	double get_audio_position() const;
 	bool is_audio_finished() const;
 	bool has_audio() const { return audio_track >= 0; }
+
+	// 0.5 to 2: the audio plays faster or slower with its pitch kept (AudioTempo), and since the audio is the master
+	// clock, the video follows. Any time, any thread; takes effect at the next mix. Without an audio track, set
+	// HWVideoTexture.playback_speed instead.
+	void set_playback_speed(double p_speed);
+	double get_playback_speed() const;
 
 	void set_video_queue_seconds(double p_seconds);
 	double get_video_queue_seconds() const { return video_queue_seconds; }

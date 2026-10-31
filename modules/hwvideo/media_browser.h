@@ -60,6 +60,13 @@ public:
 
 	TypedArray<String> list_shares(const String &p_host);
 	Array list_dir(const String &p_path);
+	// Subtitle files for a video (local or smb://), blocking like list_dir(): in its folder, those whose name starts with
+	// the video's name (all of them if it is the only video there), and in a Subs, Sub, Subtitles or Subtitle folder next
+	// to it (and its subfolder named like the video). [{path, name, language, language_name, forced, hearing_impaired,
+	// format, matches_video}], those named after the video first.
+	Array find_subtitles(const String &p_video_path);
+	// What a subtitle file's name says next to a video file (both names without folders): see find_subtitles().
+	static Dictionary parse_subtitle_name(const String &p_video_file, const String &p_subtitle_file);
 	String get_last_error() const;
 	void disconnect_host();
 

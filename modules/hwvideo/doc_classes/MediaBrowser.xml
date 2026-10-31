@@ -23,6 +23,13 @@
 				Closes the kept connection, if any.
 			</description>
 		</method>
+		<method name="find_subtitles">
+			<return type="Array" />
+			<param index="0" name="video_path" type="String" />
+			<description>
+				Returns the subtitle files for a video (a local path or smb://), blocking like [method list_dir]: in the video's folder, those whose name starts with the video's name (all of them if it is the only video there), and those in a Subs, Sub, Subtitles or Subtitle folder next to it, and in that folder's subfolder named like the video (series packs). One Dictionary each: [code]path[/code], [code]name[/code], [code]language[/code], [code]language_name[/code], [code]forced[/code], [code]hearing_impaired[/code], [code]format[/code], [code]matches_video[/code] (see [method parse_subtitle_name]); those named after the video first. Load them with [method MediaSource.add_external_subtitle].
+			</description>
+		</method>
 		<method name="get_last_error" qualifiers="const">
 			<return type="String" />
 			<description>
@@ -41,6 +48,14 @@
 			<param index="0" name="host" type="String" />
 			<description>
 				Returns the names of the host's shared folders, sorted: no printers, no IPC$, no hidden or administrative shares (names ending in [code]$[/code]). Uses the server service over DCE/RPC on IPC$. Some servers or policies don't allow listing shares; then the result is empty and [method get_last_error] says so, and the user has to type the share name.
+			</description>
+		</method>
+		<method name="parse_subtitle_name" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="video_file" type="String" />
+			<param index="1" name="subtitle_file" type="String" />
+			<description>
+				Returns what a subtitle file's name says next to a video file (both names without folders): [code]subtitle[/code] (.srt, .ass, .ssa or .vtt), [code]matches_video[/code] (the name starts with the video's name without its extension, ignoring case), [code]language[/code] (normalized as by [method MediaSource.normalize_language]; the last language named wins, so [code]Film.en.srt[/code], [code]Film.English.srt[/code], [code]2_English.srt[/code] and [code]Film.pt-BR.srt[/code] work; empty if none), [code]language_name[/code], [code]forced[/code] ("forced", "foreign"), [code]hearing_impaired[/code] ("sdh", "cc", "hearing", or "hi" after a language: [code]Film.en.hi.srt[/code]; [code]Film.hi.srt[/code] is Hindi) and [code]format[/code] ("srt", "ass", "vtt").
 			</description>
 		</method>
 		<method name="set_smb_credentials" qualifiers="static">

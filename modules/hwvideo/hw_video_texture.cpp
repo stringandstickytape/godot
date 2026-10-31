@@ -32,12 +32,17 @@
 
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
+#include "core/os/os.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server.h"
 
 #include <drm/drm_fourcc.h>
 #include <linux/videodev2.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 
 #ifndef V4L2_PIX_FMT_QC10C
@@ -339,7 +344,7 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	}
 	_check_seek();
 	if (playing) {
-		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta;
+		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta * playback_speed;
 	}
 	decoder->set_clock(clock);
 
@@ -527,7 +532,7 @@ void HWVideoTexture::_update_software(double p_delta, double p_master_clock) {
 		software->return_all_ready();
 	}
 	if (playing) {
-		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta;
+		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta * playback_speed;
 	}
 
 	RenderingDevice *rd = RenderingDevice::get_singleton();
@@ -798,6 +803,239 @@ Dictionary HWVideoTexture::get_stats() const {
 	return d;
 }
 
+// Reads a small sysfs file (no allocation beyond the result). False if it can't be read.
+static bool read_sysfs(const String &p_path, char *r_buffer, int p_size) {
+	const int fd = ::open(p_path.utf8().get_data(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return false;
+	}
+	const ssize_t n = ::read(fd, r_buffer, p_size - 1);
+	::close(fd);
+	if (n <= 0) {
+		return false;
+	}
+	size_t length = (size_t)n;
+	r_buffer[length] = 0;
+	while (length > 0 && (r_buffer[length - 1] == '\n' || r_buffer[length - 1] == ' ')) {
+		r_buffer[--length] = 0;
+	}
+	return true;
+}
+
+static bool read_sysfs_int(const String &p_path, int64_t &r_value) {
+	char buffer[64];
+	if (!read_sysfs(p_path, buffer, sizeof(buffer))) {
+		return false;
+	}
+	char *end = nullptr;
+	r_value = strtoll(buffer, &end, 10);
+	return end != buffer;
+}
+
+namespace {
+
+struct SystemPaths {
+	bool scanned = false;
+	String gpu_devfreq; // /sys/class/devfreq/<the GPU>.
+	struct Zone {
+		String temp_path;
+		String type;
+	};
+	LocalVector<Zone> zones;
+	String battery; // /sys/class/power_supply/<the battery>.
+};
+
+Mutex system_paths_mutex;
+SystemPaths system_paths;
+
+void scan_system_paths() {
+	if (system_paths.scanned) {
+		return;
+	}
+	system_paths.scanned = true;
+	char buffer[128];
+	// HWVIDEO_SYSFS_ROOT: a fake tree for tests (root/sys/class/...).
+	const String root = OS::get_singleton()->get_environment("HWVIDEO_SYSFS_ROOT");
+	const String devfreq = root + "/sys/class/devfreq";
+	const String thermal = root + "/sys/class/thermal";
+	const String power = root + "/sys/class/power_supply";
+	if (DIR *dir = opendir(devfreq.utf8().get_data())) {
+		while (struct dirent *entry = readdir(dir)) {
+			const String name = String::utf8(entry->d_name);
+			const String lower = name.to_lower();
+			if (system_paths.gpu_devfreq.is_empty() && (lower.contains("gpu") || lower.contains("kgsl") || lower.contains("3d00000"))) {
+				system_paths.gpu_devfreq = devfreq + "/" + name;
+			}
+		}
+		closedir(dir);
+	}
+	if (DIR *dir = opendir(thermal.utf8().get_data())) {
+		while (struct dirent *entry = readdir(dir)) {
+			const String name = String::utf8(entry->d_name);
+			if (!name.begins_with("thermal_zone")) {
+				continue;
+			}
+			SystemPaths::Zone zone;
+			zone.temp_path = thermal + "/" + name + "/temp";
+			zone.type = read_sysfs(thermal + "/" + name + "/type", buffer, sizeof(buffer)) ? String::utf8(buffer) : name;
+			system_paths.zones.push_back(zone);
+		}
+		closedir(dir);
+	}
+	if (DIR *dir = opendir(power.utf8().get_data())) {
+		while (struct dirent *entry = readdir(dir)) {
+			const String name = String::utf8(entry->d_name);
+			if (name.begins_with(".")) {
+				continue;
+			}
+			if (read_sysfs(power + "/" + name + "/type", buffer, sizeof(buffer)) && String::utf8(buffer) == "Battery") {
+				system_paths.battery = power + "/" + name;
+				break;
+			}
+		}
+		closedir(dir);
+	}
+}
+
+} // namespace
+
+Dictionary HWVideoTexture::get_system_stats() {
+	MutexLock lock(system_paths_mutex);
+	scan_system_paths();
+	Dictionary d;
+	int64_t value = 0;
+	if (!system_paths.gpu_devfreq.is_empty()) {
+		d["gpu_devfreq"] = system_paths.gpu_devfreq;
+		if (read_sysfs_int(system_paths.gpu_devfreq + "/cur_freq", value)) {
+			d["gpu_mhz"] = value / 1e6;
+		}
+		if (read_sysfs_int(system_paths.gpu_devfreq + "/max_freq", value)) {
+			d["gpu_max_mhz"] = value / 1e6;
+		}
+	}
+	double hottest = -1000.0;
+	double cpu = -1000.0;
+	double gpu = -1000.0;
+	String hottest_zone;
+	for (const SystemPaths::Zone &zone : system_paths.zones) {
+		if (!read_sysfs_int(zone.temp_path, value)) {
+			continue;
+		}
+		const double celsius = value / 1000.0;
+		const String lower = zone.type.to_lower();
+		if (celsius > hottest) {
+			hottest = celsius;
+			hottest_zone = zone.type;
+		}
+		if (lower.contains("cpu")) {
+			cpu = MAX(cpu, celsius);
+		}
+		if (lower.contains("gpu")) {
+			gpu = MAX(gpu, celsius);
+		}
+	}
+	if (hottest > -1000.0) {
+		d["temperature_max_c"] = hottest;
+		d["temperature_max_zone"] = hottest_zone;
+	}
+	if (cpu > -1000.0) {
+		d["cpu_temperature_c"] = cpu;
+	}
+	if (gpu > -1000.0) {
+		d["gpu_temperature_c"] = gpu;
+	}
+	if (!system_paths.battery.is_empty()) {
+		int64_t current = 0;
+		int64_t voltage = 0;
+		if (read_sysfs_int(system_paths.battery + "/power_now", value)) {
+			d["battery_power_w"] = Math::abs(value) / 1e6; // Microwatts.
+		} else if (read_sysfs_int(system_paths.battery + "/current_now", current) && read_sysfs_int(system_paths.battery + "/voltage_now", voltage)) {
+			d["battery_power_w"] = Math::abs((double)current * (double)voltage) / 1e12; // Microamps times microvolts.
+		}
+		if (read_sysfs_int(system_paths.battery + "/capacity", value)) {
+			d["battery_percent"] = value;
+		}
+		char status[32];
+		if (read_sysfs(system_paths.battery + "/status", status, sizeof(status))) {
+			d["battery_status"] = String::utf8(status);
+		}
+	}
+	return d;
+}
+
+Dictionary HWVideoTexture::get_overlay_stats() {
+	const Dictionary stats = get_stats();
+	Dictionary d;
+	d["decode_path"] = stats["decode_path"];
+	d["position"] = clock;
+	d["frame_size"] = decoded_size;
+	d["packing"] = packing;
+	d["frames_shown"] = frames_shown;
+	d["frames_dropped"] = frames_dropped;
+	d["frames_ready"] = ready.size(); // Decoded, waiting for their time.
+	d["decoder_input_queue"] = stats.get("output_in_driver", 0); // Access units in the decoder (hardware).
+	d["decoder_capture_free"] = stats.get("capture_in_driver", 0); // Empty picture buffers the decoder can fill.
+	d["decoder_latency_ms"] = stats.get("latency_avg_ms", 0.0);
+	d["decode_errors"] = stats.get("frames_error", 0);
+
+	if (source.is_valid()) {
+		const MediaSource::VideoInfo &info = source->get_video_stream_info();
+		d["codec"] = info.codec_name;
+		d["video_size"] = Size2i(info.width, info.height);
+		d["fps"] = info.fps;
+		d["bit_depth"] = info.bit_depth;
+		const PackedFloat32Array history = source->get_video_bitrate_history(60, clock);
+		d["video_kbps_history"] = history; // The last 60 s, oldest first; -1 unknown.
+		// Now: the last 3 known whole seconds.
+		double sum = 0.0;
+		int known = 0;
+		for (int i = history.size() - 1; i >= 0 && known < 3; i--) {
+			if (history[i] >= 0.0f) {
+				sum += history[i];
+				known++;
+			}
+		}
+		d["video_kbps"] = known > 0 ? sum / known : -1.0;
+		d["file_kbps"] = source->get_bit_rate() / 1000.0; // The container's overall rate (all streams); 0 if unknown.
+		const Dictionary source_stats = source->get_stats();
+		const int64_t queued = source_stats.get("video_queue", 0);
+		d["demux_video_queue"] = queued;
+		d["demux_video_queue_seconds"] = info.fps > 0.0 ? queued / info.fps : 0.0;
+		d["demux_video_queue_mb"] = (int64_t)source_stats.get("video_queue_bytes", 0) / 1e6;
+		d["audio_buffered_seconds"] = source_stats.get("audio_buffered", 0.0);
+		d["audio_underruns"] = source_stats.get("audio_underruns", 0);
+		if (bool(source_stats.get("network", false))) {
+			const double buffered_bits = (int64_t)source_stats.get("net_buffered_bytes", 0) * 8.0;
+			const double file_bps = (double)source->get_bit_rate();
+			d["network_buffered_mb"] = buffered_bits / 8e6;
+			d["network_buffered_seconds"] = file_bps > 0.0 ? buffered_bits / file_bps : -1.0;
+			d["network_read_mbps"] = source_stats.get("net_read_mbps", 0.0);
+			d["network_stalls"] = source_stats.get("net_stalls", 0);
+		}
+	}
+
+	// Rates since the previous call.
+	const uint64_t now = OS::get_singleton()->get_ticks_usec();
+	const double cpu_seconds = stats["process_cpu_seconds"];
+	const int64_t decoded = stats.get("frames_decoded", 0);
+	if (overlay_usec != 0 && now > overlay_usec) {
+		const double seconds = (now - overlay_usec) / 1e6;
+		d["interval_seconds"] = seconds;
+		d["process_cpu_percent"] = 100.0 * (cpu_seconds - overlay_cpu_seconds) / seconds; // Of one core.
+		d["decode_fps"] = (decoded - overlay_decoded) / seconds;
+		d["shown_fps"] = ((int64_t)frames_shown - overlay_shown) / seconds;
+		d["dropped_per_second"] = ((int64_t)frames_dropped - overlay_dropped) / seconds;
+	}
+	overlay_usec = now;
+	overlay_cpu_seconds = cpu_seconds;
+	overlay_decoded = decoded;
+	overlay_shown = (int64_t)frames_shown;
+	overlay_dropped = (int64_t)frames_dropped;
+
+	d.merge(get_system_stats());
+	return d;
+}
+
 HWVideoTexture::HWVideoTexture() {
 	decoder.instantiate();
 	for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
@@ -813,6 +1051,11 @@ HWVideoTexture::~HWVideoTexture() {
 }
 
 void HWVideoTexture::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_overlay_stats"), &HWVideoTexture::get_overlay_stats);
+	ClassDB::bind_method(D_METHOD("set_playback_speed", "speed"), &HWVideoTexture::set_playback_speed);
+	ClassDB::bind_method(D_METHOD("get_playback_speed"), &HWVideoTexture::get_playback_speed);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_speed", PROPERTY_HINT_RANGE, "0.25,4,0.05"), "set_playback_speed", "get_playback_speed");
+	ClassDB::bind_static_method("HWVideoTexture", D_METHOD("get_system_stats"), &HWVideoTexture::get_system_stats);
 	ClassDB::bind_method(D_METHOD("open", "path", "codec", "fps"), &HWVideoTexture::open);
 	ClassDB::bind_method(D_METHOD("open_source", "source"), &HWVideoTexture::open_source);
 	ClassDB::bind_method(D_METHOD("seek", "seconds"), &HWVideoTexture::seek);

@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "media_browser.h"
+#include "media_languages.h"
 
 #include "core/config/project_settings.h"
 #include "core/object/class_db.h"
@@ -276,6 +277,80 @@ Array MediaBrowser::list_dir(const String &p_path) {
 	return _list_smb(url);
 }
 
+Dictionary MediaBrowser::parse_subtitle_name(const String &p_video_file, const String &p_subtitle_file) {
+	const MediaLanguages::SubtitleFileName info = MediaLanguages::parse_subtitle_file_name(p_video_file, p_subtitle_file);
+	Dictionary d;
+	d["subtitle"] = info.subtitle;
+	d["matches_video"] = info.matches_video;
+	d["language"] = info.language;
+	d["language_name"] = info.language.is_empty() ? String() : MediaLanguages::name(info.language);
+	d["forced"] = info.forced;
+	d["hearing_impaired"] = info.hearing_impaired;
+	d["format"] = info.format;
+	return d;
+}
+
+Array MediaBrowser::find_subtitles(const String &p_video_path) {
+	const String folder = p_video_path.get_base_dir();
+	const String video_file = p_video_path.get_file();
+	const String video_base = video_file.get_basename().to_lower();
+	Array named; // Named after the video.
+	Array others;
+	auto add = [&](const String &p_folder, const String &p_name, bool p_any) {
+		Dictionary d = parse_subtitle_name(video_file, p_name);
+		if (!bool(d["subtitle"]) || !(bool(d["matches_video"]) || p_any)) {
+			return;
+		}
+		d.erase("subtitle");
+		d["path"] = p_folder.path_join(p_name);
+		d["name"] = p_name;
+		(bool(d["matches_video"]) ? named : others).push_back(d);
+	};
+	auto is_subs_folder = [](const String &p_name) {
+		const String lower = p_name.to_lower();
+		return lower == "subs" || lower == "sub" || lower == "subtitles" || lower == "subtitle";
+	};
+
+	const Array entries = list_dir(folder);
+	int videos = 0;
+	for (int i = 0; i < entries.size(); i++) {
+		const Dictionary entry = entries[i];
+		if (!bool(entry["is_dir"]) && MediaLanguages::is_video_extension(String(entry["name"]).get_extension())) {
+			videos++;
+		}
+	}
+	const bool only_video = videos <= 1;
+	for (int i = 0; i < entries.size(); i++) {
+		const Dictionary entry = entries[i];
+		const String name = entry["name"];
+		if (!bool(entry["is_dir"])) {
+			add(folder, name, only_video);
+		} else if (is_subs_folder(name)) {
+			const String subs = folder.path_join(name);
+			const Array sub_entries = list_dir(subs);
+			for (int k = 0; k < sub_entries.size(); k++) {
+				const Dictionary sub_entry = sub_entries[k];
+				const String sub_name = sub_entry["name"];
+				if (!bool(sub_entry["is_dir"])) {
+					add(subs, sub_name, only_video);
+				} else if (sub_name.to_lower() == video_base) {
+					// Series packs: Subs/<episode file name>/2_English.srt.
+					const String episode = subs.path_join(sub_name);
+					const Array episode_entries = list_dir(episode);
+					for (int j = 0; j < episode_entries.size(); j++) {
+						const Dictionary episode_entry = episode_entries[j];
+						if (!bool(episode_entry["is_dir"])) {
+							add(episode, episode_entry["name"], true);
+						}
+					}
+				}
+			}
+		}
+	}
+	named.append_array(others);
+	return named;
+}
+
 String MediaBrowser::get_last_error() const {
 	MutexLock lock(mutex);
 	return last_error;
@@ -304,6 +379,8 @@ void MediaBrowser::_bind_methods() {
 	ClassDB::bind_static_method("MediaBrowser", D_METHOD("set_smb_credentials", "host", "user", "password", "domain"), &MediaBrowser::set_smb_credentials, DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("list_shares", "host"), &MediaBrowser::list_shares);
 	ClassDB::bind_method(D_METHOD("list_dir", "path"), &MediaBrowser::list_dir);
+	ClassDB::bind_method(D_METHOD("find_subtitles", "video_path"), &MediaBrowser::find_subtitles);
+	ClassDB::bind_static_method("MediaBrowser", D_METHOD("parse_subtitle_name", "video_file", "subtitle_file"), &MediaBrowser::parse_subtitle_name);
 	ClassDB::bind_method(D_METHOD("get_last_error"), &MediaBrowser::get_last_error);
 	ClassDB::bind_method(D_METHOD("disconnect_host"), &MediaBrowser::disconnect_host);
 	ClassDB::bind_method(D_METHOD("set_timeout", "seconds"), &MediaBrowser::set_timeout);

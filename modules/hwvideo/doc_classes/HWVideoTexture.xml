@@ -65,6 +65,12 @@
 				On the software path: why the hardware path wasn't used (the same sentence as [code]hw_unsupported_reason[/code] in [method MediaSource.get_video_info]).
 			</description>
 		</method>
+		<method name="get_overlay_stats">
+			<return type="Dictionary" />
+			<description>
+				For a stats overlay, once or twice a second (rates are measured since the previous call). [code]decode_path[/code], [code]position[/code], [code]frame_size[/code], [code]packing[/code]; the stream ([code]codec[/code], [code]video_size[/code], [code]fps[/code], [code]bit_depth[/code]); bitrate: [code]video_kbps[/code] (the last 3 known seconds), [code]video_kbps_history[/code] (the last 60 s, oldest first, -1 unknown; see [method MediaSource.get_video_bitrate_history]), [code]file_kbps[/code]; queue depths from the file to the screen: [code]network_buffered_mb[/code], [code]network_buffered_seconds[/code], [code]network_read_mbps[/code], [code]network_stalls[/code] (smb:// only), [code]demux_video_queue[/code] (packets), [code]demux_video_queue_seconds[/code], [code]demux_video_queue_mb[/code], [code]audio_buffered_seconds[/code], [code]audio_underruns[/code], [code]decoder_input_queue[/code] (access units in the hardware decoder), [code]decoder_capture_free[/code] (picture buffers it can fill), [code]decoder_latency_ms[/code], [code]frames_ready[/code] (decoded, waiting for their time), [code]frames_shown[/code], [code]frames_dropped[/code], [code]decode_errors[/code]; rates (from the second call on): [code]interval_seconds[/code], [code]decode_fps[/code], [code]shown_fps[/code], [code]dropped_per_second[/code], [code]process_cpu_percent[/code] (of one core, all threads); and everything [method get_system_stats] returns.
+			</description>
+		</method>
 		<method name="get_packing" qualifiers="const">
 			<return type="int" enum="HWVideoTexture.Packing" />
 			<description>
@@ -88,6 +94,12 @@
 			<return type="Dictionary" />
 			<description>
 				Returns the decoder's [method V4L2Decoder.get_stats] plus [code]frames_shown[/code], [code]frames_dropped[/code] (late), [code]frames_stale[/code] (from before a seek), [code]frames_skipped[/code] (decoded on the way to a seek target), [code]settling[/code], [code]seek_target[/code], [code]position[/code] and [code]frame_time[/code].
+			</description>
+		</method>
+		<method name="get_system_stats" qualifiers="static">
+			<return type="Dictionary" />
+			<description>
+				The GPU clock, temperatures and battery power from sysfs, whatever the device has (the paths are found on the first call): [code]gpu_mhz[/code], [code]gpu_max_mhz[/code] and [code]gpu_devfreq[/code] (the GPU's devfreq entry), [code]temperature_max_c[/code] and [code]temperature_max_zone[/code] (the hottest thermal zone), [code]cpu_temperature_c[/code] and [code]gpu_temperature_c[/code] (the hottest zone whose type names it), [code]battery_power_w[/code] (power_now, or current_now times voltage_now), [code]battery_percent[/code], [code]battery_status[/code]. Keys the device lacks are left out. The environment variable [code]HWVIDEO_SYSFS_ROOT[/code] reads a fake tree instead (tests).
 			</description>
 		</method>
 		<method name="get_visible_rect" qualifiers="const">
@@ -165,6 +177,9 @@
 		</method>
 	</methods>
 	<members>
+		<member name="playback_speed" type="float" setter="set_playback_speed" getter="get_playback_speed" default="1.0">
+			0.25 to 4. Without a master clock ([method update] with [code]master_clock[/code] below 0), the frame clock runs this much faster or slower. With the audio as the master clock, set [member MediaSource.playback_speed] instead: the video follows the audio.
+		</member>
 		<member name="software_fallback" type="bool" setter="set_software_fallback" getter="is_software_fallback" default="true">
 			When [method open_source] gets a stream the hardware path can't show (VP9, 10-bit, 4:2:2, H.264 High 10), it is decoded in software instead if it is H.264, HEVC or VP9 of at most [member software_max_pixels]: FFmpeg's decoders on threads of their own, each frame converted to 8-bit NV12 and uploaded to two textures, so [method get_plane_texture] and the NV12 shader work the same. 10-bit is rounded to 8 bits and HDR isn't tone-mapped. Bigger or other streams fail with the reason in [method get_last_error]. [method get_stats] then has [code]decode_path[/code] [code]"software"[/code], the keys of [method V4L2Decoder.get_stats] that apply, and [code]software_*[/code] keys ([code]software_thread_cpu_seconds[/code] is the feeding thread only; [code]process_cpu_seconds[/code] includes FFmpeg's worker threads). [method open] (raw Annex-B files) always uses the hardware path.
 		</member>

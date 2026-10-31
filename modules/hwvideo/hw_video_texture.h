@@ -119,7 +119,14 @@ private:
 	Rect2i visible_rect;
 	Size2i plane_sizes[DmabufImage::MAX_PLANES];
 	Packing packing = PACKING_NV12;
+	double playback_speed = 1.0;
 	bool ubwc_import_failed = false; // Set by _import_generation(); update() then reopens with NV12 (once).
+	// get_overlay_stats(): the previous call's counters, for rates.
+	uint64_t overlay_usec = 0;
+	double overlay_cpu_seconds = 0.0;
+	int64_t overlay_decoded = 0;
+	int64_t overlay_shown = 0;
+	int64_t overlay_dropped = 0;
 	void _fall_back_to_nv12();
 	// Q10C import experiment: "rgb10a2", "rgb10a2_mutable", "rgba8" or "rgba8_mutable" (see q10c_view in the docs).
 	String q10c_view = "rgb10a2_mutable";
@@ -212,6 +219,15 @@ public:
 	String get_q10c_view() const { return q10c_view; }
 	String get_last_error() const { return last_error; }
 	Dictionary get_stats() const;
+	// For a stats overlay (ideas #57), once or twice a second: decode path, stream, bitrate (now and the last 60 s),
+	// queue depths from the file to the screen, rates since the previous call, and get_system_stats().
+	Dictionary get_overlay_stats();
+	// GPU clock, temperatures and battery power from sysfs (Linux; whatever the device has; the paths are found once).
+	static Dictionary get_system_stats();
+	// Without a master clock (update() with p_master_clock < 0), the frame clock runs at this speed. With the audio as the
+	// master clock, set MediaSource.playback_speed instead: the video follows the audio.
+	void set_playback_speed(double p_speed) { playback_speed = CLAMP(p_speed, 0.25, 4.0); }
+	double get_playback_speed() const { return playback_speed; }
 
 	HWVideoTexture();
 	~HWVideoTexture();
