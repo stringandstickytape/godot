@@ -30,6 +30,7 @@
 
 #include "media_browser.h"
 #include "media_languages.h"
+#include "media_source.h"
 
 #include "core/config/project_settings.h"
 #include "core/object/class_db.h"
@@ -351,6 +352,15 @@ Array MediaBrowser::find_subtitles(const String &p_video_path) {
 	return named;
 }
 
+PackedByteArray MediaBrowser::read_file(const String &p_path) {
+	PackedByteArray bytes;
+	String error;
+	const Error err = MediaSource::read_whole_file(p_path, READ_FILE_MAX, bytes, error);
+	MutexLock lock(mutex);
+	last_error = err == OK ? String() : error;
+	return err == OK ? bytes : PackedByteArray();
+}
+
 String MediaBrowser::get_last_error() const {
 	MutexLock lock(mutex);
 	return last_error;
@@ -380,6 +390,7 @@ void MediaBrowser::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("list_shares", "host"), &MediaBrowser::list_shares);
 	ClassDB::bind_method(D_METHOD("list_dir", "path"), &MediaBrowser::list_dir);
 	ClassDB::bind_method(D_METHOD("find_subtitles", "video_path"), &MediaBrowser::find_subtitles);
+	ClassDB::bind_method(D_METHOD("read_file", "path"), &MediaBrowser::read_file);
 	ClassDB::bind_static_method("MediaBrowser", D_METHOD("parse_subtitle_name", "video_file", "subtitle_file"), &MediaBrowser::parse_subtitle_name);
 	ClassDB::bind_method(D_METHOD("get_last_error"), &MediaBrowser::get_last_error);
 	ClassDB::bind_method(D_METHOD("disconnect_host"), &MediaBrowser::disconnect_host);

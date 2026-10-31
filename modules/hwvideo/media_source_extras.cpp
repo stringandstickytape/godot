@@ -33,10 +33,12 @@
 
 #include "media_languages.h"
 #include "media_source.h"
+#include "net_stream.h"
 #include "smb_client.h"
 
 #include "core/config/project_settings.h"
 #include "core/io/file_access.h"
+#include "core/os/os.h"
 
 #include <climits>
 #include <cmath>
@@ -427,7 +429,7 @@ Error MediaSource::_read_whole_file(const String &p_path, int64_t p_max_bytes, P
 		const int64_t size = file.get_size();
 		if (size > p_max_bytes) {
 			file.close();
-			r_error = vformat("%s is %d bytes; subtitle files of up to %d bytes are read.", p_path, size, p_max_bytes);
+			r_error = vformat("%s is %d bytes; files of up to %d bytes are read.", p_path, size, p_max_bytes);
 			return ERR_FILE_CORRUPT;
 		}
 		r_bytes.resize(size);
@@ -452,7 +454,7 @@ Error MediaSource::_read_whole_file(const String &p_path, int64_t p_max_bytes, P
 	}
 	const int64_t size = (int64_t)file->get_length();
 	if (size > p_max_bytes) {
-		r_error = vformat("%s is %d bytes; subtitle files of up to %d bytes are read.", global_path, size, p_max_bytes);
+		r_error = vformat("%s is %d bytes; files of up to %d bytes are read.", global_path, size, p_max_bytes);
 		return ERR_FILE_CORRUPT;
 	}
 	r_bytes.resize(size);
@@ -1103,4 +1105,252 @@ Ref<Image> MediaSource::get_album_art() const {
 		}
 	}
 	return Ref<Image>();
+}
+
+/* Audio without a player */
+
+void MediaSource::set_external_clock(double p_seconds, int64_t p_ticks_usec) {
+	MutexLock lock(mutex);
+	external_seconds = p_seconds;
+	external_ticks_usec = p_ticks_usec;
+}
+
+PackedVector2Array MediaSource::read_audio_frames(int p_count) {
+	PackedVector2Array out;
+	if (p_count <= 0 || !is_open()) {
+		return out;
+	}
+	double clock = -1.0;
+	{
+		MutexLock lock(mutex);
+		if (pull_serial != serial) {
+			// After a seek: no frame from before it in the interpolation.
+			pull_serial = serial;
+			pull_phase = 0.0;
+			pull_last = AudioFrame(0, 0);
+		}
+		if (external_seconds >= 0.0) {
+			clock = external_seconds + (double)((int64_t)OS::get_singleton()->get_ticks_usec() - external_ticks_usec) / 1e6;
+		}
+	}
+	double ratio = 1.0;
+	if (clock >= 0.0) {
+		// Ahead of the clock: take input slower; behind: faster.
+		external_error = get_audio_position() - clock;
+		ratio = 1.0 - CLAMP(external_error * EXTERNAL_GAIN, -EXTERNAL_MAX_SLEW, EXTERNAL_MAX_SLEW);
+	} else {
+		external_error = 0.0;
+	}
+	external_ratio = ratio;
+	// Output frame i is input position pull_phase + i x ratio, interpolated; input 0 is the last frame of the call before.
+	const double end = pull_phase + p_count * ratio;
+	const int need = (int)Math::floor(end);
+	if (pull_scratch.size() < (uint32_t)need + 1) {
+		pull_scratch.resize(need + 1);
+	}
+	pull_scratch[0] = pull_last;
+	if (need > 0) {
+		mix_audio(pull_scratch.ptr() + 1, need);
+	}
+	out.resize(p_count);
+	Vector2 *w = out.ptrw();
+	for (int i = 0; i < p_count; i++) {
+		const double position = pull_phase + i * ratio;
+		const int index = MIN((int)position, need);
+		const float t = (float)(position - index);
+		const AudioFrame &a = pull_scratch[index];
+		const AudioFrame &b = pull_scratch[MIN(index + 1, need)];
+		w[i] = Vector2(a.left + (b.left - a.left) * t, a.right + (b.right - a.right) * t);
+	}
+	pull_last = pull_scratch[need];
+	pull_phase = end - need;
+	return out;
+}
+
+/* Whole subtitle tracks */
+
+Error MediaSource::_read_subtitle_stream(const String &p_path, int p_stream, double p_start_time, uint32_t p_generation, LocalVector<SubtitleEvent> &r_events, String &r_error) const {
+	const bool smb = SmbUrl::is_smb(p_path);
+	const bool web = NetStream::is_url(p_path);
+	SmbFile *side_smb = nullptr;
+	NetStream *side_net = nullptr;
+	AVIOContext *side_avio = nullptr;
+	AVFormatContext *context = nullptr;
+	AVCodecContext *codec = nullptr;
+	AVPacket *packet = nullptr;
+	Error result = OK;
+	const auto fail = [&](Error p_error, const String &p_message) {
+		result = p_error;
+		r_error = p_message;
+	};
+
+	if (smb || web) {
+		void *opaque;
+		int (*read_function)(void *, uint8_t *, int);
+		int64_t (*seek_function)(void *, int64_t, int);
+		if (smb) {
+			side_smb = memnew(SmbFile);
+			if (side_smb->open(p_path, 8 << 20, 4, r_error) != OK) {
+				result = ERR_FILE_CANT_OPEN;
+			}
+			opaque = side_smb;
+			read_function = &SmbFile::avio_read;
+			seek_function = &SmbFile::avio_seek;
+		} else {
+			side_net = memnew(NetStream);
+			if (side_net->open(p_path, 16 << 20, network_tls_verify, r_error) != OK) {
+				result = ERR_FILE_CANT_OPEN;
+			} else if (side_net->is_live()) {
+				fail(ERR_UNAVAILABLE, "A live stream has no whole subtitle track to read.");
+			}
+			opaque = side_net;
+			read_function = &NetStream::avio_read;
+			seek_function = &NetStream::avio_seek;
+		}
+		if (result == OK) {
+			uint8_t *buffer = (uint8_t *)av_malloc(256 << 10);
+			side_avio = buffer ? avio_alloc_context(buffer, 256 << 10, 0, opaque, read_function, nullptr, seek_function) : nullptr;
+			context = side_avio ? avformat_alloc_context() : nullptr;
+			if (context == nullptr) {
+				if (side_avio == nullptr) {
+					av_free(buffer);
+				}
+				fail(ERR_OUT_OF_MEMORY, "Out of memory.");
+			} else {
+				context->pb = side_avio;
+				context->flags |= AVFMT_FLAG_CUSTOM_IO;
+			}
+		}
+	}
+	const String global_path = smb || web || !ProjectSettings::get_singleton() ? p_path : ProjectSettings::get_singleton()->globalize_path(p_path);
+	if (result == OK) {
+		const int r = avformat_open_input(&context, global_path.utf8().get_data(), nullptr, nullptr);
+		if (r < 0) {
+			context = nullptr; // Freed by avformat_open_input().
+			fail(ERR_FILE_CANT_OPEN, vformat("Can't open %s: %s.", global_path, _av_error(r)));
+		} else if ((int)context->nb_streams <= p_stream && avformat_find_stream_info(context, nullptr) < 0) {
+			fail(ERR_FILE_UNRECOGNIZED, vformat("Can't read the streams of %s.", global_path));
+		} else if ((int)context->nb_streams <= p_stream) {
+			fail(ERR_FILE_UNRECOGNIZED, vformat("%s has no stream %d.", global_path, p_stream));
+		}
+	}
+	if (result == OK) {
+		for (unsigned i = 0; i < context->nb_streams; i++) {
+			context->streams[i]->discard = (int)i == p_stream ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+		}
+		const AVStream *stream = context->streams[p_stream];
+		const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+		codec = decoder ? avcodec_alloc_context3(decoder) : nullptr;
+		packet = av_packet_alloc();
+		if (codec == nullptr || packet == nullptr || avcodec_parameters_to_context(codec, stream->codecpar) < 0) {
+			fail(ERR_UNAVAILABLE, "No decoder for this subtitle track.");
+		} else {
+			codec->pkt_timebase = stream->time_base;
+			if (avcodec_open2(codec, decoder, nullptr) < 0) {
+				fail(ERR_UNAVAILABLE, "The subtitle decoder didn't open.");
+			}
+		}
+	}
+	if (result == OK) {
+		const AVRational time_base = context->streams[p_stream]->time_base;
+		while (av_read_frame(context, packet) >= 0) {
+			if (lines_generation.get() != p_generation) {
+				av_packet_unref(packet);
+				fail(ERR_SKIP, "Stopped: the file was closed.");
+				break;
+			}
+			if (packet->stream_index == p_stream) {
+				const int64_t ts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+				if (ts != AV_NOPTS_VALUE) {
+					const double start = ts * av_q2d(time_base) - p_start_time;
+					const double packet_duration = packet->duration > 0 ? packet->duration * av_q2d(time_base) : -1.0;
+					SubtitleEvent event;
+					bool error = false;
+					if (_decode_text_subtitle(codec, packet, start, packet_duration, event, error)) {
+						r_events.push_back(event);
+					}
+				}
+			}
+			av_packet_unref(packet);
+		}
+	}
+	av_packet_free(&packet);
+	avcodec_free_context(&codec);
+	if (context) {
+		avformat_close_input(&context);
+	}
+	if (side_avio) {
+		av_freep(&side_avio->buffer);
+		avio_context_free(&side_avio);
+	}
+	if (side_smb) {
+		side_smb->close();
+		memdelete(side_smb);
+	}
+	if (side_net) {
+		side_net->close();
+		memdelete(side_net);
+	}
+	return result;
+}
+
+Array MediaSource::get_subtitle_lines(int p_track) {
+	Array lines;
+	ERR_FAIL_COND_V_MSG(!is_open(), lines, "MediaSource: not open.");
+	LocalVector<SubtitleEvent> events;
+	String error;
+	// Copied under the mutex: close() may run meanwhile (it clears the tracks under it); the side context needs
+	// nothing else of this source.
+	String file;
+	int stream = -1;
+	double start = 0.0;
+	uint32_t generation = 0;
+	{
+		MutexLock lock(mutex);
+		generation = lines_generation.get();
+		if (p_track >= 0 && p_track < (int)subtitle_tracks.size()) {
+			const SubtitleTrack &track = subtitle_tracks[p_track];
+			if (!track.text) {
+				error = vformat("Subtitle track %d is pictures (%s), not text.", p_track, track.codec);
+			} else {
+				file = path;
+				stream = track.stream_index;
+				start = start_time;
+			}
+		} else {
+			const int external = p_track - (int)subtitle_tracks.size();
+			if (p_track < 0 || external >= (int)external_subtitles.size()) {
+				error = vformat("There is no subtitle track %d.", p_track);
+			} else {
+				events = external_subtitles[external].events;
+			}
+		}
+	}
+	if (stream >= 0) {
+		_read_subtitle_stream(file, stream, start, generation, events, error);
+	}
+	if (!error.is_empty()) {
+		MutexLock lock(mutex);
+		last_error = error;
+		WARN_PRINT("MediaSource: " + error);
+		return lines;
+	}
+	struct ByStart {
+		bool operator()(const SubtitleEvent &p_a, const SubtitleEvent &p_b) const { return p_a.start < p_b.start; }
+	};
+	events.sort_custom<ByStart>();
+	for (uint32_t i = 0; i < events.size(); i++) {
+		const SubtitleEvent &event = events[i];
+		double end = event.end;
+		if (end < event.start) {
+			end = i + 1 < events.size() ? events[i + 1].start : event.start + 5.0;
+		}
+		Dictionary d;
+		d["start"] = event.start;
+		d["end"] = end;
+		d["text"] = event.text;
+		d["ass"] = event.ass;
+		lines.push_back(d);
+	}
+	return lines;
 }

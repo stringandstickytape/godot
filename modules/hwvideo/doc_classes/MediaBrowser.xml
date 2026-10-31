@@ -58,6 +58,13 @@
 				Returns what a subtitle file's name says next to a video file (both names without folders): [code]subtitle[/code] (.srt, .ass, .ssa or .vtt), [code]matches_video[/code] (the name starts with the video's name without its extension, ignoring case), [code]language[/code] (normalized as by [method MediaSource.normalize_language]; the last language named wins, so [code]Film.en.srt[/code], [code]Film.English.srt[/code], [code]2_English.srt[/code] and [code]Film.pt-BR.srt[/code] work; empty if none), [code]language_name[/code], [code]forced[/code] ("forced", "foreign"), [code]hearing_impaired[/code] ("sdh", "cc", "hearing", or "hi" after a language: [code]Film.en.hi.srt[/code]; [code]Film.hi.srt[/code] is Hindi) and [code]format[/code] ("srt", "ass", "vtt").
 			</description>
 		</method>
+		<method name="read_file">
+			<return type="PackedByteArray" />
+			<param index="0" name="path" type="String" />
+			<description>
+				Returns a whole file (a local path, res://, user://, or smb:// with the credentials of [method set_smb_credentials]), blocking like [method list_dir]: for cover pictures and other small files on a share. A file over 64 MiB, or one that can't be read, gives an empty array, and [method get_last_error] says why.
+			</description>
+		</method>
 		<method name="set_smb_credentials" qualifiers="static">
 			<return type="void" />
 			<param index="0" name="host" type="String" />

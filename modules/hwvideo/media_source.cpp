@@ -373,7 +373,7 @@ void MediaSource::_apply_discard() {
 			format->streams[i]->discard = (int)i == video.stream_index ? AVDISCARD_NONKEY : AVDISCARD_ALL;
 			continue;
 		}
-		const bool used = (int)i == video.stream_index || (int)i == current_audio_stream || (int)i == current_subtitle_stream;
+		const bool used = (int)i == video.stream_index || (int)i == current_audio_stream || (int)i == current_subtitle_stream || (int)i == current_secondary_stream;
 		format->streams[i]->discard = used ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
 	}
 }
@@ -1052,6 +1052,57 @@ bool MediaSource::is_audio_finished() const {
 
 /* Subtitles */
 
+// Demux thread: the second text track of dual subtitles (-1: none).
+void MediaSource::_open_secondary_subtitle_track(int p_track) {
+	avcodec_free_context(&secondary_codec);
+	current_secondary_track = p_track;
+	current_secondary_stream = -1;
+	String header;
+	if (p_track >= 0 && p_track < (int)subtitle_tracks.size() && subtitle_tracks[p_track].text) {
+		const SubtitleTrack &track = subtitle_tracks[p_track];
+		const AVStream *stream = format->streams[track.stream_index];
+		const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
+		secondary_codec = codec ? avcodec_alloc_context3(codec) : nullptr;
+		int r = secondary_codec ? avcodec_parameters_to_context(secondary_codec, stream->codecpar) : AVERROR_DECODER_NOT_FOUND;
+		if (r >= 0) {
+			secondary_codec->pkt_timebase = stream->time_base;
+			r = avcodec_open2(secondary_codec, codec, nullptr);
+		}
+		if (r < 0) {
+			avcodec_free_context(&secondary_codec);
+			MutexLock lock(mutex);
+			last_error = vformat("Subtitle track %d (%s): can't open a decoder: %s.", p_track, track.codec, _av_error(r));
+			ERR_PRINT("MediaSource: " + last_error);
+		} else {
+			current_secondary_stream = track.stream_index;
+			if (secondary_codec->subtitle_header && secondary_codec->subtitle_header_size > 0) {
+				header = String::utf8((const char *)secondary_codec->subtitle_header, secondary_codec->subtitle_header_size);
+			}
+		}
+	}
+	_apply_discard();
+	MutexLock lock(mutex);
+	secondary_subtitle_header = header;
+}
+
+void MediaSource::_handle_secondary_subtitle_packet() {
+	const int index = current_secondary_stream;
+	const int64_t ts = read_packet->pts != AV_NOPTS_VALUE ? read_packet->pts : read_packet->dts;
+	if (ts == AV_NOPTS_VALUE || secondary_codec == nullptr) {
+		return;
+	}
+	const double start = _media_time(ts, index);
+	const double packet_duration = read_packet->duration > 0 ? read_packet->duration * av_q2d(format->streams[index]->time_base) : -1.0;
+	SubtitleEvent event;
+	bool error = false;
+	if (_decode_text_subtitle(secondary_codec, read_packet, start, packet_duration, event, error)) {
+		event.track = current_secondary_track;
+		_push_subtitle(event);
+	} else if (error) {
+		dstats.subtitle_decode_errors++;
+	}
+}
+
 void MediaSource::_open_subtitle_track(int p_track) {
 	avcodec_free_context(&subtitle_codec);
 	current_subtitle_track = p_track;
@@ -1094,8 +1145,18 @@ void MediaSource::_push_subtitle(SubtitleEvent &p_event) {
 	p_event.serial = demux_serial;
 	dstats.subtitle_events++;
 	MutexLock lock(mutex);
-	if (p_event.serial != serial || subtitle_track != current_subtitle_track) {
+	if (p_event.serial != serial) {
 		return;
+	}
+	if (p_event.track >= 0 && p_event.track == current_secondary_track) {
+		if (secondary_subtitle_track != current_secondary_track) {
+			return;
+		}
+	} else if (subtitle_track != current_subtitle_track) {
+		return;
+	}
+	if (p_event.track < 0) {
+		p_event.track = current_subtitle_track;
 	}
 	if (subtitle_queue.size() >= SUBTITLE_QUEUE_MAX) {
 		subtitle_queue.remove_at(0); // Nobody reads them: keep the newest.
@@ -1332,6 +1393,8 @@ bool MediaSource::_read_packet() {
 		}
 	} else if (read_packet->stream_index == current_subtitle_stream) {
 		_handle_subtitle_packet();
+	} else if (read_packet->stream_index == current_secondary_stream) {
+		_handle_secondary_subtitle_packet();
 	}
 	av_packet_unref(read_packet);
 	if (pending_reseek >= 0.0) {
@@ -1469,6 +1532,7 @@ void MediaSource::_thread_loop() {
 		double trick = 0.0;
 		int track;
 		int sub_track;
+		int sub_track2;
 		bool dsp_changed = false;
 		{
 			MutexLock lock(mutex);
@@ -1491,6 +1555,7 @@ void MediaSource::_thread_loop() {
 			}
 			track = audio_track;
 			sub_track = subtitle_track;
+			sub_track2 = secondary_subtitle_track;
 			dstats.thread_cpu_seconds = thread_cpu_seconds();
 			stats = dstats;
 		}
@@ -1499,6 +1564,9 @@ void MediaSource::_thread_loop() {
 		}
 		if (dsp_changed) {
 			_update_audio_dsp();
+		}
+		if (sub_track2 != current_secondary_track) {
+			_open_secondary_subtitle_track(sub_track2);
 		}
 		if (sub_track != current_subtitle_track) {
 			_open_subtitle_track(sub_track);
@@ -1543,7 +1611,7 @@ void MediaSource::_thread_loop() {
 		audio_space_wanted.set(scratch_frames);
 		MutexLock lock(mutex);
 		demux_idle.set();
-		bool work = exit_requested || seek_pending || audio_track != current_audio_track || subtitle_track != current_subtitle_track;
+		bool work = exit_requested || seek_pending || audio_track != current_audio_track || subtitle_track != current_subtitle_track || secondary_subtitle_track != current_secondary_track;
 		if (!work && state != STATE_ERROR) {
 			if (scratch_frames > 0) {
 				MutexLock audio_lock(audio_mutex);
@@ -1784,6 +1852,8 @@ Error MediaSource::open(const String &p_path) {
 		video.color_transfer = transfer ? String::utf8(transfer) : String();
 		video.color_matrix = matrix ? String::utf8(matrix) : String();
 		video.color_range = range ? String::utf8(range) : String();
+		static const char *field_orders[] = { "", "progressive", "tt", "bb", "tb", "bt" }; // AVFieldOrder.
+		video.field_order = par->field_order >= AV_FIELD_UNKNOWN && par->field_order <= AV_FIELD_BT ? String(field_orders[par->field_order]) : String();
 		video.bit_depth = pixel ? pixel->comp[0].depth : par->bits_per_raw_sample;
 		const char *profile = avcodec_profile_name(par->codec_id, par->profile);
 		video.profile = profile ? String::utf8(profile) : String();
@@ -1883,12 +1953,16 @@ Error MediaSource::open(const String &p_path) {
 		MutexLock lock(mutex);
 		audio_track = default_track;
 		subtitle_track = -1;
+		secondary_subtitle_track = -1;
+		secondary_subtitle_header = String();
 		subtitle_queue.clear();
 		subtitle_header = String();
 	}
 	_open_audio_track(default_track);
 	current_subtitle_track = -1;
 	current_subtitle_stream = -1;
+	current_secondary_track = -1;
+	current_secondary_stream = -1;
 
 	// Without a codec configuration (MPEG-TS), the coded size comes from the first SPS in the stream: read up to it now
 	// (what is read is queued as usual).
@@ -1967,6 +2041,7 @@ void MediaSource::_close_network() {
 }
 
 void MediaSource::_close_internal() {
+	lines_generation.increment();
 	if (smb_file) {
 		smb_file->abort(); // The demux thread may wait for network data.
 	}
@@ -1993,6 +2068,9 @@ void MediaSource::_close_internal() {
 	avcodec_free_context(&subtitle_codec);
 	current_subtitle_track = -1;
 	current_subtitle_stream = -1;
+	avcodec_free_context(&secondary_codec);
+	current_secondary_track = -1;
+	current_secondary_stream = -1;
 	av_bsf_free(&bsf);
 	av_packet_free(&read_packet);
 	av_frame_free(&audio_frame);
@@ -2008,7 +2086,10 @@ void MediaSource::_close_internal() {
 	video = VideoInfo();
 	swr_description = String();
 	audio_tracks.clear();
-	subtitle_tracks.clear();
+	{
+		MutexLock lock(mutex);
+		subtitle_tracks.clear(); // get_subtitle_lines() reads it from any thread.
+	}
 	chapters.clear();
 	pictures.clear();
 	config_parameter_sets.clear();
@@ -2034,6 +2115,7 @@ void MediaSource::close() {
 	}
 	audio_track = -1;
 	subtitle_track = -1;
+	secondary_subtitle_track = -1;
 	subtitle_queue.clear();
 	subtitle_header = String();
 	external_subtitles.clear();
@@ -2090,6 +2172,7 @@ Dictionary MediaSource::get_video_info() const {
 	d["color_transfer"] = video.color_transfer;
 	d["color_matrix"] = video.color_matrix;
 	d["color_range"] = video.color_range;
+	d["field_order"] = video.field_order;
 	// What the shader needs: the matrix (BT.2020 when the stream says so, else BT.709, the usual for HD and up), the
 	// range, and whether the transfer is HDR (PQ or HLG: needs tone mapping).
 	d["matrix_bt2020"] = video.color_matrix.begins_with("bt2020");
@@ -2246,13 +2329,37 @@ int MediaSource::get_subtitle_track() const {
 	return subtitle_track;
 }
 
+Error MediaSource::select_secondary_subtitle_track(int p_track) {
+	ERR_FAIL_COND_V_MSG(!is_open(), ERR_UNCONFIGURED, "MediaSource: not open.");
+	ERR_FAIL_COND_V_MSG(p_track < -1 || p_track >= (int)subtitle_tracks.size(), ERR_INVALID_PARAMETER,
+			vformat("MediaSource: the second subtitle track must be one of the file's own (0 to %d), not %d.", (int)subtitle_tracks.size() - 1, p_track));
+	ERR_FAIL_COND_V_MSG(p_track >= 0 && !subtitle_tracks[p_track].text, ERR_INVALID_PARAMETER, vformat("MediaSource: subtitle track %d is pictures; the second track must be text.", p_track));
+	MutexLock lock(mutex);
+	if (secondary_subtitle_track != p_track) {
+		secondary_subtitle_track = p_track;
+		secondary_subtitle_header = String();
+		// Like the first track: events read before now aren't delivered (no seek).
+		condition.notify_one();
+	}
+	return OK;
+}
+
+int MediaSource::get_secondary_subtitle_track() const {
+	MutexLock lock(mutex);
+	return secondary_subtitle_track;
+}
+
 Dictionary MediaSource::read_subtitle_event() {
 	Dictionary d;
 	SubtitleEvent event;
 	{
 		MutexLock lock(mutex);
 		const int external = subtitle_track - (int)subtitle_tracks.size();
-		if (subtitle_track >= 0 && external >= 0) {
+		if (subtitle_track >= 0 && external >= 0 && !subtitle_queue.is_empty()) {
+			// The file's second track (dual subtitles) alongside a subtitle file.
+			event = subtitle_queue[0];
+			subtitle_queue.remove_at(0);
+		} else if (subtitle_track >= 0 && external >= 0) {
 			// A subtitle file: everything at once; after a seek, again from the events still showing at the target.
 			const LocalVector<SubtitleEvent> &events = external_subtitles[external].events;
 			if (external_serial != serial) {
@@ -2268,6 +2375,7 @@ Dictionary MediaSource::read_subtitle_event() {
 			}
 			event = events[external_cursor++];
 			event.serial = serial;
+			event.track = subtitle_track;
 		} else {
 			if (subtitle_queue.is_empty()) {
 				return d;
@@ -2300,20 +2408,29 @@ Dictionary MediaSource::read_subtitle_event() {
 			d["canvas_size"] = event.canvas.width > 0 && event.canvas.height > 0 ? Vector2i(event.canvas) : Vector2i(video.width, video.height);
 		}
 	} else if (!event.ass.is_empty()) {
-		const String header = get_subtitle_header();
-		if (header != styled_header_source) {
-			styled_header_source = header;
-			styled_header = SubtitleStyle::parse_header(header);
+		String header;
+		bool second = false;
+		{
+			MutexLock lock(mutex);
+			second = event.track >= 0 && event.track == secondary_subtitle_track && event.track != subtitle_track;
+			header = second ? secondary_subtitle_header : subtitle_header;
+		}
+		String &source = second ? styled_header2_source : styled_header_source;
+		SubtitleStyle::Header &parsed = second ? styled_header2 : styled_header;
+		if (header != source) {
+			source = header;
+			parsed = SubtitleStyle::parse_header(header);
 		}
 		// One event may hold several lines (several rects): each is styled on its own.
 		Array styled;
 		const Vector<String> lines = event.ass.split("\n");
 		for (const String &line : lines) {
-			styled.push_back(SubtitleStyle::parse_event(line, styled_header));
+			styled.push_back(SubtitleStyle::parse_event(line, parsed));
 		}
 		d["styled"] = styled;
 	}
 	d["serial"] = event.serial;
+	d["track"] = event.track;
 	return d;
 }
 
@@ -2459,6 +2576,9 @@ Dictionary MediaSource::get_stats() const {
 	d["seek_retries"] = stats.seek_retries;
 	d["trick_steps"] = stats.trick_steps;
 	d["trick_play_speed"] = trick_speed;
+	d["external_clock"] = external_seconds >= 0.0;
+	d["external_clock_error_ms"] = external_error * 1000.0; // Audio position minus the external clock, at the last read.
+	d["external_clock_ratio"] = external_ratio;
 	d["subtitle_events"] = stats.subtitle_events;
 	d["subtitle_decode_errors"] = stats.subtitle_decode_errors;
 	d["subtitle_queue"] = subtitle_queue.size();
@@ -2764,6 +2884,11 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_chapter_at", "seconds"), &MediaSource::get_chapter_at);
 	ClassDB::bind_method(D_METHOD("add_external_subtitle", "path", "language", "title"), &MediaSource::add_external_subtitle, DEFVAL(String()), DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("get_external_subtitle_count"), &MediaSource::get_external_subtitle_count);
+	ClassDB::bind_method(D_METHOD("get_subtitle_lines", "track"), &MediaSource::get_subtitle_lines);
+	ClassDB::bind_method(D_METHOD("read_audio_frames", "count"), &MediaSource::read_audio_frames);
+	ClassDB::bind_method(D_METHOD("set_external_clock", "seconds", "ticks_usec"), &MediaSource::set_external_clock);
+	ClassDB::bind_method(D_METHOD("select_secondary_subtitle_track", "track"), &MediaSource::select_secondary_subtitle_track);
+	ClassDB::bind_method(D_METHOD("get_secondary_subtitle_track"), &MediaSource::get_secondary_subtitle_track);
 	ClassDB::bind_method(D_METHOD("set_subtitle_read_ahead", "seconds"), &MediaSource::set_subtitle_read_ahead);
 	ClassDB::bind_method(D_METHOD("get_subtitle_read_ahead"), &MediaSource::get_subtitle_read_ahead);
 	ClassDB::bind_static_method("MediaSource", D_METHOD("normalize_language", "code"), &MediaSource::normalize_language);

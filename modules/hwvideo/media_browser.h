@@ -65,6 +65,10 @@ public:
 	// to it (and its subfolder named like the video). [{path, name, language, language_name, forced, hearing_impaired,
 	// format, matches_video}], those named after the video first.
 	Array find_subtitles(const String &p_video_path);
+	// A whole file (local or smb://, with the credentials of set_smb_credentials()), blocking: for pictures on a share.
+	// Empty, with get_last_error() set, if it can't be read or is over READ_FILE_MAX bytes.
+	PackedByteArray read_file(const String &p_path);
+	static constexpr int64_t READ_FILE_MAX = 64 << 20;
 	// What a subtitle file's name says next to a video file (both names without folders): see find_subtitles().
 	static Dictionary parse_subtitle_name(const String &p_video_file, const String &p_subtitle_file);
 	String get_last_error() const;

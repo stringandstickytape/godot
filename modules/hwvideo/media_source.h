@@ -105,6 +105,7 @@ public:
 		String color_transfer; // "bt709", "smpte2084" (PQ), "arib-std-b67" (HLG), ...
 		String color_matrix; // "bt709", "bt2020nc", "bt470bg" / "smpte170m" (BT.601), ...
 		String color_range; // "tv" (limited) or "pc" (full).
+		String field_order; // "progressive", "tt", "bb", "tb", "bt"; empty if unknown.
 		// Stereo 3D and spherical metadata from the container (Matroska StereoMode and Projection, MP4 st3d and sv3d).
 		String stereo_mode; // "" (the container says nothing), "2d", "sbs", "tb", "frame_sequence", "checkerboard", ...
 		bool stereo_inverted = false; // The right eye's picture comes first (left half, or top).
@@ -170,6 +171,7 @@ public:
 		LocalVector<SubtitleBitmap> bitmaps; // Decoded bitmap tracks; none: the screen is cleared.
 		Size2i canvas; // The size the bitmaps' rects refer to.
 		uint32_t serial = 0;
+		int track = -1; // The subtitle track it is from (dual subtitles: the first or the second).
 	};
 
 private:
@@ -322,6 +324,8 @@ private:
 	double seek_target = 0.0;
 	int audio_track = -1;
 	int subtitle_track = -1;
+	int secondary_subtitle_track = -1; // Dual subtitles: a second text track of the file, events in the same queue.
+	String secondary_subtitle_header;
 	// Night mode and dialogue boost: change at any time; the thread picks them up when audio_dsp_serial changes.
 	bool night_mode = false;
 	double night_mode_strength = 1.0;
@@ -333,6 +337,8 @@ private:
 	uint32_t external_cursor = 0; // The next event of the selected external track to hand out.
 	// read_subtitle_event() (consumer thread): the parsed header of the selected text track.
 	String styled_header_source;
+	String styled_header2_source; // The second track's.
+	SubtitleStyle::Header styled_header2;
 	SubtitleStyle::Header styled_header;
 	uint32_t external_serial = 0; // The serial it was handed out under.
 	double subtitle_read_ahead = 0.0;
@@ -366,6 +372,17 @@ private:
 	bool audio_in_underrun = false;
 	bool audio_mixed_since_seek = false; // An empty ring before the first frame after open/seek is a wait, not an underrun.
 	double trick_speed = 0.0; // Under mutex: trick play (keyframes only) at this speed; 0: normal playback.
+	// set_external_clock(), under mutex; read_audio_frames()'s resampler (its caller's thread only).
+	double external_seconds = -1.0;
+	int64_t external_ticks_usec = 0;
+	double external_error = 0.0; // Audio position minus the external clock at the last read.
+	double external_ratio = 1.0;
+	double pull_phase = 0.0;
+	AudioFrame pull_last = AudioFrame(0, 0);
+	uint32_t pull_serial = UINT32_MAX;
+	LocalVector<AudioFrame> pull_scratch;
+	static constexpr double EXTERNAL_MAX_SLEW = 0.005;
+	static constexpr double EXTERNAL_GAIN = 0.05; // Slew per second of error: 0.1 s off gives the full 0.5 %.
 	// Live: the mixer holds (silence, the clock stands) until this much audio is buffered, at the start and after an
 	// underrun, so live_latency of network jitter is absorbed. 0: not live.
 	uint64_t live_preroll_frames = 0;
@@ -412,6 +429,9 @@ private:
 	AVCodecContext *subtitle_codec = nullptr;
 	int current_subtitle_track = -1;
 	int current_subtitle_stream = -1;
+	AVCodecContext *secondary_codec = nullptr;
+	int current_secondary_track = -1;
+	int current_secondary_stream = -1;
 	double seek_wanted = -1.0; // The target of the last seek until its keyframe is found.
 	double seek_position = 0.0; // Where the file was last seeked to (earlier than seek_wanted after a retry).
 	int seek_retries = 0;
@@ -495,6 +515,9 @@ private:
 	bool _decode_bitmap_subtitle(AVPacket *p_packet, double p_start, double p_duration, SubtitleEvent &r_event, bool &r_error);
 	static String _subtitle_file_to_utf8(const PackedByteArray &p_bytes, String &r_charset);
 	static Error _read_whole_file(const String &p_path, int64_t p_max_bytes, PackedByteArray &r_bytes, String &r_error);
+	// get_subtitle_lines(): one text stream of p_path, read through from a demux context of its own.
+	Error _read_subtitle_stream(const String &p_path, int p_stream, double p_start_time, uint32_t p_generation, LocalVector<SubtitleEvent> &r_events, String &r_error) const;
+	SafeNumeric<uint32_t> lines_generation; // close() moves it on: a get_subtitle_lines() still reading the file stops.
 	void _read_stream_metadata(const AVStream *p_stream);
 	void _read_hdr_side_data(const AVStream *p_stream);
 	void _parse_hdr_sei(const uint8_t *p_data, uint64_t p_size, bool p_hevc);
@@ -535,6 +558,8 @@ private:
 
 	void _open_subtitle_track(int p_track);
 	void _handle_subtitle_packet();
+	void _open_secondary_subtitle_track(int p_track);
+	void _handle_secondary_subtitle_packet();
 	void _push_subtitle(SubtitleEvent &p_event);
 	bool _holding_audio() const;
 	void _seek_file(double p_position);
@@ -569,6 +594,11 @@ public:
 	// ahead of the playback position) aren't delivered.
 	Error select_subtitle_track(int p_track);
 	int get_subtitle_track() const;
+	// Dual subtitles: a second text track of the file's own (-1: none), read alongside. Its events come through
+	// read_subtitle_event() too, in file order; each event's "track" says which. Subtitle files and bitmap tracks
+	// can't be the second track (an app reads a second file itself).
+	Error select_secondary_subtitle_track(int p_track);
+	int get_secondary_subtitle_track() const;
 	// The next event of the selected subtitle track (start, end, text, ass, bitmap, data, serial), or an empty Dictionary.
 	// Events come in file order, ahead of the playback position; keep them until their time.
 	Dictionary read_subtitle_event();
@@ -590,6 +620,11 @@ public:
 	// events are all handed out by read_subtitle_event() at once, again from the seek target after a seek.
 	int add_external_subtitle(const String &p_path, const String &p_language = String(), const String &p_title = String());
 	int get_external_subtitle_count() const;
+	// Every line of a text subtitle track (the file's own or an added file): [{start, end, text, ass}] sorted by start,
+	// text plain (override tags gone, line breaks as newlines), end filled from the next line where the file has none.
+	// Blocking: the file's own tracks are read from a demux context of its own (the whole file: interleaved with the
+	// video), so playback isn't touched. Any thread. Bitmap tracks: [] with get_last_error() set.
+	Array get_subtitle_lines(int p_track);
 	// Subtitle events of a file's own tracks come with the packets, about video_queue_seconds ahead of the playback. A
 	// negative subtitle delay shows them earlier than that: set this to the largest such delay (seconds) and the video is
 	// read that far ahead while a subtitle track is selected (within the queue's limits: 512 packets, 96 MiB).
@@ -634,6 +669,8 @@ public:
 	String get_last_error() const;
 
 	static void set_smb_credentials(const String &p_host, const String &p_user, const String &p_password, const String &p_domain = String());
+	// A whole file (local, res://, user:// or smb://) of up to p_max_bytes, blocking. MediaBrowser.read_file() uses it.
+	static Error read_whole_file(const String &p_path, int64_t p_max_bytes, PackedByteArray &r_bytes, String &r_error) { return _read_whole_file(p_path, p_max_bytes, r_bytes, r_error); }
 	void set_network_buffer_size(int64_t p_bytes);
 	int64_t get_network_buffer_size() const { return network_buffer_size; }
 	void set_network_requests(int p_requests);
@@ -675,6 +712,14 @@ public:
 
 	// Audio (AudioStreamPlaybackMedia, audio thread). Always fills p_frames (silence when nothing is decoded yet).
 	void mix_audio(AudioFrame *p_buffer, int p_frames);
+	// The decoded audio without an AudioStreamPlayer (for example, to send it to a PC): p_count stereo frames at
+	// get_output_rate(), taken from the ring as the mixer would (silence where there is none yet). Use it instead of
+	// get_audio_stream(), not beside it. With set_external_clock(), the audio is resampled slightly (at most 0.5 %) so
+	// get_audio_position() follows that clock.
+	PackedVector2Array read_audio_frames(int p_count);
+	// An external master clock: at OS ticks p_ticks_usec it read p_seconds (media seconds). read_audio_frames() then
+	// slews towards it. p_seconds < 0: none.
+	void set_external_clock(double p_seconds, int64_t p_ticks_usec);
 	double get_audio_position() const;
 	bool is_audio_finished() const;
 	bool has_audio() const { return audio_track >= 0; }
