@@ -26,7 +26,7 @@
 		<method name="get_last_error" qualifiers="const">
 			<return type="String" />
 			<description>
-				Why the last call returned nothing, as a sentence for the user: for example "Access denied: HOST refused the user name or password.", "HOST has no share named \"X\".", "Not found: share/folder on HOST.", "Can't reach HOST: connection refused (is file sharing on, and port 445 open?).", "No answer from HOST within 8 s.", "Can't find the host NAME: the name doesn't resolve.". Empty after a call that succeeded (an empty folder is not an error). Never contains the password.
+				Why the last call returned nothing, as a sentence for the user: for example "Access denied: HOST refused the user name or password.", "Access denied: no user name and password are set for HOST (set_smb_credentials() with this host name), and it refused a guest login.", "HOST has no share named \"X\".", "Not found: share/folder on HOST.", "Can't reach HOST: connection refused (is file sharing on, and port 445 open?).", "No answer from HOST within 8 s.", "Can't find the host NAME: the name doesn't resolve.". Empty after a call that succeeded (an empty folder is not an error). Never contains the password.
 			</description>
 		</method>
 		<method name="list_dir">

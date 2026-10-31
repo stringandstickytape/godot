@@ -111,6 +111,7 @@ private:
 	String host;
 	String share;
 	double timeout = 8.0;
+	bool guest = false; // No credentials were registered for the host.
 };
 
 // A file on a share, read ahead into a ring buffer by a thread of its own, so network latency doesn't reach the reader

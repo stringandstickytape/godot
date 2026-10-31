@@ -164,6 +164,7 @@ bool SmbSession::connect(const String &p_host, const String &p_share, double p_t
 	}
 	SmbCredentials::Entry credentials;
 	const bool have = SmbCredentials::get(host, credentials);
+	guest = !have || credentials.user.is_empty();
 	// Without credentials: the guest account (most Windows hosts refuse it).
 	const CharString user = (have && !credentials.user.is_empty() ? credentials.user : String("guest")).utf8();
 	const CharString password = (have ? credentials.password : String()).utf8();
@@ -314,6 +315,9 @@ String SmbSession::describe_error(int p_status, const String &p_what, Wait p_wai
 		case 0xC0000072: // STATUS_ACCOUNT_DISABLED
 		case 0xC0000193: // STATUS_ACCOUNT_EXPIRED
 		case 0xC0000234: // STATUS_ACCOUNT_LOCKED_OUT
+			if (guest) {
+				return vformat("Access denied: no user name and password are set for %s (set_smb_credentials() with this host name), and it refused a guest login.", host);
+			}
 			return vformat("Access denied: %s refused the user name or password.", host);
 		case 0xC0000022: // STATUS_ACCESS_DENIED
 			return vformat("Access denied: %s on %s.", p_what, host);
