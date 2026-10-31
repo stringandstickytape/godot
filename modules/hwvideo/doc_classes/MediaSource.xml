@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <class name="MediaSource" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
 	<brief_description>
-		Reads a media file (Matroska/WebM, MP4/MOV, MPEG-TS, AVI) with FFmpeg: video access units for a hardware decoder, decoded audio for an [AudioStreamMedia].
+		Reads a media file (Matroska/WebM, MP4/MOV, MPEG-TS, AVI, and music files) or a network stream with FFmpeg: video access units for a hardware decoder, decoded audio for an [AudioStreamMedia].
 	</brief_description>
 	<description>
 		Opens a file with FFmpeg's libavformat and reads it on a worker thread. The video stream is only demuxed: its access units go, in Annex-B for H.264 and HEVC (converted from MP4/Matroska's length-prefixed form with the [code]h264_mp4toannexb[/code] / [code]hevc_mp4toannexb[/code] bitstream filters), through a bounded queue to a [V4L2Decoder] ([method V4L2Decoder.open_source], [method HWVideoTexture.open_source]). The first access unit after [method open] and after every [method seek] is a keyframe with the parameter sets (VPS/SPS/PPS) in band.
 		Files on a file share open by URL: [code]smb://host/share/path/file.mkv[/code] (SMB2/3, see [method set_smb_credentials] and [member network_buffer_size]). A thread of their own reads them ahead into a ring buffer, so network latency doesn't reach the demuxer.
+		Files and streams also open by [code]http://[/code], [code]https://[/code] and [code]udp://[/code] URL, through a readahead ring of their own (see [method open], [member network_tls_verify] and [member live_latency]). A live stream (MPEG-TS over UDP, or HTTP without a length) can't seek: [method is_live], [method is_seekable].
+		Music files (MP3, FLAC, Ogg Vorbis/Opus, WAV, AAC/M4A, ALAC, AC-3, DTS, TrueHD) play like a film without video: [method get_video_info] is empty, and the audio is the clock. A cover picture in the file is not taken for the video: it is in [method get_album_art] and [method get_attached_pictures], and the file's tags are in [method get_tags].
 		Subtitle tracks can be selected too ([method select_subtitle_track], [method read_subtitle_event]): text tracks are decoded to text, ASS lines and styled runs, bitmap tracks to RGBA images with their rectangles.
 		The selected audio track is decoded and resampled with libswresample to stereo float at the [AudioServer] mix rate, into a ring buffer that [method get_audio_stream] plays. More than two channels are downmixed (centre and surrounds at -3 dB, LFE dropped); the source layout is in [method get_audio_tracks]. The playback position of that stream is the A/V master clock.
 		All times are media seconds: the stream timestamp minus the file's start time ([method get_start_time]), so the first frame is at about 0. The thread blocks when the queues are full ([member video_queue_seconds], [member audio_queue_seconds]) and is woken when they are consumed; it never spins.
@@ -35,6 +37,12 @@
 				Stops the thread and closes the file. Close a [V4L2Decoder] reading from it first.
 			</description>
 		</method>
+		<method name="get_album_art" qualifiers="const">
+			<return type="Image" />
+			<description>
+				Returns the cover of a music file as an [Image]: the picture marked as the front cover (by its title, as ID3 and FLAC name them) if there is one, else the first attached picture that decodes (PNG, JPEG, WebP, BMP). [code]null[/code] if there is none. It decodes the picture on each call: keep the result.
+			</description>
+		</method>
 		<method name="get_audio_position" qualifiers="const">
 			<return type="float" />
 			<description>
@@ -58,6 +66,12 @@
 			<return type="AudioStreamMedia" />
 			<description>
 				Returns a new [AudioStreamMedia] that plays the decoded audio. Play it from one [AudioStreamPlayer] at a time.
+			</description>
+		</method>
+		<method name="get_attached_pictures" qualifiers="const">
+			<return type="Array" />
+			<description>
+				Returns the pictures stored in the file (cover art in MP3, FLAC, M4A and Ogg, and Matroska covers stored as a picture stream): one Dictionary each, [code]codec[/code] ("png", "mjpeg", ...), [code]title[/code] (for example "Cover (front)"; may be empty), [code]data[/code] (the encoded picture), [code]image[/code] (an [Image], or [code]null[/code] if the format can't be decoded) and [code]size[/code] (a [Vector2i]). These streams are never chosen as the video. Each call decodes them again.
 			</description>
 		</method>
 		<method name="get_audio_track" qualifiers="const">
@@ -100,7 +114,7 @@
 		<method name="get_info" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns [code]path[/code], [code]format[/code], [code]duration[/code], [code]start_time[/code], [code]bit_rate[/code], [code]video[/code] ([method get_video_info]), [code]audio_tracks[/code], [code]subtitle_tracks[/code], [code]chapters[/code] ([method get_chapters]), [code]audio_track[/code], [code]subtitle_track[/code] and [code]output_rate[/code].
+				Returns [code]path[/code], [code]format[/code], [code]duration[/code], [code]start_time[/code], [code]bit_rate[/code], [code]video[/code] ([method get_video_info]), [code]audio_tracks[/code], [code]subtitle_tracks[/code], [code]chapters[/code] ([method get_chapters]), [code]audio_track[/code], [code]subtitle_track[/code], [code]output_rate[/code], [code]tags[/code] ([method get_tags]), [code]attached_pictures[/code] (how many; see [method get_attached_pictures]), [code]live[/code] ([method is_live]), [code]seekable[/code] ([method is_seekable]) and [code]network_description[/code] (for http, https and udp, for example "HTTPS from host (7.7 MB, seekable)" or "UDP port 1234 (live)"; else empty).
 			</description>
 		</method>
 		<method name="get_external_subtitle_count" qualifiers="const">
@@ -160,8 +174,9 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns counters: [code]bitrate_bps[/code] (the video bit rate at the playback position, over the last 3 whole seconds with data; left out while unknown, see [method get_video_bitrate_history]), [code]packets_read[/code], [code]bytes_read[/code], [code]video_packets[/code], [code]video_bytes[/code], [code]video_skipped[/code] (before the first keyframe), [code]video_parameter_sets_added[/code], [code]video_queue[/code], [code]video_queue_bytes[/code], [code]audio_packets[/code], [code]audio_frames_out[/code], [code]audio_decode_errors[/code], [code]audio_dropped_frames[/code] (before a seek target), [code]audio_silence_frames[/code], [code]audio_buffered[/code] (seconds), [code]audio_position[/code], [code]audio_underruns[/code] (the ring ran empty during playback), [code]audio_seek_waits[/code] (it was empty before the first frame after open or a seek: expected, the position holds), [code]audio_frames_mixed[/code], [code]audio_finished[/code], [code]read_errors[/code], [code]seeks[/code], [code]seek_retries[/code], [code]subtitle_events[/code], [code]subtitle_decode_errors[/code], [code]subtitle_queue[/code], [code]thread_cpu_seconds[/code] (CPU time of the demux thread), [code]serial[/code], [code]eof[/code], [code]state[/code], [code]state_name[/code], [code]last_error[/code], [code]network[/code] ([code]true[/code] for smb:// files), [code]night_mode[/code], [code]night_mode_decoder_drc[/code] (the track is AC-3 or E-AC-3: night mode also uses the stream's own DRC), [code]dialogue_boost_applies[/code] (the audio has a centre channel), [code]audio_gain_db[/code] (night mode's gain just now), [code]audio_limiter_db[/code] (the limiter's reduction, 0 or negative), [code]audio_typical_level_db[/code].
+				Returns counters: [code]bitrate_bps[/code] (the video bit rate at the playback position, over the last 3 whole seconds with data; left out while unknown, see [method get_video_bitrate_history]), [code]packets_read[/code], [code]bytes_read[/code], [code]video_packets[/code], [code]video_bytes[/code], [code]video_skipped[/code] (before the first keyframe), [code]video_parameter_sets_added[/code], [code]video_queue[/code], [code]video_queue_bytes[/code], [code]audio_packets[/code], [code]audio_frames_out[/code], [code]audio_decode_errors[/code], [code]audio_dropped_frames[/code] (before a seek target), [code]audio_silence_frames[/code], [code]audio_buffered[/code] (seconds), [code]audio_position[/code], [code]audio_underruns[/code] (the ring ran empty during playback), [code]audio_seek_waits[/code] (it was empty before the first frame after open or a seek: expected, the position holds), [code]audio_frames_mixed[/code], [code]audio_finished[/code], [code]read_errors[/code], [code]seeks[/code], [code]seek_retries[/code], [code]subtitle_events[/code], [code]subtitle_decode_errors[/code], [code]subtitle_queue[/code], [code]thread_cpu_seconds[/code] (CPU time of the demux thread), [code]serial[/code], [code]eof[/code], [code]state[/code], [code]state_name[/code], [code]last_error[/code], [code]network[/code] ([code]true[/code] for smb://, http://, https:// and udp://), [code]live[/code] ([method is_live]), [code]night_mode[/code], [code]night_mode_decoder_drc[/code] (the track is AC-3 or E-AC-3: night mode also uses the stream's own DRC), [code]dialogue_boost_applies[/code] (the audio has a centre channel), [code]audio_gain_db[/code] (night mode's gain just now), [code]audio_limiter_db[/code] (the limiter's reduction, 0 or negative), [code]audio_typical_level_db[/code].
 				For smb:// files also: [code]net_buffer_bytes[/code] (ring size), [code]net_buffered_bytes[/code] (read ahead of the demuxer's position), [code]net_bytes_read[/code], [code]net_requests[/code], [code]net_resets[/code] (seeks outside the buffered range), [code]net_waits[/code] (reads that had to wait for the network), [code]net_seek_waits[/code] (of those, waits while the buffer refilled after open or a seek: expected), [code]net_stalls[/code] and [code]net_stall_seconds[/code] (waits once the buffer had refilled: the network didn't keep up), [code]net_wait_seconds[/code], [code]net_refills[/code] (refills done: from open or a seek until 4 MiB were read ahead), [code]net_refill_seconds[/code], [code]net_refill_mbps[/code] (the read rate during refills, which bounds how fast a seek settles: the decoder needs everything from the keyframe before the target), [code]net_reconnects[/code], [code]net_errors[/code], [code]net_read_mbps[/code] (Mbit/s while requests were in flight: the link's rate), [code]net_average_mbps[/code] (since open), [code]net_busy_seconds[/code], [code]net_thread_cpu_seconds[/code] (CPU time of the readahead thread).
+				For http://, https:// and udp:// streams: [code]net_buffer_bytes[/code], [code]net_buffered_bytes[/code], [code]net_bytes_read[/code], [code]net_requests[/code] (HTTP requests made: the first, one per seek outside the ring, one per reconnect), [code]net_resets[/code] (seeks outside the buffered range), [code]net_waits[/code] and [code]net_wait_seconds[/code] (reads that had to wait for the network), [code]net_reconnects[/code], [code]net_errors[/code], [code]net_packets[/code] (UDP datagrams), [code]net_overruns[/code] (bytes of a live stream dropped unread: the ring was full, or the reader fell behind), [code]net_skips[/code] (times a live stream skipped ahead because it was read more than twice [member live_latency] late), [code]net_average_mbps[/code] (since open) and [code]net_thread_cpu_seconds[/code].
 			</description>
 		</method>
 		<method name="get_subtitle_header" qualifiers="const">
@@ -180,6 +195,12 @@
 			<return type="Array" />
 			<description>
 				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]text[/code] (decoded to text: SubRip, ASS/SSA, MP4 timed text, WebVTT), [code]bitmap[/code] (PGS, VobSub, DVB, XSUB), [code]bitmap_decoded[/code] (a bitmap track whose events carry images; else they carry the raw packets), [code]language[/code], [code]language_code[/code] ([method normalize_language]), [code]title[/code], [code]default[/code], [code]forced[/code], [code]hearing_impaired[/code] (both also from the title), [code]external[/code], and for subtitle files ([method add_external_subtitle]) [code]path[/code]. The file's own tracks come first.
+			</description>
+		</method>
+		<method name="get_tags" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns the file's metadata tags with lower-case keys, as the container gives them: for music files usually [code]title[/code], [code]artist[/code], [code]album[/code], [code]album_artist[/code], [code]track[/code] ("3" or "3/12"), [code]disc[/code], [code]date[/code], [code]genre[/code], [code]comment[/code]. The container's tags come first, then the first audio stream's (Ogg keeps its comments there) for keys not yet given. Technical tags ([code]encoder[/code], [code]handler_name[/code], brands) are left out. Empty before [method open].
 			</description>
 		</method>
 		<method name="get_tone_mapping" qualifiers="static">
@@ -229,10 +250,22 @@
 				Returns [code]true[/code] once the file is read to the end (queued data may still be waiting).
 			</description>
 		</method>
+		<method name="is_live" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] for a live stream: [code]udp://[/code], or HTTP whose server gives no length. It plays as it arrives and can't seek. If it isn't read for longer than twice [member live_latency], the oldest data is skipped ([code]net_skips[/code] in [method get_stats]).
+			</description>
+		</method>
 		<method name="is_open" qualifiers="const">
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] between a successful [method open] and [method close].
+			</description>
+		</method>
+		<method name="is_seekable" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] when [method seek] works: an open file, or an HTTP stream whose server takes Range requests. [code]false[/code] for live streams and for servers that only send the whole file.
 			</description>
 		</method>
 		<method name="language_name" qualifiers="static">
@@ -255,6 +288,7 @@
 			<description>
 				Opens a file, reads its stream information, selects the default audio track and starts reading. Blocks while it reads the start of the file.
 				[param path] is a local path, a [code]res://[/code] or [code]user://[/code] path, or [code]smb://host/share/path/file[/code] (not URL-encoded: names are written as they are). For an smb:// file, the host is connected and logged into with the credentials of [method set_smb_credentials] (else as guest), which can take up to about 8 s per step when the host doesn't answer: open from a worker thread if the caller must not stall. Errors are sentences for the user in [method get_last_error], for example "Access denied: HOST refused the user name or password." or "Not found: share/path on HOST.".
+				[param path] can also be a URL. [code]http://host[:port]/path[/code] and [code]https://...[/code] use HTTP/1.1 with Range requests, so the file seeks like a local one; up to 5 redirects are followed and chunked replies are read. A server without Range support plays from the start without seeking. A lost connection is opened again where it stopped (5 tries). [code]udp://[group]:port[/code] is MPEG-TS in UDP datagrams: [code]udp://@:1234[/code] listens on every interface, and a multicast group is joined on every interface. A thread of their own reads streams into a ring of [member network_buffer_size] bytes. For a live stream, open reads only about [member live_latency] of it to find the streams, and playback then stays at most about that far behind what arrives. HTTPS checks the server's certificate against the system's CA store (or [code]network/tls/certificate_bundle_override[/code]) unless [member network_tls_verify] is off. FFmpeg's own network code isn't used.
 			</description>
 		</method>
 		<method name="parse_ass_event" qualifiers="static">
@@ -338,8 +372,14 @@
 		<member name="downmix_normalize" type="bool" setter="set_downmix_normalize" getter="is_downmix_normalize" default="false">
 			If [code]true[/code], the downmix to stereo is scaled so no sum can exceed full scale (about 7.7 dB quieter for 5.1). Set before [method open].
 		</member>
+		<member name="live_latency" type="float" setter="set_live_latency" getter="get_live_latency" default="0.5">
+			Seconds (0.1 to 10) of a live stream ([method is_live]) to read before playing, and how far behind the arriving stream the reader may fall. [method open] analyses about this much (at least 0.3 s) to find the streams. Once the reader is more than twice this behind, the stream skips ahead to the newest data. Smaller starts sooner and stays closer to live; larger rides out more network jitter. Set before [method open].
+		</member>
 		<member name="network_buffer_size" type="int" setter="set_network_buffer_size" getter="get_network_buffer_size" default="16777216">
-			Size in bytes of the readahead ring of smb:// files (4 MiB to 256 MiB; applies at the next [method open]). Reads of up to 1 MiB, up to 4 in flight; 1/8 of the ring is kept behind the read position for short backward seeks, the rest is read ahead. After a seek outside the ring the readahead starts at 256 KiB and doubles as the file is read on. A lost connection is reopened (5 tries, 0.5 s to 8 s apart) and the reading resumes where it stopped; after that the source goes to [constant STATE_ERROR] with the reason in [method get_last_error].
+			Size in bytes of the readahead ring of smb://, http://, https:// and udp:// streams (4 MiB to 256 MiB; applies at the next [method open]). For smb:// files: reads of up to 1 MiB, up to 4 in flight; 1/8 of the ring is kept behind the read position for short backward seeks, the rest is read ahead. After a seek outside the ring the readahead starts at 256 KiB and doubles as the file is read on. A lost connection is reopened (5 tries, 0.5 s to 8 s apart) and the reading resumes where it stopped; after that the source goes to [constant STATE_ERROR] with the reason in [method get_last_error].
+		</member>
+		<member name="network_tls_verify" type="bool" setter="set_network_tls_verify" getter="is_network_tls_verify" default="true">
+			If [code]true[/code], an https:// server must show a certificate that the system's CA store (or [code]network/tls/certificate_bundle_override[/code]) trusts, for the host name in the URL. If not, [method open] fails with "The TLS handshake with HOST failed (a certificate that isn't trusted?).". Set it to [code]false[/code] for a server on the local network with a self-signed certificate: the connection is still encrypted, but anyone in the path could pose as the server. Set before [method open].
 		</member>
 		<member name="network_requests" type="int" setter="set_network_requests" getter="get_network_requests" default="4">
 			Read requests (of up to 1 MiB) in flight at once for smb:// files, 1 to 16; applies at the next [method open]. More keeps a link with more latency busy.

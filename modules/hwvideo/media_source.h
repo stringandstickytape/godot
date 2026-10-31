@@ -55,6 +55,7 @@ struct SwrContext;
 struct AVIOContext;
 
 class SmbFile;
+class NetStream;
 
 class AudioStreamMedia;
 class AudioTempo;
@@ -280,15 +281,25 @@ private:
 	LocalVector<AudioTrack> audio_tracks;
 	LocalVector<SubtitleTrack> subtitle_tracks;
 	LocalVector<Chapter> chapters;
+	struct AttachedPicture {
+		String codec; // "mjpeg", "png", ...
+		String title; // "Cover (front)", a file name, ...
+		PackedByteArray data; // The image file as stored.
+	};
+	LocalVector<AttachedPicture> pictures;
 	LocalVector<uint8_t> config_parameter_sets; // Annex-B VPS/SPS/PPS from the codec configuration (avcC/hvcC).
 	int output_rate = 48000;
 	uint64_t ring_capacity = 0;
 
 	// smb://host/share/path: the file is read by an SmbFile (readahead thread) through a custom AVIOContext.
 	SmbFile *smb_file = nullptr;
+	// http://, https://, udp://: read by a NetStream (readahead thread) through the same kind of AVIOContext.
+	NetStream *net_stream = nullptr;
 	AVIOContext *avio = nullptr;
 	int64_t network_buffer_size = 16 << 20;
 	int network_requests = 4;
+	bool network_tls_verify = true;
+	double live_latency = 0.5; // Live streams: the probe, and how far behind the newest data the reader may fall.
 
 	Thread thread;
 
@@ -511,6 +522,10 @@ public:
 
 	// Chapters of the file: [{index, start, end, title}] in media seconds; empty if it has none.
 	Array get_chapters() const;
+	// Music files: the container's and the audio stream's tags (title, artist, album, ...), and cover art.
+	Dictionary get_tags() const;
+	Array get_attached_pictures() const;
+	Ref<Image> get_album_art() const;
 	// The chapter playing at p_seconds, or -1 (before the first, or none).
 	int get_chapter_at(double p_seconds) const;
 
@@ -563,6 +578,12 @@ public:
 	int64_t get_network_buffer_size() const { return network_buffer_size; }
 	void set_network_requests(int p_requests);
 	int get_network_requests() const { return network_requests; }
+	void set_network_tls_verify(bool p_verify) { network_tls_verify = p_verify; } // Applies at the next open().
+	bool is_network_tls_verify() const { return network_tls_verify; }
+	void set_live_latency(double p_seconds) { live_latency = CLAMP(p_seconds, 0.1, 10.0); } // Applies at the next open().
+	double get_live_latency() const { return live_latency; }
+	bool is_live() const;
+	bool is_seekable() const;
 	Dictionary get_stats() const;
 	// Video bitrate in kbit/s for each of the p_seconds whole media seconds before p_at (oldest first), from the sizes of
 	// the packets read; -1 where unknown (not read since the last seek, or too long ago). For a graph in an overlay.

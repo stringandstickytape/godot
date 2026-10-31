@@ -1021,3 +1021,86 @@ Color MediaSource::tone_map_color(const Color &p_rgb, const Dictionary &p_tone_m
 	nits /= target;
 	return Color(nits.x, nits.y, nits.z, p_rgb.a);
 }
+
+/* Music files */
+
+Dictionary MediaSource::get_tags() const {
+	Dictionary tags;
+	if (format == nullptr) {
+		return tags;
+	}
+	// The container's tags, then the audio stream's (Ogg keeps its Vorbis comments there); keys in lower case.
+	const auto add = [&tags](const AVDictionary *p_metadata) {
+		const AVDictionaryEntry *entry = nullptr;
+		while ((entry = av_dict_iterate(p_metadata, entry))) {
+			const String key = String::utf8(entry->key).to_lower();
+			if (!tags.has(key) && key != "handler_name" && key != "vendor_id" && key != "encoder" && key != "language" && key != "major_brand" && key != "minor_version" &&
+					key != "compatible_brands") {
+				tags[key] = String::utf8(entry->value);
+			}
+		}
+	};
+	add(format->metadata);
+	if (!audio_tracks.is_empty()) {
+		add(format->streams[audio_tracks[0].stream_index]->metadata);
+	}
+	return tags;
+}
+
+static Ref<Image> decode_picture(const PackedByteArray &p_data, const String &p_codec) {
+	Ref<Image> image;
+	image.instantiate();
+	const uint8_t *b = p_data.ptr();
+	const int64_t n = p_data.size();
+	Error error = ERR_FILE_UNRECOGNIZED;
+	if (p_codec == "png" || (n > 4 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G')) {
+		error = image->load_png_from_buffer(p_data);
+	} else if (p_codec == "mjpeg" || (n > 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff)) {
+		error = image->load_jpg_from_buffer(p_data);
+	} else if (p_codec == "webp" || (n > 12 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' && b[8] == 'W' && b[9] == 'E')) {
+		error = image->load_webp_from_buffer(p_data);
+	} else if (p_codec == "bmp" || (n > 2 && b[0] == 'B' && b[1] == 'M')) {
+		error = image->load_bmp_from_buffer(p_data);
+	}
+	return error == OK ? image : Ref<Image>();
+}
+
+Array MediaSource::get_attached_pictures() const {
+	Array result;
+	for (const AttachedPicture &picture : pictures) {
+		Dictionary d;
+		d["codec"] = picture.codec;
+		d["title"] = picture.title;
+		d["data"] = picture.data;
+		const Ref<Image> image = decode_picture(picture.data, picture.codec);
+		d["image"] = image;
+		d["size"] = image.is_valid() ? image->get_size() : Vector2i();
+		result.push_back(d);
+	}
+	return result;
+}
+
+// The front cover if one is marked so, else the first picture that decodes.
+Ref<Image> MediaSource::get_album_art() const {
+	int first = -1;
+	for (uint32_t i = 0; i < pictures.size(); i++) {
+		const String title = pictures[i].title.to_lower();
+		if (title.contains("front") || title.begins_with("cover")) {
+			first = (int)i;
+			break;
+		}
+	}
+	if (first >= 0) {
+		const Ref<Image> image = decode_picture(pictures[first].data, pictures[first].codec);
+		if (image.is_valid()) {
+			return image;
+		}
+	}
+	for (const AttachedPicture &picture : pictures) {
+		const Ref<Image> image = decode_picture(picture.data, picture.codec);
+		if (image.is_valid()) {
+			return image;
+		}
+	}
+	return Ref<Image>();
+}

@@ -33,6 +33,7 @@
 
 #include "audio_stream_media.h"
 #include "audio_tempo.h"
+#include "net_stream.h"
 #include "smb_client.h"
 
 #include "core/config/project_settings.h"
@@ -1267,6 +1268,10 @@ bool MediaSource::_read_packet() {
 			dstats.read_errors++;
 			_set_error(smb_file->get_error());
 			eof_reached = true;
+		} else if (net_stream && net_stream->has_failed()) {
+			dstats.read_errors++;
+			_set_error(net_stream->get_error());
+			eof_reached = true;
 		} else {
 			dstats.read_errors++;
 			if (++read_errors_in_row >= 64) {
@@ -1527,22 +1532,46 @@ Error MediaSource::open(const String &p_path) {
 	dstats = Stats();
 	dsp_serial = UINT32_MAX; // Night mode and dialogue boost are applied again by the new thread.
 	path = p_path;
-	const bool network = SmbUrl::is_smb(p_path);
+	const bool smb = SmbUrl::is_smb(p_path);
+	const bool web = NetStream::is_url(p_path);
+	const bool network = smb || web;
 	const String global_path = network || !ProjectSettings::get_singleton() ? p_path : ProjectSettings::get_singleton()->globalize_path(p_path);
 
 	AVFormatContext *context = nullptr;
 	if (network) {
 		// Blocking: connect, log in, open (up to about 8 s each when the host doesn't answer).
 		String error;
-		smb_file = memnew(SmbFile);
-		if (smb_file->open(p_path, (uint64_t)network_buffer_size, (uint32_t)network_requests, error) != OK) {
-			_close_network();
-			_set_error(error);
-			return ERR_FILE_CANT_OPEN;
+		void *opaque;
+		int (*read_function)(void *, uint8_t *, int);
+		int64_t (*seek_function)(void *, int64_t, int);
+		if (smb) {
+			smb_file = memnew(SmbFile);
+			if (smb_file->open(p_path, (uint64_t)network_buffer_size, (uint32_t)network_requests, error) != OK) {
+				_close_network();
+				_set_error(error);
+				return ERR_FILE_CANT_OPEN;
+			}
+			print_line(vformat("MediaSource: %s: %.2f GB over %s.", p_path, (double)smb_file->get_size() / 1e9, smb_file->get_description()));
+			opaque = smb_file;
+			read_function = &SmbFile::avio_read;
+			seek_function = &SmbFile::avio_seek;
+		} else {
+			net_stream = memnew(NetStream);
+			if (net_stream->open(p_path, (uint64_t)network_buffer_size, network_tls_verify, error) != OK) {
+				_close_network();
+				_set_error(error);
+				return ERR_FILE_CANT_OPEN;
+			}
+			print_line(vformat("MediaSource: %s: %s.", p_path, net_stream->get_description()));
+			opaque = net_stream;
+			read_function = &NetStream::avio_read;
+			seek_function = &NetStream::avio_seek;
 		}
-		print_line(vformat("MediaSource: %s: %.2f GB over %s.", p_path, (double)smb_file->get_size() / 1e9, smb_file->get_description()));
 		uint8_t *buffer = (uint8_t *)av_malloc(AVIO_BUFFER_SIZE);
-		avio = buffer ? avio_alloc_context(buffer, AVIO_BUFFER_SIZE, 0, smb_file, &SmbFile::avio_read, nullptr, &SmbFile::avio_seek) : nullptr;
+		avio = buffer ? avio_alloc_context(buffer, AVIO_BUFFER_SIZE, 0, opaque, read_function, nullptr, seek_function) : nullptr;
+		if (avio && net_stream && !net_stream->is_seekable()) {
+			avio->seekable = 0; // Live: the demuxers read on and don't try to seek.
+		}
 		context = avio ? avformat_alloc_context() : nullptr;
 		if (!context) {
 			if (!avio) {
@@ -1554,6 +1583,11 @@ Error MediaSource::open(const String &p_path) {
 		}
 		context->pb = avio;
 		context->flags |= AVFMT_FLAG_CUSTOM_IO;
+		if (net_stream && net_stream->is_live()) {
+			// Live: probe briefly (what is probed is played, so the probe is the start-up delay).
+			context->probesize = 2 << 20;
+			context->max_analyze_duration = (int64_t)(MAX(live_latency, 0.3) * AV_TIME_BASE);
+		}
 	}
 	int r = avformat_open_input(&context, global_path.utf8().get_data(), nullptr, nullptr);
 	if (r < 0) {
@@ -1569,13 +1603,40 @@ Error MediaSource::open(const String &p_path) {
 		_close_internal();
 		return ERR_FILE_UNRECOGNIZED;
 	}
+	if (net_stream && net_stream->is_live()) {
+		// Bound the delay: a reader more than 2 x live_latency behind the newest data skips ahead.
+		net_stream->set_live_limit(live_latency * 2.0);
+	}
 	format_name = format->iformat && format->iformat->name ? String::utf8(format->iformat->name) : String();
 	start_time = format->start_time != AV_NOPTS_VALUE ? (double)format->start_time / AV_TIME_BASE : 0.0;
 	duration = format->duration != AV_NOPTS_VALUE ? (double)format->duration / AV_TIME_BASE : 0.0;
 	bit_rate = format->bit_rate;
 	_read_chapters();
 
-	const int best_video = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+	// Cover art (music files, Matroska image attachments) comes as a video stream with one packet: never the video.
+	int best_video = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+	if (best_video >= 0 && (format->streams[best_video]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+		best_video = -1;
+		for (unsigned i = 0; i < format->nb_streams && best_video < 0; i++) {
+			if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !(format->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+				best_video = (int)i;
+			}
+		}
+	}
+	for (unsigned i = 0; i < format->nb_streams; i++) {
+		const AVStream *stream = format->streams[i];
+		if ((stream->disposition & AV_DISPOSITION_ATTACHED_PIC) && stream->attached_pic.size > 0) {
+			AttachedPicture picture;
+			picture.codec = String::utf8(avcodec_get_name(stream->codecpar->codec_id));
+			const AVDictionaryEntry *comment = av_dict_get(stream->metadata, "comment", nullptr, 0);
+			const AVDictionaryEntry *title = av_dict_get(stream->metadata, "title", nullptr, 0);
+			const AVDictionaryEntry *filename = av_dict_get(stream->metadata, "filename", nullptr, 0);
+			picture.title = comment ? String::utf8(comment->value) : (title ? String::utf8(title->value) : (filename ? String::utf8(filename->value) : String()));
+			picture.data.resize(stream->attached_pic.size);
+			memcpy(picture.data.ptrw(), stream->attached_pic.data, stream->attached_pic.size);
+			pictures.push_back(picture);
+		}
+	}
 	const int best_audio = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, best_video >= 0 ? best_video : -1, nullptr, 0);
 	int default_track = -1;
 	for (unsigned i = 0; i < format->nb_streams; i++) {
@@ -1831,11 +1892,19 @@ void MediaSource::_close_network() {
 		memdelete(smb_file);
 		smb_file = nullptr;
 	}
+	if (net_stream) {
+		net_stream->close();
+		memdelete(net_stream);
+		net_stream = nullptr;
+	}
 }
 
 void MediaSource::_close_internal() {
 	if (smb_file) {
 		smb_file->abort(); // The demux thread may wait for network data.
+	}
+	if (net_stream) {
+		net_stream->abort();
 	}
 	if (thread.is_started()) {
 		{
@@ -1866,6 +1935,7 @@ void MediaSource::_close_internal() {
 	audio_tracks.clear();
 	subtitle_tracks.clear();
 	chapters.clear();
+	pictures.clear();
 	config_parameter_sets.clear();
 	inband_parameter_sets.clear();
 	current_audio_track = -1;
@@ -2047,6 +2117,11 @@ Dictionary MediaSource::get_info() const {
 	d["audio_tracks"] = get_audio_tracks();
 	d["subtitle_tracks"] = get_subtitle_tracks();
 	d["chapters"] = get_chapters();
+	d["tags"] = get_tags();
+	d["live"] = is_live();
+	d["seekable"] = is_seekable();
+	d["network_description"] = net_stream ? net_stream->get_description() : String();
+	d["attached_pictures"] = (int)pictures.size();
 	d["audio_track"] = get_audio_track();
 	d["subtitle_track"] = get_subtitle_track();
 	d["output_rate"] = output_rate;
@@ -2172,8 +2247,21 @@ String MediaSource::get_subtitle_header() const {
 	return subtitle_header;
 }
 
+bool MediaSource::is_live() const {
+	return net_stream != nullptr && net_stream->is_live();
+}
+
+bool MediaSource::is_seekable() const {
+	return is_open() && !is_live() && !(net_stream != nullptr && !net_stream->is_seekable());
+}
+
 int MediaSource::seek(double p_seconds) {
 	ERR_FAIL_COND_V_MSG(!is_open(), -1, "MediaSource: not open.");
+	if (!is_seekable()) {
+		WARN_PRINT_ONCE("MediaSource: a live stream (or a server without Range support) can't seek.");
+		MutexLock lock(mutex);
+		return (int)serial;
+	}
 	double target = MAX(p_seconds, 0.0);
 	if (duration > 0.0) {
 		target = MIN(target, duration);
@@ -2280,7 +2368,25 @@ Dictionary MediaSource::get_stats() const {
 	d["thread_cpu_seconds"] = stats.thread_cpu_seconds;
 	d["seeks"] = seek_count;
 	d["last_error"] = last_error;
-	d["network"] = smb_file != nullptr;
+	d["network"] = smb_file != nullptr || net_stream != nullptr;
+	d["live"] = net_stream != nullptr && net_stream->is_live();
+	if (net_stream) {
+		const NetStream::Stats n = net_stream->get_stats();
+		d["net_buffer_bytes"] = n.buffer_size;
+		d["net_buffered_bytes"] = n.buffered;
+		d["net_bytes_read"] = n.bytes_read;
+		d["net_requests"] = n.requests;
+		d["net_resets"] = n.resets;
+		d["net_waits"] = n.waits;
+		d["net_wait_seconds"] = n.wait_seconds;
+		d["net_reconnects"] = n.reconnects;
+		d["net_errors"] = n.errors;
+		d["net_packets"] = n.packets;
+		d["net_overruns"] = n.overruns;
+		d["net_skips"] = n.skips;
+		d["net_average_mbps"] = n.open_seconds > 0.0 ? (double)n.bytes_read * 8.0 / n.open_seconds / 1e6 : 0.0;
+		d["net_thread_cpu_seconds"] = n.thread_cpu_seconds;
+	}
 	if (smb_file) {
 		const SmbFile::Stats n = smb_file->get_stats();
 		d["net_buffer_bytes"] = n.buffer_size;
@@ -2545,6 +2651,9 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_output_rate"), &MediaSource::get_output_rate);
 	ClassDB::bind_method(D_METHOD("read_video_packet"), &MediaSource::read_video_packet);
 	ClassDB::bind_method(D_METHOD("get_chapters"), &MediaSource::get_chapters);
+	ClassDB::bind_method(D_METHOD("get_tags"), &MediaSource::get_tags);
+	ClassDB::bind_method(D_METHOD("get_attached_pictures"), &MediaSource::get_attached_pictures);
+	ClassDB::bind_method(D_METHOD("get_album_art"), &MediaSource::get_album_art);
 	ClassDB::bind_static_method("MediaSource", D_METHOD("parse_ass_event", "line", "header"), &MediaSource::parse_ass_event);
 	ClassDB::bind_static_method("MediaSource", D_METHOD("get_tone_mapping", "video_info", "target_nits"), &MediaSource::get_tone_mapping, DEFVAL(203.0));
 	ClassDB::bind_static_method("MediaSource", D_METHOD("tone_map_color", "rgb", "tone_mapping"), &MediaSource::tone_map_color);
@@ -2566,6 +2675,12 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_video_queue_seconds"), &MediaSource::get_video_queue_seconds);
 	ClassDB::bind_method(D_METHOD("set_audio_queue_seconds", "seconds"), &MediaSource::set_audio_queue_seconds);
 	ClassDB::bind_method(D_METHOD("get_audio_queue_seconds"), &MediaSource::get_audio_queue_seconds);
+	ClassDB::bind_method(D_METHOD("set_network_tls_verify", "verify"), &MediaSource::set_network_tls_verify);
+	ClassDB::bind_method(D_METHOD("is_network_tls_verify"), &MediaSource::is_network_tls_verify);
+	ClassDB::bind_method(D_METHOD("set_live_latency", "seconds"), &MediaSource::set_live_latency);
+	ClassDB::bind_method(D_METHOD("get_live_latency"), &MediaSource::get_live_latency);
+	ClassDB::bind_method(D_METHOD("is_live"), &MediaSource::is_live);
+	ClassDB::bind_method(D_METHOD("is_seekable"), &MediaSource::is_seekable);
 	ClassDB::bind_method(D_METHOD("set_discrete_channels", "enabled"), &MediaSource::set_discrete_channels);
 	ClassDB::bind_method(D_METHOD("is_discrete_channels"), &MediaSource::is_discrete_channels);
 	ClassDB::bind_method(D_METHOD("get_audio_channel_stream", "channel"), &MediaSource::get_audio_channel_stream);
@@ -2592,6 +2707,8 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_speed", PROPERTY_HINT_RANGE, "0.5,2,0.05"), "set_playback_speed", "get_playback_speed");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "discrete_channels"), "set_discrete_channels", "is_discrete_channels");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "network_tls_verify"), "set_network_tls_verify", "is_network_tls_verify");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "live_latency", PROPERTY_HINT_RANGE, "0.1,10,0.1,suffix:s"), "set_live_latency", "get_live_latency");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "night_mode"), "set_night_mode", "is_night_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "night_mode_strength", PROPERTY_HINT_RANGE, "0,1,0.05"), "set_night_mode_strength", "get_night_mode_strength");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "dialogue_boost", PROPERTY_HINT_RANGE, "0,12,0.5,suffix:dB"), "set_dialogue_boost", "get_dialogue_boost");
