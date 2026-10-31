@@ -40,6 +40,7 @@
 #include <linux/videodev2.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cstdlib>
 #include <cstring>
@@ -722,9 +723,20 @@ Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
 	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
 	const bool ten_bit = MAX(info.bit_depth, (int)info.sps.bit_depth) > 8;
 	const bool allow_10bit = decoder->is_experimental_10bit() || (ten_bit && V4L2Decoder::is_p010_available(decoder->get_device_path()));
-	const String hw_reason = MediaSource::get_hw_unsupported_reason(info, allow_10bit);
-	if (!hw_reason.is_empty() && software_fallback) {
-		const String sw_reason = SoftwareVideoDecoder::get_unsupported_reason(info, software_max_pixels);
+	String hw_reason = MediaSource::get_hw_unsupported_reason(info, allow_10bit);
+	bool forced = false; // Software by choice: what software can't decode still goes to the hardware.
+	if (hw_reason.is_empty()) {
+		// A machine without the decoder (a desktop) decodes in software too; HWVIDEO_FORCE_SW=1 does it anywhere (A/B).
+		struct stat device;
+		if (OS::get_singleton()->get_environment("HWVIDEO_FORCE_SW") == "1") {
+			hw_reason = "Software decode forced (HWVIDEO_FORCE_SW=1).";
+			forced = true;
+		} else if (stat(decoder->get_device_path().utf8().get_data(), &device) != 0) {
+			hw_reason = vformat("There is no hardware video decoder on this machine (no %s).", decoder->get_device_path());
+		}
+	}
+	const String sw_reason = hw_reason.is_empty() ? String() : SoftwareVideoDecoder::get_unsupported_reason(info, software_max_pixels);
+	if (!hw_reason.is_empty() && software_fallback && !(forced && !sw_reason.is_empty())) {
 		if (!sw_reason.is_empty()) {
 			last_error = hw_reason + " " + sw_reason;
 			source.unref();
