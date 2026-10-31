@@ -123,6 +123,9 @@
 		<member name="reconfig_rate" type="float" setter="set_reconfig_rate" getter="get_reconfig_rate" default="25.0">
 			Before a CAPTURE re-setup, the input pauses until the driver's queued-rate estimate is at most this rate, so the driver's admission check passes. 0 disables the pause.
 		</member>
+		<member name="seek_eos" type="int" setter="set_seek_eos" getter="get_seek_eos" enum="V4L2Decoder.SeekEOS" default="1">
+			With a [MediaSource]: what goes into the bitstream before the first access unit after a seek (not at a session start). An end-of-sequence NAL unit (H.264 type 10, HEVC EOS_NUT) makes the decoder treat the keyframe as a random access point: after an HEVC CRA or an H.264 recovery-point I picture, the leading pictures that reference pictures from before the seek are dropped instead of being decoded from the wrong references, and the pictures held for reordering are output. (In H.264 the access unit after an end of sequence must be an IDR picture, so before a recovery-point I picture this is strictly out of spec; whether the hardware decoder accepts it is what the option is for.) Counted as [code]eos_inserted[/code] in [method get_stats]. Can be changed while open; applies from the next seek.
+		</member>
 		<member name="timeout_ms" type="int" setter="set_timeout_ms" getter="get_timeout_ms" default="5000">
 			No-progress time after which the session is declared hung and closed.
 		</member>
@@ -146,6 +149,15 @@
 		</constant>
 		<constant name="STATE_ERROR" value="5" enum="State">
 			See [method get_last_error]. The device is closed.
+		</constant>
+		<constant name="SEEK_EOS_OFF" value="0" enum="SeekEOS">
+			Nothing is added.
+		</constant>
+		<constant name="SEEK_EOS_PREPEND" value="1" enum="SeekEOS">
+			The end-of-sequence NAL unit goes in the same OUTPUT buffer, in front of the access unit.
+		</constant>
+		<constant name="SEEK_EOS_SEPARATE" value="2" enum="SeekEOS">
+			The end-of-sequence NAL unit goes into an OUTPUT buffer of its own.
 		</constant>
 	</constants>
 </class>

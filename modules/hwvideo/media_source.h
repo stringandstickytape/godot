@@ -106,6 +106,22 @@ public:
 		bool keyframe = false;
 		uint32_t sps_width = 0; // Coded size of an SPS in this access unit (0: none).
 		uint32_t sps_height = 0;
+		// H.264/HEVC keyframes (and the first access unit after a jump): the type of the first picture NAL unit
+		// (H.264: 5 IDR, 1 I/recovery point; HEVC: 19/20 IDR, 21 CRA, 16-18 BLA). -1: not looked at.
+		int8_t nal_type = -1;
+	};
+
+	// A subtitle event of the selected subtitle track. Text tracks (SubRip, ASS/SSA, MP4 timed text, WebVTT) are decoded:
+	// text is plain (ASS override tags removed, line breaks as \n), ass the ASS event line(s) for libass. Bitmap tracks
+	// (PGS, VobSub, DVB) are passed through: data is the raw packet, to be decoded later.
+	struct SubtitleEvent {
+		double start = 0.0; // Media seconds.
+		double end = -1.0; // -1: until the next event (bitmap tracks, or no duration in the container).
+		String text;
+		String ass;
+		PackedByteArray data;
+		bool bitmap = false;
+		uint32_t serial = 0;
 	};
 
 private:
@@ -124,6 +140,8 @@ private:
 	struct SubtitleTrack {
 		int stream_index = -1;
 		String codec;
+		bool text = false; // Decoded to text here.
+		bool bitmap = false; // Passed through as packets.
 		String language;
 		String title;
 		bool is_default = false;
@@ -148,6 +166,9 @@ private:
 		uint64_t audio_dropped_frames = 0; // Before a seek target.
 		uint64_t audio_silence_frames = 0; // Gap filled after a seek.
 		uint64_t read_errors = 0;
+		uint64_t seek_retries = 0; // Seeks moved further back because the first keyframe found was after the target (TS).
+		uint64_t subtitle_events = 0;
+		uint64_t subtitle_decode_errors = 0;
 		double thread_cpu_seconds = 0.0; // CPU time of the demux thread (CLOCK_THREAD_CPUTIME_ID).
 	};
 
@@ -158,6 +179,8 @@ private:
 	static constexpr uint32_t AUDIO_FIFO_MAX = 8192; // Compressed audio packets (TrueHD: 1200 per second).
 	static constexpr uint64_t AUDIO_FIFO_MAX_BYTES = 32ull << 20;
 	static constexpr double AUDIO_RING_SECONDS = 4.0;
+	static constexpr uint32_t SUBTITLE_QUEUE_MAX = 512;
+	static constexpr int SEEK_RETRIES_MAX = 6;
 
 	// Settings: change them before open().
 	double video_queue_seconds = 1.0;
@@ -191,6 +214,9 @@ private:
 	bool seek_pending = false;
 	double seek_target = 0.0;
 	int audio_track = -1;
+	int subtitle_track = -1;
+	LocalVector<SubtitleEvent> subtitle_queue;
+	String subtitle_header;
 	int wake_fd = -1;
 	VideoPacket video_queue[VIDEO_QUEUE_MAX];
 	uint32_t video_head = 0;
@@ -234,6 +260,13 @@ private:
 	String swr_description; // Logged when it changes (not after every seek).
 	int current_audio_track = -1;
 	int current_audio_stream = -1;
+	AVCodecContext *subtitle_codec = nullptr;
+	int current_subtitle_track = -1;
+	int current_subtitle_stream = -1;
+	double seek_wanted = -1.0; // The target of the last seek until its keyframe is found.
+	double seek_position = 0.0; // Where the file was last seeked to (earlier than seek_wanted after a retry).
+	int seek_retries = 0;
+	double pending_reseek = -1.0;
 	uint32_t demux_serial = 0;
 	bool need_keyframe = true;
 	bool need_parameter_sets = true;
@@ -258,7 +291,10 @@ private:
 	uint32_t scratch_serial = 0;
 
 	static String _av_error(int p_error);
-	static bool _scan_access_unit(const uint8_t *p_data, uint64_t p_size, bool p_hevc, AnnexBSplitter::SPSInfo &r_sps, LocalVector<uint8_t> *r_parameter_sets);
+	static bool _scan_access_unit(const uint8_t *p_data, uint64_t p_size, bool p_hevc, AnnexBSplitter::SPSInfo &r_sps, LocalVector<uint8_t> *r_parameter_sets, int *r_nal_type = nullptr);
+	static String _ass_to_text(const String &p_ass);
+	static bool _is_text_subtitle(int p_codec_id);
+	static bool _is_bitmap_subtitle(int p_codec_id);
 	static void _config_to_annexb(const uint8_t *p_data, int p_size, bool p_hevc, LocalVector<uint8_t> &r_out);
 
 	void _set_error(const String &p_message);
@@ -283,6 +319,12 @@ private:
 	void _resample_frame(const AVFrame *p_frame);
 	void _flush_scratch();
 	void _write_ring_locked(const float *p_samples, uint32_t p_frames, double p_time);
+
+	void _open_subtitle_track(int p_track);
+	void _handle_subtitle_packet();
+	void _push_subtitle(SubtitleEvent &p_event);
+	bool _holding_audio() const;
+	void _seek_file(double p_position);
 
 	void _deliver_video(AVPacket *p_packet);
 	void _receive_from_bsf();
@@ -309,6 +351,15 @@ public:
 	Array get_subtitle_tracks() const;
 	Error select_audio_track(int p_track);
 	int get_audio_track() const;
+	// Subtitles (-1: none). Selecting doesn't seek: events whose packets were already read (about the queue length
+	// ahead of the playback position) aren't delivered.
+	Error select_subtitle_track(int p_track);
+	int get_subtitle_track() const;
+	// The next event of the selected subtitle track (start, end, text, ass, bitmap, data, serial), or an empty Dictionary.
+	// Events come in file order, ahead of the playback position; keep them until their time.
+	Dictionary read_subtitle_event();
+	// The ASS header (styles) of the selected text track, for libass ([Script Info], [V4+ Styles], [Events]).
+	String get_subtitle_header() const;
 
 	// Any thread. Drops everything queued and reads again from the keyframe at or before p_seconds; decoded audio before
 	// p_seconds is dropped. Returns the new serial.

@@ -71,7 +71,7 @@ String MediaSource::_av_error(int p_error) {
 // Walks the NAL units of an Annex-B access unit up to its first picture (VCL) NAL unit, so only the few bytes in front of
 // the slice data are looked at. Returns true if there is an SPS; r_sps gets the first one. r_parameter_sets, if given,
 // gets the VPS/SPS/PPS NAL units found, each behind a 4-byte start code.
-bool MediaSource::_scan_access_unit(const uint8_t *p_data, uint64_t p_size, bool p_hevc, AnnexBSplitter::SPSInfo &r_sps, LocalVector<uint8_t> *r_parameter_sets) {
+bool MediaSource::_scan_access_unit(const uint8_t *p_data, uint64_t p_size, bool p_hevc, AnnexBSplitter::SPSInfo &r_sps, LocalVector<uint8_t> *r_parameter_sets, int *r_nal_type) {
 	if (r_parameter_sets) {
 		r_parameter_sets->clear();
 	}
@@ -96,18 +96,20 @@ bool MediaSource::_scan_access_unit(const uint8_t *p_data, uint64_t p_size, bool
 		bool vcl;
 		bool parameter_set;
 		bool sps;
+		const uint32_t type = p_hevc ? (header >> 1) & 0x3f : header & 0x1f;
 		if (p_hevc) {
-			const uint32_t type = (header >> 1) & 0x3f;
 			vcl = type < 32;
 			parameter_set = type >= 32 && type <= 34;
 			sps = type == 33;
 		} else {
-			const uint32_t type = header & 0x1f;
 			vcl = type >= 1 && type <= 5;
 			parameter_set = type == 7 || type == 8;
 			sps = type == 7;
 		}
 		if (vcl) {
+			if (r_nal_type) {
+				*r_nal_type = (int)type;
+			}
 			break;
 		}
 		const uint64_t next = find_start_code(nal);
@@ -216,6 +218,66 @@ void MediaSource::_config_to_annexb(const uint8_t *p_data, int p_size, bool p_he
 	}
 }
 
+bool MediaSource::_is_text_subtitle(int p_codec_id) {
+	switch (p_codec_id) {
+		case AV_CODEC_ID_SUBRIP:
+		case AV_CODEC_ID_ASS:
+		case AV_CODEC_ID_SSA:
+		case AV_CODEC_ID_MOV_TEXT:
+		case AV_CODEC_ID_WEBVTT:
+		case AV_CODEC_ID_TEXT:
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool MediaSource::_is_bitmap_subtitle(int p_codec_id) {
+	switch (p_codec_id) {
+		case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
+		case AV_CODEC_ID_DVD_SUBTITLE:
+		case AV_CODEC_ID_DVB_SUBTITLE:
+		case AV_CODEC_ID_XSUB:
+			return true;
+		default:
+			return false;
+	}
+}
+
+// An ASS event as FFmpeg's decoders give it ("ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text") to plain
+// text: the Text field without override blocks ({...}), \N and \n as line breaks, \h as a space.
+String MediaSource::_ass_to_text(const String &p_ass) {
+	int commas = 0;
+	int start = 0;
+	for (int i = 0; i < p_ass.length() && commas < 8; i++) {
+		if (p_ass[i] == ',') {
+			commas++;
+			start = i + 1;
+		}
+	}
+	String out;
+	bool in_override = false;
+	for (int i = start; i < p_ass.length(); i++) {
+		const char32_t c = p_ass[i];
+		if (in_override) {
+			in_override = c != '}';
+			continue;
+		}
+		if (c == '{') {
+			in_override = true;
+		} else if (c == '\\' && i + 1 < p_ass.length() && (p_ass[i + 1] == 'N' || p_ass[i + 1] == 'n')) {
+			out += "\n";
+			i++;
+		} else if (c == '\\' && i + 1 < p_ass.length() && p_ass[i + 1] == 'h') {
+			out += " ";
+			i++;
+		} else if (c != '\r' && c != '\n') {
+			out += c;
+		}
+	}
+	return out.strip_edges();
+}
+
 void MediaSource::_set_error(const String &p_message) {
 	{
 		MutexLock lock(mutex);
@@ -297,7 +359,7 @@ bool MediaSource::_needs_input_locked() const {
 
 void MediaSource::_apply_discard() {
 	for (unsigned i = 0; i < format->nb_streams; i++) {
-		const bool used = (int)i == video.stream_index || (int)i == current_audio_stream;
+		const bool used = (int)i == video.stream_index || (int)i == current_audio_stream || (int)i == current_subtitle_stream;
 		format->streams[i]->discard = used ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
 	}
 }
@@ -664,6 +726,117 @@ bool MediaSource::is_audio_finished() const {
 	return audio_eof && ring_write == ring_read;
 }
 
+/* Subtitles */
+
+void MediaSource::_open_subtitle_track(int p_track) {
+	avcodec_free_context(&subtitle_codec);
+	current_subtitle_track = p_track;
+	current_subtitle_stream = -1;
+	String header;
+	if (p_track >= 0 && p_track < (int)subtitle_tracks.size()) {
+		const SubtitleTrack &track = subtitle_tracks[p_track];
+		const AVStream *stream = format->streams[track.stream_index];
+		if (track.text) {
+			const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
+			subtitle_codec = codec ? avcodec_alloc_context3(codec) : nullptr;
+			int r = subtitle_codec ? avcodec_parameters_to_context(subtitle_codec, stream->codecpar) : AVERROR_DECODER_NOT_FOUND;
+			if (r >= 0) {
+				subtitle_codec->pkt_timebase = stream->time_base;
+				r = avcodec_open2(subtitle_codec, codec, nullptr);
+			}
+			if (r < 0) {
+				avcodec_free_context(&subtitle_codec);
+				MutexLock lock(mutex);
+				last_error = vformat("Subtitle track %d (%s): can't open a decoder: %s.", p_track, track.codec, _av_error(r));
+				ERR_PRINT("MediaSource: " + last_error);
+			} else {
+				current_subtitle_stream = track.stream_index;
+				if (subtitle_codec->subtitle_header && subtitle_codec->subtitle_header_size > 0) {
+					header = String::utf8((const char *)subtitle_codec->subtitle_header, subtitle_codec->subtitle_header_size);
+				}
+			}
+		} else {
+			current_subtitle_stream = track.stream_index; // Bitmap or other: packets passed through.
+		}
+	}
+	_apply_discard();
+	MutexLock lock(mutex);
+	subtitle_header = header;
+}
+
+void MediaSource::_push_subtitle(SubtitleEvent &p_event) {
+	p_event.serial = demux_serial;
+	dstats.subtitle_events++;
+	MutexLock lock(mutex);
+	if (p_event.serial != serial || subtitle_track != current_subtitle_track) {
+		return;
+	}
+	if (subtitle_queue.size() >= SUBTITLE_QUEUE_MAX) {
+		subtitle_queue.remove_at(0); // Nobody reads them: keep the newest.
+	}
+	subtitle_queue.push_back(p_event);
+}
+
+void MediaSource::_handle_subtitle_packet() {
+	const int index = current_subtitle_stream;
+	const AVRational time_base = format->streams[index]->time_base;
+	const int64_t ts = read_packet->pts != AV_NOPTS_VALUE ? read_packet->pts : read_packet->dts;
+	if (ts == AV_NOPTS_VALUE) {
+		return;
+	}
+	const double start = _media_time(ts, index);
+	const double packet_duration = read_packet->duration > 0 ? read_packet->duration * av_q2d(time_base) : -1.0;
+	if (subtitle_codec == nullptr) {
+		SubtitleEvent event;
+		event.start = start;
+		event.end = packet_duration > 0.0 ? start + packet_duration : -1.0;
+		event.bitmap = true;
+		event.data.resize(read_packet->size);
+		memcpy(event.data.ptrw(), read_packet->data, read_packet->size);
+		_push_subtitle(event);
+		return;
+	}
+	AVSubtitle subtitle = {};
+	int got = 0;
+	const int r = avcodec_decode_subtitle2(subtitle_codec, &subtitle, &got, read_packet);
+	if (r < 0) {
+		dstats.subtitle_decode_errors++;
+		return;
+	}
+	if (!got) {
+		return;
+	}
+	SubtitleEvent event;
+	event.start = start + subtitle.start_display_time / 1000.0;
+	if (packet_duration > 0.0) {
+		event.end = start + packet_duration;
+	} else if (subtitle.end_display_time > subtitle.start_display_time && subtitle.end_display_time != UINT32_MAX) {
+		event.end = start + subtitle.end_display_time / 1000.0;
+	}
+	for (unsigned i = 0; i < subtitle.num_rects; i++) {
+		const AVSubtitleRect *rect = subtitle.rects[i];
+		String line;
+		if (rect->ass) {
+			line = String::utf8(rect->ass);
+		} else if (rect->text) {
+			line = String::utf8(rect->text);
+		}
+		if (line.is_empty()) {
+			continue;
+		}
+		if (!event.ass.is_empty()) {
+			event.ass += "\n";
+			event.text += "\n";
+		}
+		event.ass += line;
+		event.text += rect->ass ? _ass_to_text(line) : line;
+	}
+	avsubtitle_free(&subtitle);
+	if (!event.ass.is_empty()) {
+		_push_subtitle(event);
+	}
+}
+
 /* Video */
 
 void MediaSource::_deliver_video(AVPacket *p_packet) {
@@ -676,19 +849,36 @@ void MediaSource::_deliver_video(AVPacket *p_packet) {
 	next_video_pts = MAX(out.pts, out.dts) + frame_duration;
 	out.keyframe = (p_packet->flags & AV_PKT_FLAG_KEY) != 0;
 
+	if (pending_reseek >= 0.0) {
+		_packet_put(p_packet); // A seek further back is about to happen.
+		return;
+	}
 	if (need_keyframe) {
 		if (!out.keyframe) {
 			dstats.video_skipped++;
 			_packet_put(p_packet);
 			return;
 		}
+		if (seek_wanted >= 0.0 && out.pts > seek_wanted + 0.001 && seek_position > 0.0 && seek_retries < SEEK_RETRIES_MAX) {
+			// Containers without a keyframe index (MPEG-TS) are seeked by timestamp: reading starts at the target, and the
+			// first keyframe is after it. Go back further (2, 4, 8... s) until the keyframe is at or before the target.
+			seek_retries++;
+			pending_reseek = MAX(seek_wanted - (double)(1 << seek_retries), 0.0);
+			dstats.seek_retries++;
+			dstats.video_skipped++;
+			_packet_put(p_packet);
+			return;
+		}
 		need_keyframe = false;
+		seek_wanted = -1.0;
 	}
 
 	if (_is_annexb_codec() && (out.keyframe || need_parameter_sets)) {
 		const bool hevc = video.codec == VIDEO_CODEC_HEVC;
 		AnnexBSplitter::SPSInfo sps;
-		const bool has_sps = _scan_access_unit(p_packet->data, (uint64_t)p_packet->size, hevc, sps, &scan_parameter_sets);
+		int nal_type = -1;
+		const bool has_sps = _scan_access_unit(p_packet->data, (uint64_t)p_packet->size, hevc, sps, &scan_parameter_sets, &nal_type);
+		out.nal_type = (int8_t)nal_type;
 		if (has_sps) {
 			out.sps_width = sps.width;
 			out.sps_height = sps.height;
@@ -802,8 +992,8 @@ bool MediaSource::_read_packet() {
 		_handle_video_packet();
 	} else if (read_packet->stream_index == current_audio_stream) {
 		dstats.audio_packets++;
-		if (scratch_frames > 0 || audio_fifo_count > 0) {
-			// The ring is full: keep the packet compressed and read on for the video.
+		if (scratch_frames > 0 || audio_fifo_count > 0 || _holding_audio()) {
+			// The ring is full, or the seek's keyframe isn't found yet: keep the packet compressed and read on.
 			AVPacket *queued = _packet_get();
 			if (queued) {
 				av_packet_move_ref(queued, read_packet);
@@ -812,9 +1002,22 @@ bool MediaSource::_read_packet() {
 		} else {
 			_decode_audio(read_packet);
 		}
+	} else if (read_packet->stream_index == current_subtitle_stream) {
+		_handle_subtitle_packet();
 	}
 	av_packet_unref(read_packet);
+	if (pending_reseek >= 0.0) {
+		const double position = pending_reseek;
+		pending_reseek = -1.0;
+		_seek_file(position);
+	}
 	return true;
+}
+
+// After a seek, audio waits (compressed) until the video's keyframe is found: if the file has to be seeked again further
+// back, what was read meanwhile would come out of order.
+bool MediaSource::_holding_audio() const {
+	return need_keyframe && video.stream_index >= 0 && !eof_reached && audio_fifo_count + 16 < AUDIO_FIFO_MAX;
 }
 
 void MediaSource::_drain_at_eof() {
@@ -840,24 +1043,31 @@ void MediaSource::_drain_at_eof() {
 	}
 }
 
-void MediaSource::_do_seek(double p_target) {
+// Positions the file at the keyframe at or before p_position (where the container has an index; else by timestamp) and
+// flushes everything read or decoded before.
+void MediaSource::_seek_file(double p_position) {
+	seek_position = p_position;
 	const int stream = video.stream_index >= 0 ? video.stream_index : current_audio_stream;
 	int r;
-	if (stream >= 0) {
+	if (p_position <= 0.0 && format_name == "mpegts") {
+		// MPEG-TS has no index: a timestamp seek to the start can land just after the first keyframe's start (its PES is
+		// large), and the first keyframe found is then the next one. The start of the file is byte 0.
+		r = av_seek_frame(format, -1, 0, AVSEEK_FLAG_BYTE);
+	} else if (stream >= 0) {
 		// The keyframe at or before the target (max_ts = target).
 		const double seconds_per_tick = av_q2d(format->streams[stream]->time_base);
-		const int64_t ts = (int64_t)Math::round((p_target + start_time) / seconds_per_tick);
+		const int64_t ts = (int64_t)Math::round((p_position + start_time) / seconds_per_tick);
 		r = avformat_seek_file(format, stream, INT64_MIN, ts, ts, 0);
 		if (r < 0) {
 			r = av_seek_frame(format, stream, ts, AVSEEK_FLAG_BACKWARD);
 		}
 	} else {
-		const int64_t ts = (int64_t)Math::round((p_target + start_time) * AV_TIME_BASE);
+		const int64_t ts = (int64_t)Math::round((p_position + start_time) * AV_TIME_BASE);
 		r = avformat_seek_file(format, -1, INT64_MIN, ts, ts, 0);
 	}
 	if (r < 0) {
 		MutexLock lock(mutex);
-		last_error = vformat("Seeking to %.3f s failed: %s.", p_target, _av_error(r));
+		last_error = vformat("Seeking to %.3f s failed: %s.", p_position, _av_error(r));
 		ERR_PRINT("MediaSource: " + last_error);
 	}
 	if (bsf) {
@@ -865,6 +1075,9 @@ void MediaSource::_do_seek(double p_target) {
 	}
 	if (audio_codec) {
 		avcodec_flush_buffers(audio_codec);
+	}
+	if (subtitle_codec) {
+		avcodec_flush_buffers(subtitle_codec);
 	}
 	_audio_fifo_clear();
 	swr_free(&swr); // Its delay line holds audio from before the seek; reconfigured with the next frame.
@@ -876,6 +1089,13 @@ void MediaSource::_do_seek(double p_target) {
 	eof_reached = false;
 	eof_drained = false;
 	read_errors_in_row = 0;
+	pending_reseek = -1.0;
+}
+
+void MediaSource::_do_seek(double p_target) {
+	seek_wanted = p_target;
+	seek_retries = 0;
+	_seek_file(p_target);
 	audio_trim_until = p_target;
 	audio_next_time = p_target;
 	next_video_pts = p_target;
@@ -890,6 +1110,7 @@ void MediaSource::_thread_loop() {
 		bool do_seek = false;
 		double target = 0.0;
 		int track;
+		int sub_track;
 		{
 			MutexLock lock(mutex);
 			if (exit_requested) {
@@ -902,11 +1123,15 @@ void MediaSource::_thread_loop() {
 				demux_serial = serial;
 			}
 			track = audio_track;
+			sub_track = subtitle_track;
 			dstats.thread_cpu_seconds = thread_cpu_seconds();
 			stats = dstats;
 		}
 		if (track != current_audio_track) {
 			_open_audio_track(track);
+		}
+		if (sub_track != current_subtitle_track) {
+			_open_subtitle_track(sub_track);
 		}
 		if (do_seek) {
 			_do_seek(target);
@@ -919,7 +1144,7 @@ void MediaSource::_thread_loop() {
 			_flush_scratch();
 			progress = scratch_frames != before;
 		}
-		if (scratch_frames == 0 && audio_fifo_count > 0) {
+		if (scratch_frames == 0 && audio_fifo_count > 0 && !_holding_audio()) {
 			AVPacket *packet = _audio_fifo_pop();
 			_decode_audio(packet);
 			_packet_put(packet);
@@ -948,13 +1173,13 @@ void MediaSource::_thread_loop() {
 		audio_space_wanted.set(scratch_frames);
 		MutexLock lock(mutex);
 		demux_idle.set();
-		bool work = exit_requested || seek_pending || audio_track != current_audio_track;
+		bool work = exit_requested || seek_pending || audio_track != current_audio_track || subtitle_track != current_subtitle_track;
 		if (!work && state != STATE_ERROR) {
 			if (scratch_frames > 0) {
 				MutexLock audio_lock(audio_mutex);
 				work = audio_serial != scratch_serial || ring_capacity - (ring_write - ring_read) >= scratch_frames;
 			} else {
-				work = audio_fifo_count > 0;
+				work = audio_fifo_count > 0 && !_holding_audio();
 			}
 			if (!work) {
 				work = eof_reached ? (!eof_drained && scratch_frames == 0 && audio_fifo_count == 0) : _needs_input_locked();
@@ -1044,6 +1269,8 @@ Error MediaSource::open(const String &p_path) {
 			SubtitleTrack track;
 			track.stream_index = (int)i;
 			track.codec = String::utf8(avcodec_get_name(par->codec_id));
+			track.text = _is_text_subtitle(par->codec_id) && avcodec_find_decoder(par->codec_id) != nullptr;
+			track.bitmap = _is_bitmap_subtitle(par->codec_id);
 			track.language = language ? String::utf8(language->value) : String();
 			track.title = title ? String::utf8(title->value) : String();
 			track.is_default = (stream->disposition & AV_DISPOSITION_DEFAULT) != 0;
@@ -1148,6 +1375,10 @@ Error MediaSource::open(const String &p_path) {
 	demux_serial = 0;
 	need_keyframe = true;
 	need_parameter_sets = true;
+	seek_wanted = -1.0;
+	seek_position = 0.0;
+	seek_retries = 0;
+	pending_reseek = -1.0;
 	eof_reached = eof_drained = false;
 	read_errors_in_row = 0;
 	inband_parameter_sets.clear();
@@ -1161,8 +1392,13 @@ Error MediaSource::open(const String &p_path) {
 	{
 		MutexLock lock(mutex);
 		audio_track = default_track;
+		subtitle_track = -1;
+		subtitle_queue.clear();
+		subtitle_header = String();
 	}
 	_open_audio_track(default_track);
+	current_subtitle_track = -1;
+	current_subtitle_stream = -1;
 
 	// Without a codec configuration (MPEG-TS), the coded size comes from the first SPS in the stream: read up to it now
 	// (what is read is queued as usual).
@@ -1212,6 +1448,9 @@ void MediaSource::_close_internal() {
 		thread.wait_to_finish();
 	}
 	_close_audio_codec();
+	avcodec_free_context(&subtitle_codec);
+	current_subtitle_track = -1;
+	current_subtitle_stream = -1;
 	av_bsf_free(&bsf);
 	av_packet_free(&read_packet);
 	av_frame_free(&audio_frame);
@@ -1248,6 +1487,9 @@ void MediaSource::close() {
 		state = STATE_CLOSED;
 	}
 	audio_track = -1;
+	subtitle_track = -1;
+	subtitle_queue.clear();
+	subtitle_header = String();
 }
 
 Dictionary MediaSource::get_video_info() const {
@@ -1312,6 +1554,8 @@ Array MediaSource::get_subtitle_tracks() const {
 		d["index"] = i;
 		d["stream_index"] = track.stream_index;
 		d["codec"] = track.codec;
+		d["text"] = track.text;
+		d["bitmap"] = track.bitmap;
 		d["language"] = track.language;
 		d["title"] = track.title;
 		d["default"] = track.is_default;
@@ -1332,6 +1576,7 @@ Dictionary MediaSource::get_info() const {
 	d["audio_tracks"] = get_audio_tracks();
 	d["subtitle_tracks"] = get_subtitle_tracks();
 	d["audio_track"] = get_audio_track();
+	d["subtitle_track"] = get_subtitle_track();
 	d["output_rate"] = output_rate;
 	return d;
 }
@@ -1357,6 +1602,52 @@ int MediaSource::get_audio_track() const {
 	return audio_track;
 }
 
+Error MediaSource::select_subtitle_track(int p_track) {
+	ERR_FAIL_COND_V_MSG(!is_open(), ERR_UNCONFIGURED, "MediaSource: not open.");
+	ERR_FAIL_COND_V_MSG(p_track < -1 || p_track >= (int)subtitle_tracks.size(), ERR_INVALID_PARAMETER, vformat("MediaSource: no subtitle track %d (%d tracks).", p_track, subtitle_tracks.size()));
+	MutexLock lock(mutex);
+	if (subtitle_track != p_track) {
+		subtitle_track = p_track;
+		subtitle_queue.clear();
+		subtitle_header = String();
+		condition.notify_one();
+	}
+	return OK;
+}
+
+int MediaSource::get_subtitle_track() const {
+	MutexLock lock(mutex);
+	return subtitle_track;
+}
+
+Dictionary MediaSource::read_subtitle_event() {
+	Dictionary d;
+	SubtitleEvent event;
+	{
+		MutexLock lock(mutex);
+		if (subtitle_queue.is_empty()) {
+			return d;
+		}
+		event = subtitle_queue[0];
+		subtitle_queue.remove_at(0);
+	}
+	d["start"] = event.start;
+	d["end"] = event.end;
+	d["text"] = event.text;
+	d["ass"] = event.ass;
+	d["bitmap"] = event.bitmap;
+	if (event.bitmap) {
+		d["data"] = event.data;
+	}
+	d["serial"] = event.serial;
+	return d;
+}
+
+String MediaSource::get_subtitle_header() const {
+	MutexLock lock(mutex);
+	return subtitle_header;
+}
+
 int MediaSource::seek(double p_seconds) {
 	ERR_FAIL_COND_V_MSG(!is_open(), -1, "MediaSource: not open.");
 	double target = MAX(p_seconds, 0.0);
@@ -1373,6 +1664,7 @@ int MediaSource::seek(double p_seconds) {
 		state = STATE_READING;
 	}
 	_flush_video_queue_locked();
+	subtitle_queue.clear();
 	last_video_pts = -1.0;
 	{
 		MutexLock audio_lock(audio_mutex);
@@ -1443,6 +1735,10 @@ Dictionary MediaSource::get_stats() const {
 	d["audio_dropped_frames"] = stats.audio_dropped_frames;
 	d["audio_silence_frames"] = stats.audio_silence_frames;
 	d["read_errors"] = stats.read_errors;
+	d["seek_retries"] = stats.seek_retries;
+	d["subtitle_events"] = stats.subtitle_events;
+	d["subtitle_decode_errors"] = stats.subtitle_decode_errors;
+	d["subtitle_queue"] = subtitle_queue.size();
 	d["thread_cpu_seconds"] = stats.thread_cpu_seconds;
 	d["seeks"] = seek_count;
 	d["last_error"] = last_error;
@@ -1480,6 +1776,15 @@ Dictionary MediaSource::read_video_packet() {
 	d["serial"] = packet.serial;
 	d["sps_width"] = packet.sps_width;
 	d["sps_height"] = packet.sps_height;
+	d["nal_type"] = packet.nal_type;
+	static const char *h264_names[] = { "", "i", "", "", "", "idr" };
+	String random_access;
+	if (packet.nal_type >= 0 && video.codec == VIDEO_CODEC_H264 && packet.nal_type <= 5) {
+		random_access = h264_names[packet.nal_type];
+	} else if (packet.nal_type >= 0 && video.codec == VIDEO_CODEC_HEVC) {
+		random_access = packet.nal_type == 19 || packet.nal_type == 20 ? "idr" : packet.nal_type == 21 ? "cra" : (packet.nal_type >= 16 && packet.nal_type <= 18) ? "bla" : "";
+	}
+	d["random_access"] = random_access;
 	release_video_packet(packet);
 	return d;
 }
@@ -1563,6 +1868,10 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_subtitle_tracks"), &MediaSource::get_subtitle_tracks);
 	ClassDB::bind_method(D_METHOD("select_audio_track", "track"), &MediaSource::select_audio_track);
 	ClassDB::bind_method(D_METHOD("get_audio_track"), &MediaSource::get_audio_track);
+	ClassDB::bind_method(D_METHOD("select_subtitle_track", "track"), &MediaSource::select_subtitle_track);
+	ClassDB::bind_method(D_METHOD("get_subtitle_track"), &MediaSource::get_subtitle_track);
+	ClassDB::bind_method(D_METHOD("read_subtitle_event"), &MediaSource::read_subtitle_event);
+	ClassDB::bind_method(D_METHOD("get_subtitle_header"), &MediaSource::get_subtitle_header);
 	ClassDB::bind_method(D_METHOD("seek", "seconds"), &MediaSource::seek);
 	ClassDB::bind_method(D_METHOD("get_serial"), &MediaSource::get_serial);
 	ClassDB::bind_method(D_METHOD("get_seek_target"), &MediaSource::get_seek_target);

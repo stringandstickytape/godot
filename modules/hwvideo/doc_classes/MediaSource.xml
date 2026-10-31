@@ -5,6 +5,7 @@
 	</brief_description>
 	<description>
 		Opens a file with FFmpeg's libavformat and reads it on a worker thread. The video stream is only demuxed: its access units go, in Annex-B for H.264 and HEVC (converted from MP4/Matroska's length-prefixed form with the [code]h264_mp4toannexb[/code] / [code]hevc_mp4toannexb[/code] bitstream filters), through a bounded queue to a [V4L2Decoder] ([method V4L2Decoder.open_source], [method HWVideoTexture.open_source]). The first access unit after [method open] and after every [method seek] is a keyframe with the parameter sets (VPS/SPS/PPS) in band.
+		Subtitle tracks can be selected too ([method select_subtitle_track], [method read_subtitle_event]): text tracks are decoded to text and ASS lines, bitmap tracks passed through as packets.
 		The selected audio track is decoded and resampled with libswresample to stereo float at the [AudioServer] mix rate, into a ring buffer that [method get_audio_stream] plays. More than two channels are downmixed (centre and surrounds at -3 dB, LFE dropped); the source layout is in [method get_audio_tracks]. The playback position of that stream is the A/V master clock.
 		All times are media seconds: the stream timestamp minus the file's start time ([method get_start_time]), so the first frame is at about 0. The thread blocks when the queues are full ([member video_queue_seconds], [member audio_queue_seconds]) and is woken when they are consumed; it never spins.
 		[codeblock]
@@ -111,19 +112,44 @@
 		<method name="get_stats" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
-				Returns counters: [code]packets_read[/code], [code]bytes_read[/code], [code]video_packets[/code], [code]video_bytes[/code], [code]video_skipped[/code] (before the first keyframe), [code]video_parameter_sets_added[/code], [code]video_queue[/code], [code]video_queue_bytes[/code], [code]audio_packets[/code], [code]audio_frames_out[/code], [code]audio_decode_errors[/code], [code]audio_dropped_frames[/code] (before a seek target), [code]audio_silence_frames[/code], [code]audio_buffered[/code] (seconds), [code]audio_position[/code], [code]audio_underruns[/code], [code]audio_frames_mixed[/code], [code]audio_finished[/code], [code]read_errors[/code], [code]seeks[/code], [code]thread_cpu_seconds[/code] (CPU time of the demux thread), [code]serial[/code], [code]eof[/code], [code]state[/code], [code]state_name[/code], [code]last_error[/code].
+				Returns counters: [code]packets_read[/code], [code]bytes_read[/code], [code]video_packets[/code], [code]video_bytes[/code], [code]video_skipped[/code] (before the first keyframe), [code]video_parameter_sets_added[/code], [code]video_queue[/code], [code]video_queue_bytes[/code], [code]audio_packets[/code], [code]audio_frames_out[/code], [code]audio_decode_errors[/code], [code]audio_dropped_frames[/code] (before a seek target), [code]audio_silence_frames[/code], [code]audio_buffered[/code] (seconds), [code]audio_position[/code], [code]audio_underruns[/code], [code]audio_frames_mixed[/code], [code]audio_finished[/code], [code]read_errors[/code], [code]seeks[/code], [code]seek_retries[/code], [code]subtitle_events[/code], [code]subtitle_decode_errors[/code], [code]subtitle_queue[/code], [code]thread_cpu_seconds[/code] (CPU time of the demux thread), [code]serial[/code], [code]eof[/code], [code]state[/code], [code]state_name[/code], [code]last_error[/code].
+			</description>
+		</method>
+		<method name="get_subtitle_header" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the ASS header ([code][Script Info][/code], [code][V4+ Styles][/code], [code][Events][/code] format) of the selected text subtitle track, for libass. Empty for bitmap tracks, and until the demux thread has opened the track's decoder.
+			</description>
+		</method>
+		<method name="get_subtitle_track" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns the selected subtitle track, or -1.
 			</description>
 		</method>
 		<method name="get_subtitle_tracks" qualifiers="const">
 			<return type="Array" />
 			<description>
-				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]language[/code], [code]title[/code], [code]default[/code], [code]forced[/code]. Subtitles are not read yet.
+				Returns one Dictionary per subtitle stream: [code]index[/code], [code]stream_index[/code], [code]codec[/code], [code]text[/code] (decoded to text: SubRip, ASS/SSA, MP4 timed text, WebVTT), [code]bitmap[/code] (PGS, VobSub, DVB, XSUB: passed through), [code]language[/code], [code]title[/code], [code]default[/code], [code]forced[/code].
 			</description>
 		</method>
 		<method name="get_video_info" qualifiers="const">
 			<return type="Dictionary" />
 			<description>
 				Returns the video stream: [code]codec[/code] ("h264", "hevc", "vp9", "av1" or FFmpeg's name), [code]is_h264[/code], [code]is_hevc[/code], [code]is_vp9[/code], [code]is_av1[/code], [code]width[/code], [code]height[/code] (the cropped picture size, before any pixel aspect; the exact visible rectangle comes from [method HWVideoTexture.get_visible_rect]), [code]sample_aspect_ratio[/code] (pixel aspect, 1 if square or unknown), [code]display_aspect[/code], [code]fps[/code], [code]bit_depth[/code], [code]profile[/code], [code]pixel_format[/code], [code]hw_decodable[/code] (H.264 or HEVC, 8-bit), [code]annexb_filter[/code], and from the SPS [code]coded_width[/code], [code]coded_height[/code], [code]display_width[/code], [code]display_height[/code], [code]chroma_format[/code]. Empty if there is no video.
+			</description>
+		</method>
+		<method name="read_subtitle_event">
+			<return type="Dictionary" />
+			<description>
+				Takes the next event of the selected subtitle track: [code]start[/code] and [code]end[/code] (media seconds; [code]end[/code] is -1 when unknown, as for most bitmap tracks, where the next event ends it), [code]text[/code] (plain text, lines separated by [code]\n[/code], ASS override tags removed), [code]ass[/code] (FFmpeg's ASS event line(s): ReadOrder, Layer, Style, Name, margins, Effect, Text), [code]bitmap[/code], [code]data[/code] (bitmap tracks: the raw packet), [code]serial[/code]. Returns an empty Dictionary when none is queued. Events come in file order, about the queue length ahead of the playback position; keep them until their time. At most 512 are queued (the oldest are dropped).
+			</description>
+		</method>
+		<method name="select_subtitle_track">
+			<return type="int" enum="Error" />
+			<param index="0" name="track" type="int" />
+			<description>
+				Selects a subtitle track (-1: none). This doesn't seek: events whose packets were read before (up to the queue length ahead of the playback position) aren't delivered. An event that started before a seek target isn't delivered after the seek either, unless its packet lies after the keyframe the seek lands on.
 			</description>
 		</method>
 		<method name="is_eof" qualifiers="const">
@@ -148,14 +174,14 @@
 		<method name="read_video_packet">
 			<return type="Dictionary" />
 			<description>
-				For scripts and tests: takes the next video access unit from the queue and returns [code]data[/code] (a copy), [code]pts[/code], [code]dts[/code], [code]keyframe[/code], [code]serial[/code], [code]sps_width[/code], [code]sps_height[/code] (coded size of an SPS in it, or 0). Returns an empty Dictionary if none is queued yet. Don't use it while a [V4L2Decoder] reads the same source.
+				For scripts and tests: takes the next video access unit from the queue and returns [code]data[/code] (a copy), [code]pts[/code], [code]dts[/code], [code]keyframe[/code], [code]serial[/code], [code]sps_width[/code], [code]sps_height[/code] (coded size of an SPS in it, or 0), [code]nal_type[/code] and [code]random_access[/code] (for keyframes and the first access unit after a seek: the first picture NAL unit type, and "idr", "cra", "bla" or "i" for an H.264 non-IDR I picture; -1 and "" otherwise). Returns an empty Dictionary if none is queued yet. Don't use it while a [V4L2Decoder] reads the same source.
 			</description>
 		</method>
 		<method name="seek">
 			<return type="int" />
 			<param index="0" name="seconds" type="float" />
 			<description>
-				Drops everything queued and reads again from the keyframe at or before [param seconds]. Decoded audio before the target is dropped (and a short gap filled with silence), so the audio clock restarts exactly at the target. A [HWVideoTexture] playing this source notices the new serial, drops its stale frames and shows the frame at the target. Returns the new serial. Any thread.
+				Drops everything queued and reads again from the keyframe at or before [param seconds]. Containers without a keyframe index (MPEG-TS) are seeked by timestamp: when the first keyframe found is after the target, the file is seeked again 2, 4, 8... s earlier (up to 6 times; [code]seek_retries[/code] in [method get_stats]), with the audio read meanwhile held back. Decoded audio before the target is dropped (and a short gap filled with silence), so the audio clock restarts exactly at the target. A [HWVideoTexture] playing this source notices the new serial, drops its stale frames and shows the frame at the target. Returns the new serial. Any thread.
 			</description>
 		</method>
 		<method name="select_audio_track">

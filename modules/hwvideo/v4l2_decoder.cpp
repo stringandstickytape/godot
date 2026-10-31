@@ -532,14 +532,41 @@ bool V4L2Decoder::_hold_source_packet() {
 			serial = held.serial;
 			media_index = 0;
 			_begin_epoch(serial, 0);
-			_log_verbose(vformat("serial %d: first access unit at %.3f s%s.", serial, held.pts, held.keyframe ? " (keyframe)" : ""));
+			// Only mid-session: a session starts with a clean decoder anyway.
+			eos_pending = seek_eos != SEEK_EOS_OFF && seq > seq_at_open;
+			static const char *nal_names_h264[] = { "?", "I (non-IDR)", "?", "?", "?", "IDR" };
+			String nal = "?";
+			if (held.nal_type >= 0) {
+				if (codec == AnnexBSplitter::CODEC_H264) {
+					nal = held.nal_type <= 5 ? String(nal_names_h264[held.nal_type]) : itos(held.nal_type);
+				} else {
+					nal = held.nal_type == 19 || held.nal_type == 20 ? "IDR" : held.nal_type == 21 ? "CRA" : (held.nal_type >= 16 && held.nal_type <= 18) ? "BLA" : itos(held.nal_type);
+				}
+			}
+			_log(vformat("seek (serial %d): first access unit at %.3f s, %s%s, %s.", serial, held.pts, held.keyframe ? "keyframe " : "", nal,
+					held.sps_width ? " with SPS" : "", eos_pending ? (seek_eos == SEEK_EOS_PREPEND ? "end-of-sequence NAL unit in front" : "end-of-sequence NAL unit in its own buffer") : "no end-of-sequence NAL unit"));
 		}
 		return true;
 	}
 }
 
 // Source mode: copies `held` into OUTPUT buffer p_index and queues it, with its PTS kept for the frame it decodes to.
+// With a pending end-of-sequence NAL unit (seek_eos), that goes in front, or alone into this buffer (`held` stays).
 int V4L2Decoder::_queue_source_packet(uint32_t p_index) {
+	static const uint8_t h264_eos[] = { 0, 0, 0, 1, 0x0a }; // nal_unit_type 10, end of sequence.
+	static const uint8_t hevc_eos[] = { 0, 0, 0, 1, 0x48, 0x01 }; // nal_unit_type 36 (EOS_NUT), layer 0, TemporalId 0.
+	const uint8_t *eos = codec == AnnexBSplitter::CODEC_H264 ? h264_eos : hevc_eos;
+	const uint32_t eos_size = codec == AnnexBSplitter::CODEC_H264 ? sizeof(h264_eos) : sizeof(hevc_eos);
+	if (eos_pending && seek_eos == SEEK_EOS_SEPARATE) {
+		eos_pending = false;
+		memcpy(output[p_index].map, eos, eos_size);
+		queue_pts[seq % QUEUE_RING] = held.pts;
+		wstats.eos_inserted++;
+		return _qbuf_output(p_index, eos_size);
+	}
+	const uint32_t prefix = eos_pending ? eos_size : 0;
+	eos_pending = false;
+
 	RecentAU &recent_au = recent[recent_count % RECENT_AUS];
 	recent_au.au = AnnexBSplitter::AccessUnit();
 	recent_au.au.size = held.size;
@@ -557,13 +584,17 @@ int V4L2Decoder::_queue_source_packet(uint32_t p_index) {
 		last_sps_size = Size2i(held.sps_width, held.sps_height);
 	}
 	int r = 0;
-	if (held.size > output[p_index].length) {
+	if (held.size + prefix > output[p_index].length) {
 		_log(vformat("access unit at %.3f s (%d bytes) doesn't fit an OUTPUT buffer (%d bytes); skipped. Set output_buffer_size.", held.pts, held.size, output[p_index].length));
 		wstats.aus_skipped++;
 	} else {
-		memcpy(output[p_index].map, held.data, held.size);
+		if (prefix) {
+			memcpy(output[p_index].map, eos, prefix);
+			wstats.eos_inserted++;
+		}
+		memcpy((uint8_t *)output[p_index].map + prefix, held.data, held.size);
 		queue_pts[seq % QUEUE_RING] = held.pts;
-		r = _qbuf_output(p_index, held.size);
+		r = _qbuf_output(p_index, held.size + prefix);
 	}
 	source->release_video_packet(held);
 	have_held = false;
@@ -1398,6 +1429,7 @@ Error V4L2Decoder::_start_worker() {
 	epochs.clear();
 	_begin_epoch(serial, 0);
 	have_held = false;
+	eos_pending = false;
 	input_time = 0.0;
 	last_sps_size = Size2i(stream_sps.width, stream_sps.height);
 	frames_ready.clear();
@@ -1555,6 +1587,7 @@ Dictionary V4L2Decoder::get_stats() const {
 	d["output_errors"] = stats.output_errors;
 	d["source_changes"] = stats.source_changes;
 	d["loops"] = stats.loops;
+	d["eos_inserted"] = stats.eos_inserted;
 	d["reconfig_in_place"] = stats.reconfig_in_place;
 	d["reconfig_restart"] = stats.reconfig_restart;
 	d["restarts"] = stats.restarts;
@@ -1688,6 +1721,10 @@ void V4L2Decoder::set_verbose(bool p_verbose) {
 	verbose = p_verbose;
 }
 
+void V4L2Decoder::set_seek_eos(SeekEOS p_mode) {
+	seek_eos = p_mode; // Read by the worker at the next seek.
+}
+
 V4L2Decoder::~V4L2Decoder() {
 	close();
 }
@@ -1728,6 +1765,8 @@ void V4L2Decoder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_loop"), &V4L2Decoder::get_loop);
 	ClassDB::bind_method(D_METHOD("set_verbose", "verbose"), &V4L2Decoder::set_verbose);
 	ClassDB::bind_method(D_METHOD("is_verbose"), &V4L2Decoder::is_verbose);
+	ClassDB::bind_method(D_METHOD("set_seek_eos", "mode"), &V4L2Decoder::set_seek_eos);
+	ClassDB::bind_method(D_METHOD("get_seek_eos"), &V4L2Decoder::get_seek_eos);
 
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "device_path"), "set_device_path", "get_device_path");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "capture_format"), "set_capture_format", "get_capture_format");
@@ -1739,6 +1778,7 @@ void V4L2Decoder::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "timeout_ms"), "set_timeout_ms", "get_timeout_ms");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "loop"), "set_loop", "get_loop");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "verbose"), "set_verbose", "is_verbose");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "seek_eos", PROPERTY_HINT_ENUM, "Off,Prepend,Separate"), "set_seek_eos", "get_seek_eos");
 
 	BIND_ENUM_CONSTANT(STATE_CLOSED);
 	BIND_ENUM_CONSTANT(STATE_STARTING);
@@ -1746,4 +1786,8 @@ void V4L2Decoder::_bind_methods() {
 	BIND_ENUM_CONSTANT(STATE_RECONFIGURING);
 	BIND_ENUM_CONSTANT(STATE_ENDED);
 	BIND_ENUM_CONSTANT(STATE_ERROR);
+
+	BIND_ENUM_CONSTANT(SEEK_EOS_OFF);
+	BIND_ENUM_CONSTANT(SEEK_EOS_PREPEND);
+	BIND_ENUM_CONSTANT(SEEK_EOS_SEPARATE);
 }

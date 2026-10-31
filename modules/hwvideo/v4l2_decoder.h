@@ -53,6 +53,18 @@ class V4L2Decoder : public RefCounted {
 	GDCLASS(V4L2Decoder, RefCounted);
 
 public:
+	// What goes into the bitstream in front of the first access unit after a seek on a MediaSource (not at a session
+	// start): an end-of-sequence NAL unit (H.264: end of sequence, type 10; HEVC: EOS_NUT, type 36), so the decoder
+	// treats the keyframe as a random access point. That matters for open GOPs: after an HEVC CRA or an H.264
+	// recovery-point I picture, the leading pictures reference pictures from before the seek; after EOS the decoder
+	// drops them (HEVC: NoRaslOutputFlag) instead of decoding them from the wrong references. It also makes the decoder
+	// output the pictures still held for reordering.
+	enum SeekEOS {
+		SEEK_EOS_OFF,
+		SEEK_EOS_PREPEND, // In the same OUTPUT buffer, before the access unit.
+		SEEK_EOS_SEPARATE, // In an OUTPUT buffer of its own.
+	};
+
 	enum State {
 		STATE_CLOSED,
 		STATE_STARTING, // Device open and fed, waiting for the first SOURCE_CHANGE.
@@ -131,6 +143,7 @@ private:
 		uint64_t output_errors = 0;
 		uint64_t source_changes = 0;
 		uint64_t loops = 0;
+		uint64_t eos_inserted = 0;
 		uint32_t reconfig_in_place = 0;
 		uint32_t reconfig_restart = 0;
 		uint32_t restarts = 0;
@@ -157,6 +170,7 @@ private:
 	int timeout_ms = 5000;
 	bool loop = false;
 	bool verbose = false;
+	SeekEOS seek_eos = SEEK_EOS_PREPEND;
 
 	// The stream, read-only while the worker runs. With a MediaSource (source valid) there is no file mapping: access
 	// units are popped from the source, and their PTS become the frame times.
@@ -230,6 +244,7 @@ private:
 	bool have_held = false;
 	double input_time = 0.0;
 	double epoch_start_pts = 0.0; // Source mode: PTS of the first access unit of the current epoch.
+	bool eos_pending = false; // Source mode: put an end-of-sequence NAL unit before the next access unit (seek_eos).
 	Size2i last_sps_size;
 	double t_reconfig_start = 0.0;
 	double t_last_seen = 0.0;
@@ -342,8 +357,11 @@ public:
 	bool get_loop() const { return loop; }
 	void set_verbose(bool p_verbose);
 	bool is_verbose() const { return verbose; }
+	void set_seek_eos(SeekEOS p_mode);
+	SeekEOS get_seek_eos() const { return seek_eos; }
 
 	~V4L2Decoder();
 };
 
 VARIANT_ENUM_CAST(V4L2Decoder::State);
+VARIANT_ENUM_CAST(V4L2Decoder::SeekEOS);
