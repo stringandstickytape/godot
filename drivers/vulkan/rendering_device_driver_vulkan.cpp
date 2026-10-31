@@ -3116,6 +3116,14 @@ void RenderingDeviceDriverVulkan::_command_texture_external_transfer(CommandBuff
 	vkCmdPipelineBarrier(command_buffer->vk_command_buffer, src_stages, dst_stages, 0, 0, nullptr, 0, nullptr, 1, &vk_image_barrier);
 }
 
+VkCommandBuffer RenderingDeviceDriverVulkan::command_buffer_get_vk(CommandBufferID p_cmd_buffer) {
+	return ((const CommandBufferInfo *)p_cmd_buffer.id)->vk_command_buffer;
+}
+
+uint32_t RenderingDeviceDriverVulkan::command_buffer_get_queue_family(CommandBufferID p_cmd_buffer) {
+	return ((const CommandBufferInfo *)p_cmd_buffer.id)->queue_family_index;
+}
+
 void RenderingDeviceDriverVulkan::command_texture_external_acquire(CommandBufferID p_cmd_buffer, TextureID p_texture) {
 	_command_texture_external_transfer(p_cmd_buffer, p_texture, true);
 }

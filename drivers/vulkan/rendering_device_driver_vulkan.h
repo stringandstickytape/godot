@@ -217,6 +217,10 @@ public:
 	// For engine code that creates Vulkan objects directly and hands them to texture_create_from_extension().
 	bool is_device_extension_enabled(const CharString &p_extension_name) const { return enabled_device_extension_names.has(p_extension_name); }
 	bool is_sampler_ycbcr_conversion_enabled() const { return sampler_ycbcr_conversion_support; }
+	// For engine code that records its own Vulkan commands in a RenderingDevice::driver_callback_add() callback: the command
+	// buffer it is given, and the queue family that command buffer is submitted to.
+	static VkCommandBuffer command_buffer_get_vk(CommandBufferID p_cmd_buffer);
+	static uint32_t command_buffer_get_queue_family(CommandBufferID p_cmd_buffer);
 
 private:
 	/****************/
