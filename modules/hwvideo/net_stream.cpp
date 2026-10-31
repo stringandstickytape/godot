@@ -259,14 +259,23 @@ bool NetStream::_stop_requested() const {
 /* HTTP */
 
 // The CAs HTTPS is checked against: the project's bundle override, else the system's, else Godot's default. Loaded
-// once (Godot itself loads its default only when it starts a game, not for --script runs).
+// once (Godot itself loads its default only when it starts a game, not for --script runs); released by
+// NetStream::release_static() when the module unloads, before Godot checks for leaked objects.
+static BinaryMutex trusted_mutex;
+static Ref<X509Certificate> trusted_chain;
+static bool trusted_loaded = false;
+
+void NetStream::release_static() {
+	MutexLock lock(trusted_mutex);
+	trusted_chain.unref();
+	trusted_loaded = false;
+}
+
 static Ref<X509Certificate> trusted_cas() {
-	static BinaryMutex mutex;
-	static Ref<X509Certificate> cas;
-	static bool loaded = false;
-	MutexLock lock(mutex);
-	if (!loaded) {
-		loaded = true;
+	MutexLock lock(trusted_mutex);
+	Ref<X509Certificate> &cas = trusted_chain;
+	if (!trusted_loaded) {
+		trusted_loaded = true;
 		const String override_path = GLOBAL_GET("network/tls/certificate_bundle_override");
 		Ref<X509Certificate> chain = Ref<X509Certificate>(X509Certificate::create());
 		if (chain.is_valid()) {

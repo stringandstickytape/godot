@@ -351,6 +351,9 @@ bool MediaSource::_needs_input_locked() const {
 	if (video_count + 4 >= VIDEO_QUEUE_MAX || video_queued_bytes >= VIDEO_QUEUE_MAX_BYTES || audio_fifo_count + 1 >= AUDIO_FIFO_MAX || audio_fifo_bytes >= AUDIO_FIFO_MAX_BYTES) {
 		return false;
 	}
+	if (demux_trick > 0.0) {
+		return video_count < TRICK_QUEUE; // Keyframes only, no audio.
+	}
 	const uint32_t target = current_subtitle_stream >= 0 ? MAX(video_queue_target, subtitle_video_target) : video_queue_target;
 	const bool video_enough = video.stream_index < 0 || video_count >= target;
 	bool audio_enough = true;
@@ -365,6 +368,11 @@ bool MediaSource::_needs_input_locked() const {
 
 void MediaSource::_apply_discard() {
 	for (unsigned i = 0; i < format->nb_streams; i++) {
+		if (demux_trick > 0.0) {
+			// Trick play: the video's keyframes only (demuxers that know skip the rest without reading it).
+			format->streams[i]->discard = (int)i == video.stream_index ? AVDISCARD_NONKEY : AVDISCARD_ALL;
+			continue;
+		}
 		const bool used = (int)i == video.stream_index || (int)i == current_audio_stream || (int)i == current_subtitle_stream;
 		format->streams[i]->discard = used ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
 	}
@@ -1160,6 +1168,20 @@ void MediaSource::_deliver_video(AVPacket *p_packet) {
 		need_keyframe = false;
 		seek_wanted = -1.0;
 	}
+	if (demux_trick > 0.0) {
+		// Trick play: keyframes only, at most one per TRICK_WALL_INTERVAL of wall time at this speed. With an index the
+		// next one is reached by a jump (_trick_step, after this packet); without (MPEG-TS) by reading on.
+		if (!out.keyframe || (trick_next_pts >= 0.0 && out.pts < trick_next_pts)) {
+			dstats.video_skipped++;
+			_packet_put(p_packet);
+			return;
+		}
+		trick_next_pts = out.pts + demux_trick * TRICK_WALL_INTERVAL;
+		const AVStream *stream = format->streams[index];
+		if (format_name != "mpegts" && avformat_index_get_entries_count(stream) > 1) {
+			trick_step_to = trick_next_pts;
+		}
+	}
 
 	if (_is_annexb_codec() && (out.keyframe || need_parameter_sets)) {
 		const bool hevc = video.codec == VIDEO_CODEC_HEVC;
@@ -1203,6 +1225,9 @@ void MediaSource::_deliver_video(AVPacket *p_packet) {
 		}
 	}
 	need_parameter_sets = false;
+	if (letterbox_wanted.is_set() && out.keyframe && (out.pts >= letterbox_next_pts || out.pts < letterbox_last_pts - 1.0)) {
+		_letterbox_offer(p_packet, out.pts); // The second case: a seek back.
+	}
 
 	out.packet = p_packet;
 	out.data = p_packet->data;
@@ -1291,6 +1316,8 @@ bool MediaSource::_read_packet() {
 	dstats.bytes_read += (uint64_t)read_packet->size;
 	if (read_packet->stream_index == video.stream_index) {
 		_handle_video_packet();
+	} else if (demux_trick > 0.0) {
+		// Trick play: no audio or subtitles (most demuxers drop them already, AVDISCARD_ALL).
 	} else if (read_packet->stream_index == current_audio_stream) {
 		dstats.audio_packets++;
 		if (scratch_frames > 0 || audio_fifo_count > 0 || _holding_audio()) {
@@ -1312,7 +1339,29 @@ bool MediaSource::_read_packet() {
 		pending_reseek = -1.0;
 		_seek_file(position);
 	}
+	if (trick_step_to >= 0.0) {
+		const double to = trick_step_to;
+		trick_step_to = -1.0;
+		_trick_step(to);
+	}
 	return true;
+}
+
+// Trick play with an index: jump to the first keyframe at or after p_to, so what lies between isn't read. Past the last
+// keyframe: the end.
+void MediaSource::_trick_step(double p_to) {
+	const int stream = video.stream_index;
+	const double seconds_per_tick = av_q2d(format->streams[stream]->time_base);
+	const int64_t ts = (int64_t)Math::round((p_to + start_time) / seconds_per_tick);
+	if (avformat_seek_file(format, stream, ts, ts, INT64_MAX, 0) < 0) {
+		eof_reached = true;
+		return;
+	}
+	if (bsf) {
+		av_bsf_flush(bsf);
+	}
+	need_parameter_sets = true; // A keyframe that isn't an IDR gets the parameter sets put in front.
+	dstats.trick_steps++;
 }
 
 // After a seek, audio waits (compressed) until the video's keyframe is found: if the file has to be seeked again further
@@ -1394,14 +1443,20 @@ void MediaSource::_seek_file(double p_position) {
 	pending_reseek = -1.0;
 }
 
-void MediaSource::_do_seek(double p_target) {
+void MediaSource::_do_seek(double p_target, double p_trick) {
+	if (p_trick != demux_trick) {
+		demux_trick = p_trick;
+		_apply_discard();
+	}
+	trick_next_pts = -1.0;
+	trick_step_to = -1.0;
 	seek_wanted = p_target;
 	seek_retries = 0;
 	_seek_file(p_target);
 	audio_trim_until = p_target;
 	audio_next_time = p_target;
 	next_video_pts = p_target;
-	if (current_audio_stream < 0) {
+	if (current_audio_stream < 0 || demux_trick > 0.0) {
 		MutexLock audio_lock(audio_mutex);
 		audio_eof = true;
 	}
@@ -1411,6 +1466,7 @@ void MediaSource::_thread_loop() {
 	for (;;) {
 		bool do_seek = false;
 		double target = 0.0;
+		double trick = 0.0;
 		int track;
 		int sub_track;
 		bool dsp_changed = false;
@@ -1430,6 +1486,7 @@ void MediaSource::_thread_loop() {
 				do_seek = true;
 				seek_pending = false;
 				target = seek_target;
+				trick = trick_speed;
 				demux_serial = serial;
 			}
 			track = audio_track;
@@ -1447,7 +1504,7 @@ void MediaSource::_thread_loop() {
 			_open_subtitle_track(sub_track);
 		}
 		if (do_seek) {
-			_do_seek(target);
+			_do_seek(target, trick);
 		}
 
 		bool progress = false;
@@ -1887,6 +1944,7 @@ Error MediaSource::open(const String &p_path) {
 	summary += vformat(", %d subtitle track(s).", subtitle_tracks.size());
 	print_line(summary);
 
+	_letterbox_start();
 	thread.start(&MediaSource::_thread_func, this);
 	return OK;
 }
@@ -1922,6 +1980,14 @@ void MediaSource::_close_internal() {
 			condition.notify_all();
 		}
 		thread.wait_to_finish();
+	}
+	_letterbox_stop(); // After the demux thread: nothing is offered any more.
+	demux_trick = 0.0;
+	trick_next_pts = -1.0;
+	trick_step_to = -1.0;
+	{
+		MutexLock lock(mutex);
+		trick_speed = 0.0;
 	}
 	_close_audio_codec();
 	avcodec_free_context(&subtitle_codec);
@@ -2293,7 +2359,7 @@ int MediaSource::seek(double p_seconds) {
 		marker_count = 0;
 		audio_position = target;
 		audio_serial = serial;
-		audio_eof = audio_track < 0;
+		audio_eof = audio_track < 0 || trick_speed > 0.0; // Trick play has no audio.
 		audio_in_underrun = false;
 		audio_mixed_since_seek = false;
 		live_playing = false;
@@ -2301,6 +2367,25 @@ int MediaSource::seek(double p_seconds) {
 	condition.notify_one();
 	_wake_consumer_locked();
 	return (int)serial;
+}
+
+int MediaSource::trick_play(double p_speed, double p_from) {
+	ERR_FAIL_COND_V_MSG(!is_open(), -1, "MediaSource: not open.");
+	const double speed = p_speed >= TRICK_SPEED_MIN ? MIN(p_speed, TRICK_SPEED_MAX) : 0.0;
+	if (speed > 0.0 && video.stream_index < 0) {
+		_set_error("Trick play needs a video stream.");
+		return (int)get_serial();
+	}
+	{
+		MutexLock lock(mutex);
+		trick_speed = speed; // The demux thread takes it with the seek.
+	}
+	return seek(p_from);
+}
+
+double MediaSource::get_trick_play_speed() const {
+	MutexLock lock(mutex);
+	return trick_speed;
 }
 
 uint32_t MediaSource::get_serial() const {
@@ -2372,6 +2457,8 @@ Dictionary MediaSource::get_stats() const {
 	d["audio_silence_frames"] = stats.audio_silence_frames;
 	d["read_errors"] = stats.read_errors;
 	d["seek_retries"] = stats.seek_retries;
+	d["trick_steps"] = stats.trick_steps;
+	d["trick_play_speed"] = trick_speed;
 	d["subtitle_events"] = stats.subtitle_events;
 	d["subtitle_decode_errors"] = stats.subtitle_decode_errors;
 	d["subtitle_queue"] = subtitle_queue.size();
@@ -2648,6 +2735,8 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("read_subtitle_event"), &MediaSource::read_subtitle_event);
 	ClassDB::bind_method(D_METHOD("get_subtitle_header"), &MediaSource::get_subtitle_header);
 	ClassDB::bind_method(D_METHOD("seek", "seconds"), &MediaSource::seek);
+	ClassDB::bind_method(D_METHOD("trick_play", "speed", "from"), &MediaSource::trick_play);
+	ClassDB::bind_method(D_METHOD("get_trick_play_speed"), &MediaSource::get_trick_play_speed);
 	ClassDB::bind_method(D_METHOD("get_serial"), &MediaSource::get_serial);
 	ClassDB::bind_method(D_METHOD("get_seek_target"), &MediaSource::get_seek_target);
 	ClassDB::bind_method(D_METHOD("get_duration"), &MediaSource::get_duration);
@@ -2702,6 +2791,9 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_night_mode_strength"), &MediaSource::get_night_mode_strength);
 	ClassDB::bind_method(D_METHOD("set_dialogue_boost", "db"), &MediaSource::set_dialogue_boost);
 	ClassDB::bind_method(D_METHOD("get_dialogue_boost"), &MediaSource::get_dialogue_boost);
+	ClassDB::bind_method(D_METHOD("set_letterbox_detection", "enabled"), &MediaSource::set_letterbox_detection);
+	ClassDB::bind_method(D_METHOD("is_letterbox_detection"), &MediaSource::is_letterbox_detection);
+	ClassDB::bind_method(D_METHOD("get_letterbox"), &MediaSource::get_letterbox);
 	ClassDB::bind_method(D_METHOD("set_downmix_normalize", "normalize"), &MediaSource::set_downmix_normalize);
 	ClassDB::bind_method(D_METHOD("is_downmix_normalize"), &MediaSource::is_downmix_normalize);
 	ClassDB::bind_static_method("MediaSource", D_METHOD("set_smb_credentials", "host", "user", "password", "domain"), &MediaSource::set_smb_credentials, DEFVAL(String()));
@@ -2715,6 +2807,7 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "video_queue_seconds"), "set_video_queue_seconds", "get_video_queue_seconds");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "audio_queue_seconds"), "set_audio_queue_seconds", "get_audio_queue_seconds");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "letterbox_detection"), "set_letterbox_detection", "is_letterbox_detection");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_speed", PROPERTY_HINT_RANGE, "0.5,2,0.05"), "set_playback_speed", "get_playback_speed");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "discrete_channels"), "set_discrete_channels", "is_discrete_channels");

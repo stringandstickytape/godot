@@ -225,7 +225,8 @@ private:
 		uint64_t bytes_read = 0;
 		uint64_t video_packets = 0;
 		uint64_t video_bytes = 0;
-		uint64_t video_skipped = 0; // Before the first keyframe after open/seek.
+		uint64_t video_skipped = 0; // Before the first keyframe after open/seek, and in trick play all but keyframes.
+		uint64_t trick_steps = 0; // Trick play: jumps through the index to the next keyframe due.
 		uint64_t video_parameter_sets_added = 0;
 		uint64_t audio_packets = 0;
 		uint64_t audio_frames_out = 0; // Resampled frames written to the ring.
@@ -253,6 +254,11 @@ private:
 	static constexpr uint64_t AUDIO_FIFO_MAX_BYTES = 32ull << 20;
 	static constexpr double AUDIO_RING_SECONDS = 4.0;
 	static constexpr double LIVE_LATENCY_MAX = 2.5; // The pre-roll plus a margin must fit the audio ring.
+	// Trick play: keyframes at most this often in wall time (so at speed S, S x this apart in media time).
+	static constexpr double TRICK_SPEED_MIN = 2.0;
+	static constexpr double TRICK_SPEED_MAX = 64.0;
+	static constexpr double TRICK_WALL_INTERVAL = 0.25;
+	static constexpr uint32_t TRICK_QUEUE = 4; // Keyframes queued ahead.
 	static constexpr uint32_t SUBTITLE_QUEUE_MAX = 512;
 	static constexpr int SEEK_RETRIES_MAX = 6;
 	static constexpr uint32_t BITRATE_SECONDS = 128; // Seconds of video bytes kept (behind and ahead of the read position).
@@ -359,6 +365,7 @@ private:
 	bool audio_eof = false;
 	bool audio_in_underrun = false;
 	bool audio_mixed_since_seek = false; // An empty ring before the first frame after open/seek is a wait, not an underrun.
+	double trick_speed = 0.0; // Under mutex: trick play (keyframes only) at this speed; 0: normal playback.
 	// Live: the mixer holds (silence, the clock stands) until this much audio is buffered, at the start and after an
 	// underrun, so live_latency of network jitter is absorbed. 0: not live.
 	uint64_t live_preroll_frames = 0;
@@ -418,6 +425,11 @@ private:
 	LocalVector<uint8_t> inband_parameter_sets; // The latest in-band VPS/SPS/PPS.
 	LocalVector<uint8_t> scan_parameter_sets;
 	double next_video_pts = 0.0;
+	double demux_trick = 0.0; // Trick play speed as the thread applies it (0: off).
+	double trick_next_pts = -1.0; // Trick play: the next keyframe to queue is the first at or after this.
+	double trick_step_to = -1.0; // Trick play: after this packet, jump through the index to the keyframe at or after this.
+	double letterbox_next_pts = -1.0; // Offer the letterbox thread the first keyframe at or after this...
+	double letterbox_last_pts = -1.0; // ...or one before the last offered (a seek back).
 	bool hdr_sei_pending = false; // open(): HDR video without full metadata in the container; read the first keyframe's SEI.
 	double audio_trim_until = -1.0;
 	double audio_next_time = -1.0;
@@ -434,6 +446,42 @@ private:
 	uint32_t scratch_offset = 0;
 	double scratch_time = 0.0;
 	uint32_t scratch_serial = 0;
+
+	// Letterbox detection (#42): a few keyframes, decoded in software on a low-priority thread of their own, scanned for
+	// black bars (media_source_letterbox.cpp).
+	static constexpr double LETTERBOX_INTERVAL = 4.0; // Media seconds between the keyframes scanned.
+	static constexpr uint32_t LETTERBOX_KNOWN = 3; // Frames with a picture before a result is given...
+	static constexpr uint32_t LETTERBOX_FRAMES = 6; // ...and after which it is final.
+	static constexpr uint32_t LETTERBOX_TRIES = 40; // Keyframes decoded at most (dark ones count too)...
+	static constexpr uint32_t LETTERBOX_SLOW_AFTER = 16; // ...after this many, LETTERBOX_SLOW_INTERVAL apart (dark openings).
+	static constexpr double LETTERBOX_SLOW_INTERVAL = 15.0;
+	bool letterbox_detection = false;
+	SafeFlag letterbox_wanted; // The thread waits for a keyframe: the demux thread offers the next one due.
+	struct Letterbox {
+		mutable BinaryMutex mutex;
+		ConditionVariable condition;
+		Thread thread;
+		bool exit = false;
+		AVCodecContext *codec = nullptr; // Made by open(), used by the thread only, freed by close().
+		AVFrame *frame = nullptr;
+		AVPacket *offered = nullptr; // Parameter sets + the keyframe, for the thread (which frees it).
+		double offered_pts = 0.0;
+		LocalVector<Rect2i> frames; // The picture's rectangle in each frame scanned that wasn't (nearly) black.
+		LocalVector<double> frame_times;
+		Size2i frame_size;
+		uint32_t scanned = 0;
+		uint32_t dark = 0;
+		bool done = false;
+		double cpu_seconds = 0.0;
+		double decode_seconds_max = 0.0; // The slowest keyframe (decode and scan, wall time).
+		Rect2i rect; // Combined, once frames.size() >= LETTERBOX_KNOWN.
+		String error;
+	} letterbox;
+	void _letterbox_start();
+	void _letterbox_stop();
+	void _letterbox_offer(const AVPacket *p_packet, double p_pts);
+	void _letterbox_loop();
+	static void _letterbox_thread_func(void *p_userdata);
 
 	static String _av_error(int p_error);
 	static bool _scan_access_unit(const uint8_t *p_data, uint64_t p_size, bool p_hevc, AnnexBSplitter::SPSInfo &r_sps, LocalVector<uint8_t> *r_parameter_sets, int *r_nal_type = nullptr);
@@ -496,7 +544,8 @@ private:
 	void _handle_video_packet();
 	bool _read_packet();
 	void _drain_at_eof();
-	void _do_seek(double p_target);
+	void _do_seek(double p_target, double p_trick);
+	void _trick_step(double p_to);
 	void _thread_loop();
 	static void _thread_func(void *p_userdata);
 	void _close_internal();
@@ -569,6 +618,11 @@ public:
 	// Any thread. Drops everything queued and reads again from the keyframe at or before p_seconds; decoded audio before
 	// p_seconds is dropped. Returns the new serial.
 	int seek(double p_seconds);
+	// Trick play: p_speed 2 to 64 shows keyframes only, forwards, from the keyframe at or before p_from (no audio; a
+	// HWVideoTexture then runs its clock at p_speed). Below 2: normal playback again from p_from. A seek either way;
+	// returns the new serial. seek() keeps the mode.
+	int trick_play(double p_speed, double p_from);
+	double get_trick_play_speed() const;
 	uint32_t get_serial() const;
 	double get_seek_target() const;
 
@@ -650,6 +704,11 @@ public:
 	Array get_audio_channels() const;
 	// AudioStreamPlaybackMedia of a channel stream: p_channel 0-7, as mono (left = right).
 	void mix_audio_channel(AudioFrame *p_buffer, int p_frames, int p_channel);
+
+	// Letterbox detection (set before open()): black bars found in a few keyframes; get_letterbox() says where the picture is.
+	void set_letterbox_detection(bool p_enabled) { letterbox_detection = p_enabled; }
+	bool is_letterbox_detection() const { return letterbox_detection; }
+	Dictionary get_letterbox() const;
 
 	void set_downmix_normalize(bool p_normalize);
 	bool is_downmix_normalize() const { return downmix_normalize; }

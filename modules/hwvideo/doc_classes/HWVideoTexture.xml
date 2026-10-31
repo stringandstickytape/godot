@@ -172,7 +172,7 @@
 			<param index="0" name="delta" type="float" />
 			<param index="1" name="master_clock" type="float" default="-1.0" />
 			<description>
-				While playing, advances the clock by [param delta], or sets it to [param master_clock] if that is 0 or more (for example the audio position). Then shows the newest decoded frame whose time is at or before the clock and drops the older ones.
+				While playing, advances the clock by [param delta], or sets it to [param master_clock] if that is 0 or more (for example the audio position). During [method MediaSource.trick_play] it advances by [param delta] times the trick speed and ignores [param master_clock]. Then shows the newest decoded frame whose time is at or before the clock and drops the older ones.
 			</description>
 		</method>
 	</methods>

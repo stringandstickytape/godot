@@ -344,7 +344,9 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	}
 	_check_seek();
 	if (playing) {
-		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta * playback_speed;
+		// Trick play (keyframes only, no audio): the source sets the pace.
+		const double trick = source.is_valid() ? source->get_trick_play_speed() : 0.0;
+		clock = trick > 0.0 ? clock + p_delta * trick : (p_master_clock >= 0.0 ? p_master_clock : clock + p_delta * playback_speed);
 	}
 	decoder->set_clock(clock);
 
@@ -532,7 +534,9 @@ void HWVideoTexture::_update_software(double p_delta, double p_master_clock) {
 		software->return_all_ready();
 	}
 	if (playing) {
-		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta * playback_speed;
+		// Trick play (keyframes only, no audio): the source sets the pace.
+		const double trick = source.is_valid() ? source->get_trick_play_speed() : 0.0;
+		clock = trick > 0.0 ? clock + p_delta * trick : (p_master_clock >= 0.0 ? p_master_clock : clock + p_delta * playback_speed);
 	}
 
 	RenderingDevice *rd = RenderingDevice::get_singleton();

@@ -79,6 +79,7 @@ public:
 	};
 
 	static bool is_url(const String &p_path);
+	static void release_static(); // Module unload: drops the cached CA chain.
 	static Url parse(const String &p_url);
 
 	NetStream();

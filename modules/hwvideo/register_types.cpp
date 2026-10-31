@@ -35,6 +35,7 @@
 #include "hw_video_texture.h"
 #include "media_browser.h"
 #include "media_source.h"
+#include "net_stream.h"
 #include "v4l2_decoder.h"
 
 #include "core/object/class_db.h"
@@ -60,6 +61,7 @@ void uninitialize_hwvideo_module(ModuleInitializationLevel p_level) {
 	}
 
 	SmbCredentials::clear();
+	NetStream::release_static();
 
 	// Forget images still waiting to be destroyed: the RenderingDevice outlives the modules.
 	DmabufImage::flush_pending_frees();
