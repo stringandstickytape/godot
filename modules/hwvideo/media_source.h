@@ -31,6 +31,7 @@
 #pragma once
 
 #include "annexb_splitter.h"
+#include "audio_dynamics.h"
 #include "subtitle_style.h"
 
 #include "core/io/image.h"
@@ -222,6 +223,11 @@ private:
 		uint64_t subtitle_events = 0;
 		uint64_t subtitle_decode_errors = 0;
 		double thread_cpu_seconds = 0.0; // CPU time of the demux thread (CLOCK_THREAD_CPUTIME_ID).
+		bool decoder_drc = false; // AC-3 / E-AC-3: the decoder applies the stream's own DRC in night mode.
+		bool dialogue_boost_applies = false; // The audio has a centre channel beside front left and right.
+		float audio_gain_db = 0.0f; // Night mode: leveller and compressor gain of the last block.
+		float audio_limiter_db = 0.0f; // Limiter reduction in the last buffer (0 or negative).
+		float audio_typical_level_db = 0.0f; // Night mode: the typical level the compressor works from.
 	};
 
 	static constexpr uint32_t VIDEO_QUEUE_MAX = 512;
@@ -281,6 +287,11 @@ private:
 	double seek_target = 0.0;
 	int audio_track = -1;
 	int subtitle_track = -1;
+	// Night mode and dialogue boost: change at any time; the thread picks them up when audio_dsp_serial changes.
+	bool night_mode = false;
+	double night_mode_strength = 1.0;
+	double dialogue_boost = 0.0; // dB on the centre channel before the downmix.
+	uint32_t audio_dsp_serial = 0;
 	LocalVector<SubtitleEvent> subtitle_queue;
 	String subtitle_header;
 	LocalVector<ExternalSubtitle> external_subtitles; // Tracks subtitle_tracks.size() and up.
@@ -340,6 +351,13 @@ private:
 	int swr_in_channels = 0;
 	uint64_t swr_in_mask = 0;
 	String swr_description; // Logged when it changes (not after every seek).
+	double swr_center_level = 0.0; // The centre mix level swr was built with (dialogue boost).
+	// Night mode and dialogue boost as the thread applies them.
+	uint32_t dsp_serial = UINT32_MAX;
+	bool dsp_night_mode = false;
+	float dsp_strength = 1.0f;
+	float dsp_dialogue_boost = 0.0f;
+	AudioDynamics dynamics;
 	int current_audio_track = -1;
 	int current_audio_stream = -1;
 	AVCodecContext *subtitle_codec = nullptr;
@@ -406,6 +424,8 @@ private:
 	void _open_audio_track(int p_track);
 	void _close_audio_codec();
 	bool _configure_swr(const AVFrame *p_frame);
+	void _apply_audio_decoder_settings();
+	void _update_audio_dsp();
 	void _decode_audio(const AVPacket *p_packet);
 	void _audio_fifo_push(AVPacket *p_packet);
 	AVPacket *_audio_fifo_pop();
@@ -548,6 +568,14 @@ public:
 	double get_video_queue_seconds() const { return video_queue_seconds; }
 	void set_audio_queue_seconds(double p_seconds);
 	double get_audio_queue_seconds() const { return audio_queue_seconds; }
+	// Night mode and dialogue boost: any time, also while playing (heard after the audio queue, about 1 s).
+	void set_night_mode(bool p_enabled);
+	bool is_night_mode() const;
+	void set_night_mode_strength(double p_strength);
+	double get_night_mode_strength() const;
+	void set_dialogue_boost(double p_db);
+	double get_dialogue_boost() const;
+
 	void set_downmix_normalize(bool p_normalize);
 	bool is_downmix_normalize() const { return downmix_normalize; }
 	void set_audio_decoder_options(const Dictionary &p_options);

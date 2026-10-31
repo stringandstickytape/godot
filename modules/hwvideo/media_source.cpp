@@ -401,6 +401,8 @@ void MediaSource::_audio_fifo_clear() {
 void MediaSource::_close_audio_codec() {
 	_audio_fifo_clear();
 	avcodec_free_context(&audio_codec);
+	dstats.decoder_drc = false;
+	dstats.dialogue_boost_applies = false;
 	swr_free(&swr);
 	swr_in_format = -1;
 	swr_in_rate = 0;
@@ -442,6 +444,9 @@ void MediaSource::_open_audio_track(int p_track) {
 		}
 		if (problem.is_empty()) {
 			current_audio_stream = index;
+			dstats.decoder_drc = codec->id == AV_CODEC_ID_AC3 || codec->id == AV_CODEC_ID_EAC3;
+			_apply_audio_decoder_settings();
+			dynamics.reset(); // Another track: its typical level is learnt again.
 			print_line(vformat("MediaSource: audio track %d: %s decoder%s.", p_track, codec->name, audio_decoder_options.is_empty() ? String() : vformat(" with options %s", Variant(audio_decoder_options))));
 		} else {
 			// Not fatal: the video plays on, without audio (AudioStreamMedia finishes at once).
@@ -457,10 +462,41 @@ void MediaSource::_open_audio_track(int p_track) {
 	}
 }
 
+// FFmpeg's AC-3 / E-AC-3 decoder clears its whole context when flushed, its options too (drc_scale, heavy_compr,
+// target_level go back to 0): they are set again after open, after every seek, and when night mode changes. Without
+// night mode drc_scale is 0 (the full dynamic range, as mpv plays it); in night mode it is the strength. An app's own
+// "drc_scale" in audio_decoder_options wins.
+void MediaSource::_apply_audio_decoder_settings() {
+	if (audio_codec == nullptr || !dstats.decoder_drc) {
+		return;
+	}
+	for (const KeyValue<Variant, Variant> &kv : audio_decoder_options) {
+		av_opt_set(audio_codec, String(kv.key).utf8().get_data(), String(kv.value).utf8().get_data(), AV_OPT_SEARCH_CHILDREN);
+	}
+	if (!audio_decoder_options.has("drc_scale")) {
+		av_opt_set_double(audio_codec, "drc_scale", dsp_night_mode ? (double)dsp_strength : 0.0, AV_OPT_SEARCH_CHILDREN);
+	}
+}
+
+// Demux thread: night mode or dialogue boost changed.
+void MediaSource::_update_audio_dsp() {
+	_apply_audio_decoder_settings();
+	const bool was_active = dynamics.is_active();
+	dynamics.configure(dsp_night_mode, dsp_strength, dsp_dialogue_boost > 0.0f, output_rate);
+	if (!was_active) {
+		dynamics.reset();
+	}
+	// Dialogue boost: _configure_swr() builds the resampler again with the new centre level at the next frame.
+	print_line(vformat("MediaSource: night mode %s (strength %.2f, decoder DRC %s), dialogue boost %.1f dB.", dsp_night_mode ? "on" : "off", dsp_strength,
+			dstats.decoder_drc ? "yes" : "no", dsp_dialogue_boost));
+}
+
 bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	const int channels = p_frame->ch_layout.nb_channels;
 	const uint64_t mask = p_frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? p_frame->ch_layout.u.mask : 0;
-	if (swr && swr_in_format == p_frame->format && swr_in_rate == p_frame->sample_rate && swr_in_channels == channels && swr_in_mask == mask) {
+	// Downmix to stereo (ITU-R BS.775): centre at -3 dB, plus the dialogue boost.
+	const double center_level = SQRT_HALF * Math::db_to_linear((double)dsp_dialogue_boost);
+	if (swr && swr_in_format == p_frame->format && swr_in_rate == p_frame->sample_rate && swr_in_channels == channels && swr_in_mask == mask && swr_center_level == center_level) {
 		return true;
 	}
 	swr_free(&swr);
@@ -479,7 +515,8 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	if (r >= 0) {
 		// Downmix to stereo (ITU-R BS.775): centre and surrounds at -3 dB, LFE dropped. Not normalised by default (like
 		// mpv), so dialogue keeps its level; downmix_normalize scales the matrix so no sum can exceed full scale.
-		av_opt_set_double(swr, "center_mix_level", SQRT_HALF, 0);
+		// Mono (a centre channel alone) is spread at -3 dB whatever the centre level: the boost needs front left and right.
+		av_opt_set_double(swr, "center_mix_level", center_level, 0);
 		av_opt_set_double(swr, "surround_mix_level", SQRT_HALF, 0);
 		av_opt_set_double(swr, "lfe_mix_level", 0.0, 0);
 		if (downmix_normalize) {
@@ -489,6 +526,8 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	}
 	char in_name[128] = {};
 	av_channel_layout_describe(&in_layout, in_name, sizeof(in_name));
+	dstats.dialogue_boost_applies = av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_CENTER) >= 0 &&
+			av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_LEFT) >= 0 && av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_RIGHT) >= 0;
 	av_channel_layout_uninit(&in_layout);
 	av_channel_layout_uninit(&out_layout);
 	if (r < 0) {
@@ -502,6 +541,7 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	swr_in_rate = p_frame->sample_rate;
 	swr_in_channels = channels;
 	swr_in_mask = mask;
+	swr_center_level = center_level;
 	const String description = vformat("MediaSource: audio %s, %s, %d Hz -> stereo float, %d Hz%s.", av_get_sample_fmt_name((AVSampleFormat)p_frame->format), in_name, p_frame->sample_rate, output_rate,
 			downmix_normalize ? " (normalised downmix)" : "");
 	if (description != swr_description) {
@@ -546,6 +586,12 @@ void MediaSource::_resample_frame(const AVFrame *p_frame) {
 	const int converted = swr_convert(swr, &out, max_out, p_frame ? (const uint8_t **)p_frame->extended_data : nullptr, in_samples);
 	if (converted <= 0) {
 		return;
+	}
+	if (dynamics.is_active()) {
+		dynamics.process((float *)out, (uint32_t)converted, 2);
+		dstats.audio_gain_db = dynamics.get_gain_db();
+		dstats.audio_limiter_db = dynamics.get_limiter_db();
+		dstats.audio_typical_level_db = dynamics.get_typical_level_db();
 	}
 	if (scratch_frames == 0) {
 		scratch_time = time;
@@ -1168,6 +1214,7 @@ void MediaSource::_seek_file(double p_position) {
 	}
 	if (audio_codec) {
 		avcodec_flush_buffers(audio_codec);
+		_apply_audio_decoder_settings(); // The AC-3 decoder's flush cleared them.
 	}
 	if (subtitle_codec) {
 		avcodec_flush_buffers(subtitle_codec);
@@ -1204,10 +1251,18 @@ void MediaSource::_thread_loop() {
 		double target = 0.0;
 		int track;
 		int sub_track;
+		bool dsp_changed = false;
 		{
 			MutexLock lock(mutex);
 			if (exit_requested) {
 				return;
+			}
+			if (audio_dsp_serial != dsp_serial) {
+				dsp_serial = audio_dsp_serial;
+				dsp_night_mode = night_mode;
+				dsp_strength = (float)night_mode_strength;
+				dsp_dialogue_boost = (float)dialogue_boost;
+				dsp_changed = true;
 			}
 			if (seek_pending) {
 				do_seek = true;
@@ -1222,6 +1277,9 @@ void MediaSource::_thread_loop() {
 		}
 		if (track != current_audio_track) {
 			_open_audio_track(track);
+		}
+		if (dsp_changed) {
+			_update_audio_dsp();
 		}
 		if (sub_track != current_subtitle_track) {
 			_open_subtitle_track(sub_track);
@@ -1315,6 +1373,7 @@ Error MediaSource::open(const String &p_path) {
 		}
 	}
 	dstats = Stats();
+	dsp_serial = UINT32_MAX; // Night mode and dialogue boost are applied again by the new thread.
 	path = p_path;
 	const bool network = SmbUrl::is_smb(p_path);
 	const String global_path = network || !ProjectSettings::get_singleton() ? p_path : ProjectSettings::get_singleton()->globalize_path(p_path);
@@ -2065,6 +2124,13 @@ Dictionary MediaSource::get_stats() const {
 		d["audio_frames_mixed"] = audio_frames_mixed;
 		d["audio_finished"] = audio_eof && ring_write == ring_read;
 	}
+	// mutex is still held (since the counters above).
+	d["night_mode"] = night_mode;
+	d["night_mode_decoder_drc"] = stats.decoder_drc;
+	d["dialogue_boost_applies"] = stats.dialogue_boost_applies;
+	d["audio_gain_db"] = stats.audio_gain_db;
+	d["audio_limiter_db"] = stats.audio_limiter_db;
+	d["audio_typical_level_db"] = stats.audio_typical_level_db;
 	return d;
 }
 
@@ -2154,6 +2220,42 @@ void MediaSource::set_audio_queue_seconds(double p_seconds) {
 	audio_queue_seconds = CLAMP(p_seconds, 0.1, AUDIO_RING_SECONDS - 1.0);
 }
 
+void MediaSource::set_night_mode(bool p_enabled) {
+	MutexLock lock(mutex);
+	night_mode = p_enabled;
+	audio_dsp_serial++;
+	condition.notify_one();
+}
+
+bool MediaSource::is_night_mode() const {
+	MutexLock lock(mutex);
+	return night_mode;
+}
+
+void MediaSource::set_night_mode_strength(double p_strength) {
+	MutexLock lock(mutex);
+	night_mode_strength = CLAMP(p_strength, 0.0, 1.0);
+	audio_dsp_serial++;
+	condition.notify_one();
+}
+
+double MediaSource::get_night_mode_strength() const {
+	MutexLock lock(mutex);
+	return night_mode_strength;
+}
+
+void MediaSource::set_dialogue_boost(double p_db) {
+	MutexLock lock(mutex);
+	dialogue_boost = CLAMP(p_db, 0.0, 12.0);
+	audio_dsp_serial++;
+	condition.notify_one();
+}
+
+double MediaSource::get_dialogue_boost() const {
+	MutexLock lock(mutex);
+	return dialogue_boost;
+}
+
 void MediaSource::set_downmix_normalize(bool p_normalize) {
 	SETTING_GUARD();
 	downmix_normalize = p_normalize;
@@ -2237,6 +2339,12 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_video_queue_seconds"), &MediaSource::get_video_queue_seconds);
 	ClassDB::bind_method(D_METHOD("set_audio_queue_seconds", "seconds"), &MediaSource::set_audio_queue_seconds);
 	ClassDB::bind_method(D_METHOD("get_audio_queue_seconds"), &MediaSource::get_audio_queue_seconds);
+	ClassDB::bind_method(D_METHOD("set_night_mode", "enabled"), &MediaSource::set_night_mode);
+	ClassDB::bind_method(D_METHOD("is_night_mode"), &MediaSource::is_night_mode);
+	ClassDB::bind_method(D_METHOD("set_night_mode_strength", "strength"), &MediaSource::set_night_mode_strength);
+	ClassDB::bind_method(D_METHOD("get_night_mode_strength"), &MediaSource::get_night_mode_strength);
+	ClassDB::bind_method(D_METHOD("set_dialogue_boost", "db"), &MediaSource::set_dialogue_boost);
+	ClassDB::bind_method(D_METHOD("get_dialogue_boost"), &MediaSource::get_dialogue_boost);
 	ClassDB::bind_method(D_METHOD("set_downmix_normalize", "normalize"), &MediaSource::set_downmix_normalize);
 	ClassDB::bind_method(D_METHOD("is_downmix_normalize"), &MediaSource::is_downmix_normalize);
 	ClassDB::bind_static_method("MediaSource", D_METHOD("set_smb_credentials", "host", "user", "password", "domain"), &MediaSource::set_smb_credentials, DEFVAL(String()));
@@ -2252,6 +2360,9 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_speed", PROPERTY_HINT_RANGE, "0.5,2,0.05"), "set_playback_speed", "get_playback_speed");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "night_mode"), "set_night_mode", "is_night_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "night_mode_strength", PROPERTY_HINT_RANGE, "0,1,0.05"), "set_night_mode_strength", "get_night_mode_strength");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "dialogue_boost", PROPERTY_HINT_RANGE, "0,12,0.5,suffix:dB"), "set_dialogue_boost", "get_dialogue_boost");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "subtitle_read_ahead", PROPERTY_HINT_RANGE, "0,30,0.1,suffix:s"), "set_subtitle_read_ahead", "get_subtitle_read_ahead");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "network_buffer_size", PROPERTY_HINT_RANGE, "4194304,268435456,1048576,suffix:B"), "set_network_buffer_size", "get_network_buffer_size");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "network_requests", PROPERTY_HINT_RANGE, "1,16,1"), "set_network_requests", "get_network_requests");
