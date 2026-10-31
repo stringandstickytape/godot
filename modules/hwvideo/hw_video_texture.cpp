@@ -981,6 +981,11 @@ Dictionary HWVideoTexture::get_stats() const {
 		// Opening failed, or the software path couldn't take over from a failed hardware session.
 		d["state"] = V4L2Decoder::STATE_ERROR;
 		d["state_name"] = "error";
+	} else if (!software && decoder->is_vp9() && software_fallback && int(d["state"]) == V4L2Decoder::STATE_ERROR) {
+		// A failed VP9 session that the next update() hands to software: not an error for the caller.
+		d["state"] = V4L2Decoder::STATE_RECONFIGURING;
+		d["state_name"] = "reconfiguring";
+		d["switching_to_software"] = true;
 	}
 	d["decode_path"] = get_decode_path();
 	d["decode_path_text"] = get_decode_path_text();
