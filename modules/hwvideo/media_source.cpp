@@ -687,6 +687,9 @@ void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
 			}
 			ring_read += got;
 			audio_frames_mixed += got;
+			if (got > 0) {
+				audio_mixed_since_seek = true;
+			}
 			while (marker_count > 1 && markers[1].frame <= ring_read) {
 				for (uint32_t i = 1; i < marker_count; i++) {
 					markers[i - 1] = markers[i];
@@ -699,7 +702,11 @@ void MediaSource::mix_audio(AudioFrame *p_buffer, int p_frames) {
 		}
 		if (got < (uint32_t)p_frames && !audio_eof) {
 			if (!audio_in_underrun) {
-				audio_underruns++;
+				if (audio_mixed_since_seek) {
+					audio_underruns++;
+				} else {
+					audio_seek_waits++;
+				}
 				audio_in_underrun = true;
 			}
 		} else {
@@ -1234,7 +1241,7 @@ Error MediaSource::open(const String &p_path) {
 		// Blocking: connect, log in, open (up to about 8 s each when the host doesn't answer).
 		String error;
 		smb_file = memnew(SmbFile);
-		if (smb_file->open(p_path, (uint64_t)network_buffer_size, error) != OK) {
+		if (smb_file->open(p_path, (uint64_t)network_buffer_size, (uint32_t)network_requests, error) != OK) {
 			_close_network();
 			_set_error(error);
 			return ERR_FILE_CANT_OPEN;
@@ -1400,7 +1407,9 @@ Error MediaSource::open(const String &p_path) {
 		audio_serial = 0;
 		audio_eof = false;
 		audio_in_underrun = false;
+		audio_mixed_since_seek = false;
 		audio_underruns = 0;
+		audio_seek_waits = 0;
 		audio_frames_mixed = 0;
 	}
 	read_packet = av_packet_alloc();
@@ -1723,6 +1732,7 @@ int MediaSource::seek(double p_seconds) {
 		audio_serial = serial;
 		audio_eof = audio_track < 0;
 		audio_in_underrun = false;
+		audio_mixed_since_seek = false;
 	}
 	condition.notify_one();
 	_wake_consumer_locked();
@@ -1800,8 +1810,13 @@ Dictionary MediaSource::get_stats() const {
 		d["net_requests"] = n.requests;
 		d["net_resets"] = n.resets;
 		d["net_waits"] = n.waits;
+		d["net_seek_waits"] = n.seek_waits;
 		d["net_stalls"] = n.stalls;
+		d["net_stall_seconds"] = n.stall_seconds;
 		d["net_wait_seconds"] = n.wait_seconds;
+		d["net_refills"] = n.refills;
+		d["net_refill_seconds"] = n.refill_seconds;
+		d["net_refill_mbps"] = n.refill_seconds > 0.0 ? (double)n.refill_bytes * 8.0 / n.refill_seconds / 1e6 : 0.0;
 		d["net_reconnects"] = n.reconnects;
 		d["net_errors"] = n.errors;
 		d["net_read_mbps"] = n.busy_seconds > 0.0 ? (double)n.bytes_read * 8.0 / n.busy_seconds / 1e6 : 0.0;
@@ -1814,6 +1829,7 @@ Dictionary MediaSource::get_stats() const {
 		d["audio_buffered"] = output_rate > 0 ? (double)(ring_write - ring_read) / output_rate : 0.0;
 		d["audio_position"] = audio_position;
 		d["audio_underruns"] = audio_underruns;
+		d["audio_seek_waits"] = audio_seek_waits;
 		d["audio_frames_mixed"] = audio_frames_mixed;
 		d["audio_finished"] = audio_eof && ring_write == ring_read;
 	}
@@ -1919,6 +1935,10 @@ void MediaSource::set_network_buffer_size(int64_t p_bytes) {
 	network_buffer_size = CLAMP(p_bytes, (int64_t)4 << 20, (int64_t)256 << 20); // Applies at the next open().
 }
 
+void MediaSource::set_network_requests(int p_requests) {
+	network_requests = CLAMP(p_requests, 1, 16); // Applies at the next open().
+}
+
 void MediaSource::set_audio_decoder_options(const Dictionary &p_options) {
 	SETTING_GUARD();
 	audio_decoder_options = p_options.duplicate();
@@ -1971,6 +1991,8 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_static_method("MediaSource", D_METHOD("set_smb_credentials", "host", "user", "password", "domain"), &MediaSource::set_smb_credentials, DEFVAL(String()));
 	ClassDB::bind_method(D_METHOD("set_network_buffer_size", "bytes"), &MediaSource::set_network_buffer_size);
 	ClassDB::bind_method(D_METHOD("get_network_buffer_size"), &MediaSource::get_network_buffer_size);
+	ClassDB::bind_method(D_METHOD("set_network_requests", "requests"), &MediaSource::set_network_requests);
+	ClassDB::bind_method(D_METHOD("get_network_requests"), &MediaSource::get_network_requests);
 	ClassDB::bind_method(D_METHOD("set_audio_decoder_options", "options"), &MediaSource::set_audio_decoder_options);
 	ClassDB::bind_method(D_METHOD("get_audio_decoder_options"), &MediaSource::get_audio_decoder_options);
 
@@ -1979,6 +2001,7 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "network_buffer_size", PROPERTY_HINT_RANGE, "4194304,268435456,1048576,suffix:B"), "set_network_buffer_size", "get_network_buffer_size");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "network_requests", PROPERTY_HINT_RANGE, "1,16,1"), "set_network_requests", "get_network_requests");
 
 	BIND_ENUM_CONSTANT(STATE_CLOSED);
 	BIND_ENUM_CONSTANT(STATE_READING);

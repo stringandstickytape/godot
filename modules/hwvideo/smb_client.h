@@ -132,8 +132,13 @@ public:
 		uint64_t requests = 0;
 		uint64_t resets = 0; // Seeks outside the buffered range.
 		uint64_t waits = 0; // Reads that had to wait for data.
-		uint64_t stalls = 0; // Of those, waits while reading on (not right after a reset).
+		uint64_t seek_waits = 0; // Of those, waits while the buffer refills after open or a seek (expected).
+		uint64_t stalls = 0; // Of those, waits once the buffer had refilled: the network didn't keep up.
 		double wait_seconds = 0.0;
+		double stall_seconds = 0.0;
+		uint64_t refills = 0; // Refills completed: from a reset until 4 MiB (or half the ring) were ahead.
+		double refill_seconds = 0.0;
+		uint64_t refill_bytes = 0;
 		uint64_t reconnects = 0;
 		uint64_t errors = 0;
 		double busy_seconds = 0.0; // Time with at least one request in flight.
@@ -144,7 +149,7 @@ public:
 	SmbFile();
 	~SmbFile();
 
-	Error open(const String &p_url, uint64_t p_buffer_size, String &r_error);
+	Error open(const String &p_url, uint64_t p_buffer_size, uint32_t p_requests, String &r_error);
 	// Ends every wait (reads return AVERROR_EXIT) and stops the thread. close() still has to be called.
 	void abort();
 	void close();
@@ -160,7 +165,8 @@ public:
 	static int64_t avio_seek(void *p_opaque, int64_t p_offset, int p_whence);
 
 private:
-	static constexpr uint32_t MAX_REQUESTS = 4;
+	static constexpr uint32_t MAX_REQUESTS = 16;
+	static constexpr uint64_t REFILLED = 4 << 20; // Ahead of the reader once a refill counts as done (at most half the ring).
 	static constexpr uint64_t CHUNK_MAX = 1 << 20;
 	static constexpr uint64_t FIRST_AHEAD = 256 << 10;
 	static constexpr double CONNECT_TIMEOUT = 8.0;
@@ -186,6 +192,7 @@ private:
 	uint64_t chunk = CHUNK_MAX;
 	uint64_t keep_back = 0;
 	uint64_t max_ahead = 0;
+	uint32_t max_requests = 4; // In flight at once (1 to MAX_REQUESTS).
 	int wake_fd = -1;
 	Thread thread;
 	SafeFlag abort_flag;
@@ -208,6 +215,9 @@ private:
 	bool failed = false;
 	String error;
 	Stats stats;
+	bool refilling = true; // From open or a reset until REFILLED bytes are ahead.
+	uint64_t refill_from = 0;
+	uint64_t refill_start_usec = 0;
 
 	// Reader thread only.
 	Request requests[MAX_REQUESTS];

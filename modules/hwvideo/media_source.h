@@ -209,6 +209,7 @@ private:
 	SmbFile *smb_file = nullptr;
 	AVIOContext *avio = nullptr;
 	int64_t network_buffer_size = 16 << 20;
+	int network_requests = 4;
 
 	Thread thread;
 
@@ -251,7 +252,9 @@ private:
 	uint32_t audio_serial = 0;
 	bool audio_eof = false;
 	bool audio_in_underrun = false;
+	bool audio_mixed_since_seek = false; // An empty ring before the first frame after open/seek is a wait, not an underrun.
 	uint64_t audio_underruns = 0;
+	uint64_t audio_seek_waits = 0;
 	uint64_t audio_frames_mixed = 0;
 
 	// Demux thread only (and open(), before the thread starts).
@@ -386,6 +389,8 @@ public:
 	static void set_smb_credentials(const String &p_host, const String &p_user, const String &p_password, const String &p_domain = String());
 	void set_network_buffer_size(int64_t p_bytes);
 	int64_t get_network_buffer_size() const { return network_buffer_size; }
+	void set_network_requests(int p_requests);
+	int get_network_requests() const { return network_requests; }
 	Dictionary get_stats() const;
 
 	Ref<AudioStreamMedia> get_audio_stream();

@@ -413,7 +413,7 @@ bool SmbFile::_open_handle(String &r_error, const SafeFlag *p_abort) {
 	return true;
 }
 
-Error SmbFile::open(const String &p_url, uint64_t p_buffer_size, String &r_error) {
+Error SmbFile::open(const String &p_url, uint64_t p_buffer_size, uint32_t p_requests, String &r_error) {
 	close();
 	url = SmbUrl::parse(p_url);
 	if (!url.valid || url.share.is_empty() || url.path.is_empty()) {
@@ -444,7 +444,8 @@ Error SmbFile::open(const String &p_url, uint64_t p_buffer_size, String &r_error
 	keep_back = capacity / 8;
 	max_ahead = capacity - keep_back;
 	ring = (uint8_t *)memalloc(capacity);
-	description = session.get_description() + vformat(", reads of %d KiB, %d in flight, %d MiB buffer", (int)(chunk >> 10), MAX_REQUESTS, (int)(capacity >> 20));
+	max_requests = CLAMP(p_requests, 1u, MAX_REQUESTS);
+	description = session.get_description() + vformat(", reads of %d KiB, %d in flight, %d MiB buffer", (int)(chunk >> 10), max_requests, (int)(capacity >> 20));
 	{
 		MutexLock lock(mutex);
 		position = ring_start = ring_end = issue_offset = 0;
@@ -458,6 +459,9 @@ Error SmbFile::open(const String &p_url, uint64_t p_buffer_size, String &r_error
 		stats = Stats();
 		stats.size = (uint64_t)size;
 		stats.buffer_size = capacity;
+		refilling = true;
+		refill_from = 0;
+		refill_start_usec = opened_usec;
 	}
 	request_head = request_count = 0;
 	restart_pending = false;
@@ -618,7 +622,7 @@ void SmbFile::_reader_loop() {
 				ring_start = MIN(position - keep_back, ring_end);
 			}
 			reader_wants_space = false;
-			while (!reset_pending && !restart_pending && !failed && request_count < MAX_REQUESTS && issue_offset < (uint64_t)size) {
+			while (!reset_pending && !restart_pending && !failed && request_count < max_requests && issue_offset < (uint64_t)size) {
 				const uint64_t limit = MIN(ring_start + capacity, MAX(position, ring_start) + ahead_limit);
 				if (issue_offset >= limit) {
 					reader_wants_space = true;
@@ -690,6 +694,12 @@ void SmbFile::_reader_loop() {
 				stats.busy_seconds += (double)(ticks_usec() - busy_since_usec) * 1e-6;
 				busy_since_usec = 0;
 			}
+			if (refilling && !reset_pending && (ring_end >= MIN(position, ring_end) + MIN(REFILLED, max_ahead / 2) || ring_end >= (uint64_t)size)) {
+				refilling = false;
+				stats.refills++;
+				stats.refill_seconds += (double)(ticks_usec() - refill_start_usec) * 1e-6;
+				stats.refill_bytes += ring_end - refill_from;
+			}
 			if (advanced && consumer_waiting) {
 				consumer_waiting = false;
 				condition.notify_all();
@@ -711,6 +721,7 @@ void SmbFile::_reader_loop() {
 int SmbFile::_read(uint8_t *p_buffer, int p_size) {
 	MutexLock lock(mutex);
 	uint64_t wait_start = 0;
+	bool stalled = false;
 	for (;;) {
 		if (abort_flag.is_set()) {
 			return AVERROR_EXIT;
@@ -727,8 +738,11 @@ int SmbFile::_read(uint8_t *p_buffer, int p_size) {
 		if (!wait_start) {
 			wait_start = ticks_usec();
 			stats.waits++;
-			if (!reset_pending && position != reset_point) {
+			if (reset_pending || refilling) {
+				stats.seek_waits++;
+			} else {
 				stats.stalls++;
+				stalled = true;
 			}
 		}
 		consumer_waiting = true;
@@ -739,7 +753,11 @@ int SmbFile::_read(uint8_t *p_buffer, int p_size) {
 		condition.wait(lock);
 	}
 	if (wait_start) {
-		stats.wait_seconds += (double)(ticks_usec() - wait_start) * 1e-6;
+		const double waited = (double)(ticks_usec() - wait_start) * 1e-6;
+		stats.wait_seconds += waited;
+		if (stalled) {
+			stats.stall_seconds += waited;
+		}
 	}
 	const uint64_t count = MIN((uint64_t)p_size, ring_end - position);
 	const uint64_t slot = position % capacity;
@@ -796,6 +814,11 @@ int64_t SmbFile::_seek(int64_t p_offset, int p_whence) {
 		reset_point = position;
 		generation++;
 		stats.resets++;
+		if (!refilling) {
+			refilling = true;
+			refill_start_usec = ticks_usec();
+		}
+		refill_from = position;
 		_wake();
 	}
 	return target;
