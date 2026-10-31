@@ -31,6 +31,7 @@
 #pragma once
 
 #include "dmabuf_image.h"
+#include "software_video_decoder.h"
 #include "v4l2_decoder.h"
 
 #include "scene/resources/texture.h"
@@ -91,8 +92,14 @@ private:
 	};
 
 	struct ReadyFrame {
-		uint32_t buffer = 0;
+		uint32_t buffer = 0; // Hardware: the CAPTURE buffer. Software: the decoder's slot.
 		double time = 0.0;
+		uint32_t generation = 0; // Software: the frame size/range generation.
+	};
+
+	struct RetiringSlot {
+		uint32_t slot = 0;
+		uint64_t release_frame = 0;
 	};
 
 	Ref<V4L2Decoder> decoder;
@@ -113,6 +120,18 @@ private:
 	Packing packing = PACKING_NV12;
 	// Q10C import experiment: "rgb10a2", "rgb10a2_mutable", "rgba8" or "rgba8_mutable" (see q10c_view in the docs).
 	String q10c_view = "rgb10a2_mutable";
+
+	// Software path, for what the hardware path can't show (open_source() picks it). Null on the hardware path.
+	SoftwareVideoDecoder *software = nullptr;
+	String software_reason; // Why the hardware path wasn't used.
+	bool software_fallback = true;
+	int software_threads = 4;
+	int64_t software_max_pixels = SoftwareVideoDecoder::DEFAULT_MAX_PIXELS;
+	RID software_rd[DmabufImage::MAX_PLANES]; // The shown frame is uploaded to these (Y R8, CbCr R8G8).
+	RID software_rs[DmabufImage::MAX_PLANES];
+	uint32_t software_generation = UINT32_MAX;
+	int software_shown = -1; // Slot of the frame on screen.
+	LocalVector<RetiringSlot> software_retiring; // Shown before; back to the decoder once the GPU upload is done.
 	uint32_t serial = 0;
 	double clock = 0.0;
 	double frame_time = -1.0;
@@ -136,6 +155,14 @@ private:
 	void _show(const ReadyFrame &p_frame, uint64_t p_frames_drawn);
 	void _discard_ready(uint32_t p_count, bool p_skipped);
 	void _return_all_ready();
+	void _return_ready_buffer(const ReadyFrame &p_frame);
+	bool _select_due(bool p_input_ended, ReadyFrame &r_show);
+	bool _check_seek();
+	void _update_software(double p_delta, double p_master_clock);
+	void _show_software(const ReadyFrame &p_frame, uint64_t p_frames_drawn);
+	void _free_software_textures();
+	Dictionary _get_software_stats() const;
+	static void _render_thread_upload(RID p_y, RID p_uv, const Vector<uint8_t> &p_y_data, const Vector<uint8_t> &p_uv_data);
 
 protected:
 	static void _bind_methods();
@@ -159,7 +186,7 @@ public:
 	Error seek(double p_seconds);
 	double get_position() const { return clock; }
 	double get_frame_time() const { return frame_time; }
-	bool has_frame() const { return shown >= 0 || have_orphan; }
+	bool has_frame() const { return shown >= 0 || have_orphan || software_shown >= 0; }
 
 	Ref<V4L2Decoder> get_decoder() const { return decoder; }
 	Ref<MediaSource> get_media_source() const { return source; }
@@ -169,6 +196,15 @@ public:
 	Rect2i get_visible_rect() const { return visible_rect; }
 	Rect2 get_visible_uv_rect() const;
 	Packing get_packing() const { return packing; }
+	// "hardware" (V4L2 + dmabuf import), "software" (SoftwareVideoDecoder), or "" when closed.
+	String get_decode_path() const;
+	String get_software_reason() const { return software_reason; }
+	void set_software_fallback(bool p_enabled) { software_fallback = p_enabled; }
+	bool is_software_fallback() const { return software_fallback; }
+	void set_software_threads(int p_threads) { software_threads = CLAMP(p_threads, 1, 16); }
+	int get_software_threads() const { return software_threads; }
+	void set_software_max_pixels(int64_t p_pixels) { software_max_pixels = MAX(p_pixels, (int64_t)64 * 64); }
+	int64_t get_software_max_pixels() const { return software_max_pixels; }
 	void set_q10c_view(const String &p_view);
 	String get_q10c_view() const { return q10c_view; }
 	String get_last_error() const { return last_error; }

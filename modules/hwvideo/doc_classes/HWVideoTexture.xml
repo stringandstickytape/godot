@@ -53,6 +53,18 @@
 				Returns the [RenderingDevice] texture of a plane of the frame on screen. It changes with every frame.
 			</description>
 		</method>
+		<method name="get_decode_path" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns [code]"hardware"[/code] (the V4L2 decoder, frames imported without copies), [code]"software"[/code] (the fallback, see [member software_fallback]), or an empty string when nothing is open.
+			</description>
+		</method>
+		<method name="get_software_reason" qualifiers="const">
+			<return type="String" />
+			<description>
+				On the software path: why the hardware path wasn't used (the same sentence as [code]hw_unsupported_reason[/code] in [method MediaSource.get_video_info]).
+			</description>
+		</method>
 		<method name="get_packing" qualifiers="const">
 			<return type="int" enum="HWVideoTexture.Packing" />
 			<description>
@@ -153,6 +165,15 @@
 		</method>
 	</methods>
 	<members>
+		<member name="software_fallback" type="bool" setter="set_software_fallback" getter="is_software_fallback" default="true">
+			When [method open_source] gets a stream the hardware path can't show (VP9, 10-bit, 4:2:2, H.264 High 10), it is decoded in software instead if it is H.264, HEVC or VP9 of at most [member software_max_pixels]: FFmpeg's decoders on threads of their own, each frame converted to 8-bit NV12 and uploaded to two textures, so [method get_plane_texture] and the NV12 shader work the same. 10-bit is rounded to 8 bits and HDR isn't tone-mapped. Bigger or other streams fail with the reason in [method get_last_error]. [method get_stats] then has [code]decode_path[/code] [code]"software"[/code], the keys of [method V4L2Decoder.get_stats] that apply, and [code]software_*[/code] keys ([code]software_thread_cpu_seconds[/code] is the feeding thread only; [code]process_cpu_seconds[/code] includes FFmpeg's worker threads). [method open] (raw Annex-B files) always uses the hardware path.
+		</member>
+		<member name="software_max_pixels" type="int" setter="set_software_max_pixels" getter="get_software_max_pixels" default="2088960">
+			The largest frame (width x height) decoded in software: 1920 x 1088 by default.
+		</member>
+		<member name="software_threads" type="int" setter="set_software_threads" getter="get_software_threads" default="4">
+			FFmpeg decoder threads on the software path (frame and slice threading).
+		</member>
 		<member name="q10c_view" type="String" setter="set_q10c_view" getter="get_q10c_view" default="&quot;rgb10a2_mutable&quot;">
 			Experimental, with [member V4L2Decoder.experimental_10bit]: how a 10-bit decoder buffer ([code]Q10C[/code], UBWC-compressed TP10) is imported. Turnip has no TP10 format, but each plane of a Q10C buffer is laid out like a UBWC image of a 32-bit format, a third of the width in texels, and the Adreno 750 can read UBWC data as another format. Each texel is then a 32-bit word with three 10-bit samples (bits 0-9, 10-19, 20-29); the CbCr plane holds Cb and Cr alternately. [code]"rgb10a2"[/code] imports the planes as A2B10G10R10 (the three samples are r, g and b), [code]"rgba8"[/code] as R8G8B8A8 (the shader rebuilds the word from the bytes). The [code]_mutable[/code] variants make the images mutable to a format of another UBWC class, which on the A750 sets the descriptors' bit for reading UBWC across formats. Which, if any, gives a correct picture is what the experiment is for.
 		</member>

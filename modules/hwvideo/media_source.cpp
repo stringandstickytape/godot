@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "media_source.h"
+#include "software_video_decoder.h"
 
 #include "audio_stream_media.h"
 #include "smb_client.h"
@@ -1604,6 +1605,11 @@ Dictionary MediaSource::get_video_info() const {
 	const String hw_reason = get_hw_unsupported_reason(video);
 	d["hw_decodable"] = hw_reason.is_empty();
 	d["hw_unsupported_reason"] = hw_reason;
+	// HWVideoTexture.open_source() decodes the rest in software up to about 1080p (its software_max_pixels can change that).
+	const String sw_reason = hw_reason.is_empty() ? String() : SoftwareVideoDecoder::get_unsupported_reason(video, SoftwareVideoDecoder::DEFAULT_MAX_PIXELS);
+	d["software_decodable"] = !hw_reason.is_empty() && sw_reason.is_empty();
+	d["playable"] = hw_reason.is_empty() || sw_reason.is_empty();
+	d["unplayable_reason"] = hw_reason.is_empty() || sw_reason.is_empty() ? String() : hw_reason + " " + sw_reason;
 	d["annexb_filter"] = bsf != nullptr;
 	if (video.sps.valid) {
 		d["coded_width"] = video.sps.width;

@@ -38,6 +38,7 @@
 #include <drm/drm_fourcc.h>
 #include <linux/videodev2.h>
 #include <unistd.h>
+#include <ctime>
 
 #ifndef V4L2_PIX_FMT_QC10C
 #define V4L2_PIX_FMT_QC10C v4l2_fourcc('Q', '1', '0', 'C')
@@ -273,10 +274,18 @@ void HWVideoTexture::_show(const ReadyFrame &p_frame, uint64_t p_frames_drawn) {
 	RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(release, buffer.image, to_free));
 }
 
+void HWVideoTexture::_return_ready_buffer(const ReadyFrame &p_frame) {
+	if (software) {
+		software->return_slot(p_frame.buffer);
+		return;
+	}
+	buffers[p_frame.buffer].status = BUFFER_DECODER;
+	decoder->return_buffer(generation, p_frame.buffer);
+}
+
 void HWVideoTexture::_discard_ready(uint32_t p_count, bool p_skipped) {
 	for (uint32_t k = 0; k < p_count; k++) {
-		buffers[ready[k].buffer].status = BUFFER_DECODER;
-		decoder->return_buffer(generation, ready[k].buffer);
+		_return_ready_buffer(ready[k]);
 	}
 	if (p_skipped) {
 		frames_skipped += p_count;
@@ -290,28 +299,38 @@ void HWVideoTexture::_discard_ready(uint32_t p_count, bool p_skipped) {
 
 void HWVideoTexture::_return_all_ready() {
 	for (const ReadyFrame &ready_frame : ready) {
-		buffers[ready_frame.buffer].status = BUFFER_DECODER;
-		decoder->return_buffer(generation, ready_frame.buffer);
+		_return_ready_buffer(ready_frame);
 	}
 	frames_stale += ready.size();
 	ready.clear();
 }
 
+// A seek on the source (by us, the audio player or anyone): frames ready now are from before it. True if there was one.
+bool HWVideoTexture::_check_seek() {
+	if (source.is_null()) {
+		return false;
+	}
+	const uint32_t source_serial = source->get_serial();
+	if (source_serial == serial) {
+		return false;
+	}
+	serial = source_serial;
+	clock = source->get_seek_target();
+	seek_target = clock;
+	settling = true;
+	_return_all_ready();
+	return true;
+}
+
 void HWVideoTexture::update(double p_delta, double p_master_clock) {
+	if (software) {
+		_update_software(p_delta, p_master_clock);
+		return;
+	}
 	if (decoder.is_null() || !decoder->is_open()) {
 		return;
 	}
-	if (source.is_valid()) {
-		const uint32_t source_serial = source->get_serial();
-		if (source_serial != serial) {
-			// A seek on the source (by us, the audio player or anyone): frames ready now are from before it.
-			serial = source_serial;
-			clock = source->get_seek_target();
-			seek_target = clock;
-			settling = true;
-			_return_all_ready();
-		}
-	}
+	_check_seek();
 	if (playing) {
 		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta;
 	}
@@ -354,7 +373,15 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 		ready.push_back(ready_frame);
 	}
 
-	// Show the newest frame that is due; the ones before it are late and dropped.
+	ReadyFrame show;
+	if (_select_due(decoder->get_state() == V4L2Decoder::STATE_ENDED, show)) {
+		_show(show, frames_drawn);
+	}
+}
+
+// Picks the frame to show now from `ready`: the newest that is due; the ones before it are late and dropped (or, while
+// settling after a seek, skipped). False if there is nothing to show yet.
+bool HWVideoTexture::_select_due(bool p_input_ended, ReadyFrame &r_show) {
 	int due = -1;
 	bool later = false;
 	for (uint32_t k = 0; k < ready.size(); k++) {
@@ -367,25 +394,190 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 	if (settling) {
 		if (due < 0) {
 			if (!later) {
-				return;
+				return false;
 			}
 			due = 0; // The first frame is after the target (a stream starting at 0.083 s, a seek into a gap): show it.
-		} else if (!later && ready[due].time < clock - 1e-3 && decoder->get_state() != V4L2Decoder::STATE_ENDED) {
+		} else if (!later && ready[due].time < clock - 1e-3 && !p_input_ended) {
 			// Not known yet whether this is the frame for the target: keep it, skip the ones before it.
 			_discard_ready((uint32_t)due, true);
-			return;
+			return false;
 		}
 		_discard_ready((uint32_t)due, true);
 		settling = false;
 	} else {
 		if (due < 0) {
-			return;
+			return false;
 		}
 		_discard_ready((uint32_t)due, false);
 	}
-	const ReadyFrame show = ready[0];
+	r_show = ready[0];
 	ready.remove_at(0);
-	_show(show, frames_drawn);
+	return true;
+}
+
+/* Software path */
+
+// Render thread: copies the frame's planes into the textures (through the RenderingDevice's staging buffers, before this
+// frame's draws). The Vectors are the decoder's slot data, held by reference; the slot isn't written again until the
+// frames after this one have completed.
+void HWVideoTexture::_render_thread_upload(RID p_y, RID p_uv, const Vector<uint8_t> &p_y_data, const Vector<uint8_t> &p_uv_data) {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (rd == nullptr || !rd->texture_is_valid(p_y) || !rd->texture_is_valid(p_uv)) {
+		return;
+	}
+	rd->texture_update(p_y, 0, p_y_data);
+	rd->texture_update(p_uv, 0, p_uv_data);
+}
+
+void HWVideoTexture::_free_software_textures() {
+	for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+		if (software_rs[p].is_valid() && RS::get_singleton() != nullptr) {
+			RS::get_singleton()->free_rid(software_rs[p]);
+		}
+		software_rs[p] = RID();
+		RenderingDevice *rd = RenderingDevice::get_singleton();
+		if (software_rd[p].is_valid() && rd != nullptr) {
+			rd->free_rid(software_rd[p]); // Destroyed once the frames that may use it are done.
+		}
+		software_rd[p] = RID();
+	}
+	software_generation = UINT32_MAX;
+}
+
+void HWVideoTexture::_show_software(const ReadyFrame &p_frame, uint64_t p_frames_drawn) {
+	const SoftwareVideoDecoder::Slot &slot = software->get_slot(p_frame.buffer);
+	bool format_changed = false;
+	if (p_frame.generation != software_generation || software_rd[0].is_null()) {
+		// First frame, or a new size: textures for it.
+		for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+			plane_textures[p]->set_source(RID(), Size2i());
+		}
+		_free_software_textures();
+		RenderingDevice *rd = RenderingDevice::get_singleton();
+		ERR_FAIL_NULL(rd);
+		const Size2i sizes[DmabufImage::MAX_PLANES] = { slot.size, slot.size / 2 };
+		const RD::DataFormat formats[DmabufImage::MAX_PLANES] = { RD::DATA_FORMAT_R8_UNORM, RD::DATA_FORMAT_R8G8_UNORM };
+		for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
+			RD::TextureFormat format;
+			format.format = formats[p];
+			format.width = sizes[p].width;
+			format.height = sizes[p].height;
+			format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+			software_rd[p] = rd->texture_create(format, RD::TextureView());
+			ERR_FAIL_COND_MSG(software_rd[p].is_null(), "HWVideoTexture: couldn't create the software path's textures.");
+			software_rs[p] = RS::get_singleton()->texture_rd_create(software_rd[p]);
+		}
+		software_generation = p_frame.generation;
+		decoded_size = slot.size;
+		visible_rect = Rect2i(Point2i(), slot.size); // FFmpeg's frames are already cropped.
+		plane_sizes[0] = sizes[0];
+		plane_sizes[1] = sizes[1];
+		packing = PACKING_NV12;
+		format_changed = true;
+		print_line(vformat("HWVideoTexture: software frames %dx%d (%s range).", slot.size.width, slot.size.height, software->is_full_range() ? "full" : "limited"));
+	}
+
+	if (software_shown >= 0) {
+		RetiringSlot retiring;
+		retiring.slot = (uint32_t)software_shown;
+		retiring.release_frame = p_frames_drawn;
+		software_retiring.push_back(retiring);
+	}
+	software_shown = (int)p_frame.buffer;
+	frame_time = p_frame.time;
+	frames_shown++;
+	RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_upload).bind(software_rd[0], software_rd[1], slot.y, slot.uv));
+	plane_textures[0]->set_source(software_rs[0], plane_sizes[0]);
+	plane_textures[1]->set_source(software_rs[1], plane_sizes[1]);
+	if (format_changed) {
+		emit_signal(SNAME("format_changed"));
+	}
+}
+
+void HWVideoTexture::_update_software(double p_delta, double p_master_clock) {
+	if (_check_seek()) {
+		software->return_all_ready();
+	}
+	if (playing) {
+		clock = p_master_clock >= 0.0 ? p_master_clock : clock + p_delta;
+	}
+
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	const uint64_t frames_drawn = rd ? rd->get_frames_drawn() : 0;
+	const uint64_t frame_delay = rd ? rd->get_frame_delay() : 0;
+	// A slot shown before goes back once the frame that uploaded from it has completed (as for the hardware path).
+	for (uint32_t i = 0; i < software_retiring.size(); i++) {
+		if (frames_drawn >= software_retiring[i].release_frame + frame_delay + 2) {
+			software->return_slot(software_retiring[i].slot);
+			software_retiring.remove_at_unordered(i);
+			i--;
+		}
+	}
+
+	SoftwareVideoDecoder::Frame frame;
+	while (software->pop_frame(frame)) {
+		if (frame.serial != serial) {
+			frames_stale++; // Decoded before the last seek.
+			software->return_slot(frame.slot);
+			continue;
+		}
+		ReadyFrame ready_frame;
+		ready_frame.buffer = frame.slot;
+		ready_frame.time = frame.time;
+		ready_frame.generation = frame.generation;
+		ready.push_back(ready_frame);
+	}
+	if (software->has_failed() && last_error.is_empty()) {
+		last_error = software->get_error();
+	}
+
+	ReadyFrame show;
+	if (_select_due(software->is_ended(), show)) {
+		_show_software(show, frames_drawn);
+	}
+}
+
+Dictionary HWVideoTexture::_get_software_stats() const {
+	// The keys of V4L2Decoder.get_stats() that apply, so that code reading those works on both paths.
+	Dictionary d = software->get_stats();
+	const bool ended = software->is_ended() && ready.is_empty();
+	const int state = software->has_failed() ? V4L2Decoder::STATE_ERROR : (ended ? V4L2Decoder::STATE_ENDED : V4L2Decoder::STATE_DECODING);
+	static const char *state_names[] = { "closed", "starting", "decoding", "reconfiguring", "ended", "error" };
+	d["state"] = state;
+	d["state_name"] = state_names[state];
+	d["frames_decoded"] = d["software_frames_decoded"];
+	d["frames_error"] = d["software_decode_errors"];
+	d["aus_queued"] = d["software_packets_fed"];
+	d["thread_cpu_seconds"] = d["software_thread_cpu_seconds"];
+	d["aus_skipped"] = 0;
+	d["output_errors"] = 0;
+	d["source_changes"] = 0;
+	d["loops"] = 0;
+	d["eos_inserted"] = 0;
+	d["reconfig_in_place"] = 0;
+	d["reconfig_restart"] = 0;
+	d["restarts"] = 0;
+	d["output_in_driver"] = 0;
+	d["capture_in_driver"] = d["software_slots_in_use"];
+	d["capture_buffers"] = SoftwareVideoDecoder::SLOT_COUNT;
+	d["queued_rate"] = 0.0;
+	d["latency_avg_ms"] = 0.0;
+	d["latency_max_ms"] = 0.0;
+	d["media_source"] = true;
+	d["software_reason"] = software_reason;
+	d["software_description"] = software->get_description();
+	const String error = software->get_error();
+	if (!error.is_empty()) {
+		d["last_error"] = error;
+	}
+	return d;
+}
+
+String HWVideoTexture::get_decode_path() const {
+	if (software) {
+		return "software";
+	}
+	return decoder.is_valid() && decoder->is_open() ? "hardware" : "";
 }
 
 Error HWVideoTexture::open(const String &p_path, const String &p_codec, double p_fps) {
@@ -419,6 +611,33 @@ Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
 	clock = source->get_seek_target();
 	seek_target = clock;
 	settling = true;
+	software_reason = String();
+
+	// What the hardware path can't show (VP9, 10-bit, 4:2:2, H.264 High 10) is decoded in software, up to about 1080p.
+	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
+	const String hw_reason = MediaSource::get_hw_unsupported_reason(info, decoder->is_experimental_10bit());
+	if (!hw_reason.is_empty() && software_fallback) {
+		const String sw_reason = SoftwareVideoDecoder::get_unsupported_reason(info, software_max_pixels);
+		if (!sw_reason.is_empty()) {
+			last_error = hw_reason + " " + sw_reason;
+			source.unref();
+			return ERR_UNAVAILABLE;
+		}
+		software = memnew(SoftwareVideoDecoder);
+		String error;
+		const Error err = software->open(p_source, software_threads, error);
+		if (err != OK) {
+			memdelete(software);
+			software = nullptr;
+			last_error = error;
+			source.unref();
+			return err;
+		}
+		software_reason = hw_reason;
+		print_line(vformat("HWVideoTexture: software decode (%s): %s", software->get_description(), hw_reason));
+		return OK;
+	}
+
 	const Error err = decoder->open_source(p_source);
 	if (err != OK) {
 		last_error = decoder->get_last_error();
@@ -443,6 +662,13 @@ void HWVideoTexture::close() {
 			RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));
 		}
 	}
+	if (software) {
+		memdelete(software); // Stops its thread.
+		software = nullptr;
+	}
+	_free_software_textures();
+	software_retiring.clear();
+	software_shown = -1;
 	buffers.clear();
 	ready.clear();
 	shown = -1;
@@ -493,6 +719,9 @@ Ref<Texture2D> HWVideoTexture::get_plane_texture(int p_plane) const {
 
 RID HWVideoTexture::get_plane_rd_rid(int p_plane) const {
 	ERR_FAIL_INDEX_V(p_plane, (int)DmabufImage::MAX_PLANES, RID());
+	if (software) {
+		return software_shown >= 0 ? software_rd[p_plane] : RID();
+	}
 	if (shown >= 0) {
 		return buffers[shown].image->get_plane_rid(p_plane);
 	}
@@ -511,7 +740,12 @@ Rect2 HWVideoTexture::get_visible_uv_rect() const {
 }
 
 Dictionary HWVideoTexture::get_stats() const {
-	Dictionary d = decoder->get_stats();
+	Dictionary d = software ? _get_software_stats() : decoder->get_stats();
+	d["decode_path"] = get_decode_path();
+	// CPU time of the whole process (all threads, FFmpeg's decoder threads included), to compare the two paths.
+	struct timespec cpu;
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
+	d["process_cpu_seconds"] = cpu.tv_sec + cpu.tv_nsec * 1e-9;
 	d["frames_shown"] = frames_shown;
 	d["frames_dropped"] = frames_dropped;
 	d["frames_stale"] = frames_stale;
@@ -569,6 +803,17 @@ void HWVideoTexture::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_visible_rect"), &HWVideoTexture::get_visible_rect);
 	ClassDB::bind_method(D_METHOD("get_visible_uv_rect"), &HWVideoTexture::get_visible_uv_rect);
 	ClassDB::bind_method(D_METHOD("get_packing"), &HWVideoTexture::get_packing);
+	ClassDB::bind_method(D_METHOD("get_decode_path"), &HWVideoTexture::get_decode_path);
+	ClassDB::bind_method(D_METHOD("get_software_reason"), &HWVideoTexture::get_software_reason);
+	ClassDB::bind_method(D_METHOD("set_software_fallback", "enabled"), &HWVideoTexture::set_software_fallback);
+	ClassDB::bind_method(D_METHOD("is_software_fallback"), &HWVideoTexture::is_software_fallback);
+	ClassDB::bind_method(D_METHOD("set_software_threads", "threads"), &HWVideoTexture::set_software_threads);
+	ClassDB::bind_method(D_METHOD("get_software_threads"), &HWVideoTexture::get_software_threads);
+	ClassDB::bind_method(D_METHOD("set_software_max_pixels", "pixels"), &HWVideoTexture::set_software_max_pixels);
+	ClassDB::bind_method(D_METHOD("get_software_max_pixels"), &HWVideoTexture::get_software_max_pixels);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "software_fallback"), "set_software_fallback", "is_software_fallback");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "software_threads", PROPERTY_HINT_RANGE, "1,16"), "set_software_threads", "get_software_threads");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "software_max_pixels"), "set_software_max_pixels", "get_software_max_pixels");
 	ClassDB::bind_method(D_METHOD("set_q10c_view", "view"), &HWVideoTexture::set_q10c_view);
 	ClassDB::bind_method(D_METHOD("get_q10c_view"), &HWVideoTexture::get_q10c_view);
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "q10c_view", PROPERTY_HINT_ENUM, "rgb10a2,rgb10a2_mutable,rgba8,rgba8_mutable"), "set_q10c_view", "get_q10c_view");
