@@ -105,6 +105,9 @@
 		<member name="capture_format" type="String" setter="set_capture_format" getter="get_capture_format" default="&quot;NV12&quot;">
 			CAPTURE fourcc to ask for after SOURCE_CHANGE, or empty for the driver's choice. [HWVideoTexture] can import NV12 and [code]Q08C[/code] (Qualcomm UBWC-compressed NV12, imported with [code]DRM_FORMAT_MOD_QCOM_COMPRESSED[/code]; experimental).
 		</member>
+		<member name="experimental_10bit" type="bool" setter="set_experimental_10bit" getter="is_experimental_10bit" default="false">
+			Decode 10-bit HEVC to [code]Q10C[/code] (the only correct 10-bit output of the Frame's 6.18 kernel) for [HWVideoTexture]'s experimental import (see [member HWVideoTexture.q10c_view]). Off: 10-bit streams are refused with a readable reason (see [code]hw_unsupported_reason[/code] in [method MediaSource.get_video_info]). For a 10-bit stream the decoder logs the CAPTURE formats the driver offers (a linear 10-bit format such as P010 would show there).
+		</member>
 		<member name="device_path" type="String" setter="set_device_path" getter="get_device_path" default="&quot;/dev/video-dec0&quot;">
 			The decoder device.
 		</member>

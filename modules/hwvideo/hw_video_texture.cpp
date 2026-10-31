@@ -39,6 +39,12 @@
 #include <linux/videodev2.h>
 #include <unistd.h>
 
+#ifndef V4L2_PIX_FMT_QC10C
+#define V4L2_PIX_FMT_QC10C v4l2_fourcc('Q', '1', '0', 'C')
+#endif
+#ifndef V4L2_PIX_FMT_QC08C
+#define V4L2_PIX_FMT_QC08C v4l2_fourcc('Q', '0', '8', 'C')
+#endif
 #ifndef DRM_FORMAT_MOD_QCOM_COMPRESSED
 #define DRM_FORMAT_MOD_QCOM_COMPRESSED fourcc_mod_code(QCOM, 1)
 #endif
@@ -149,12 +155,13 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 	Array to_free;
 	_release_generation(to_free);
 
-	if (layout.fourcc != V4L2_PIX_FMT_NV12 && !layout.ubwc) {
+	const bool q10c = layout.fourcc == V4L2_PIX_FMT_QC10C;
+	if (layout.fourcc != V4L2_PIX_FMT_NV12 && layout.fourcc != V4L2_PIX_FMT_QC08C && !q10c) {
 		for (int fd : layout.fds) {
 			::close(fd);
 		}
 		failed_generation = p_generation;
-		last_error = "Only NV12 and Q08C (UBWC NV12) CAPTURE buffers can be imported.";
+		last_error = "Only NV12, Q08C (UBWC NV12) and, experimentally, Q10C CAPTURE buffers can be imported.";
 		ERR_PRINT("HWVideoTexture: " + last_error);
 		RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));
 		return ERR_UNAVAILABLE;
@@ -169,13 +176,34 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 	PackedInt64Array pitches;
 	pitches.push_back(layout.pitch);
 	pitches.push_back(layout.pitch);
+
+	// Q10C (experiment): each plane as a UBWC image of a 32-bit format, W/3 texels wide (three 10-bit samples per texel);
+	// the shader unpacks them (see Packing). Turnip has no TP10 format, but the A750 can read UBWC data as another format.
+	Packing new_packing = PACKING_NV12;
+	Size2i new_plane_sizes[DmabufImage::MAX_PLANES] = { layout.size, layout.size / 2 };
+	RD::DataFormat q10c_format = RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
+	bool q10c_mutable = false;
+	if (q10c) {
+		new_packing = q10c_view.begins_with("rgba8") ? PACKING_TP10_RGBA8 : PACKING_TP10_RGB10A2;
+		q10c_format = new_packing == PACKING_TP10_RGBA8 ? RD::DATA_FORMAT_R8G8B8A8_UNORM : RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
+		q10c_mutable = q10c_view.ends_with("_mutable");
+		new_plane_sizes[0] = Size2i((layout.size.width + 2) / 3, layout.size.height);
+		new_plane_sizes[1] = Size2i((layout.size.width + 2) / 3, (layout.size.height + 1) / 2);
+	}
+	const uint64_t q10c_offsets[DmabufImage::MAX_PLANES] = { 0, layout.chroma_offset };
+	const uint64_t q10c_pitches[DmabufImage::MAX_PLANES] = { layout.pitch, layout.pitch };
+
 	buffers.resize(layout.fds.size());
 	for (uint32_t i = 0; i < layout.fds.size(); i++) {
 		Buffer &buffer = buffers[i];
 		buffer = Buffer();
 		if (err == OK) {
 			buffer.image.instantiate();
-			err = buffer.image->import_nv12(layout.fds[i], layout.size.width, layout.size.height, (int64_t)modifier, offsets, pitches);
+			if (q10c) {
+				err = buffer.image->import_planes(layout.fds[i], q10c_format, (int64_t)modifier, new_plane_sizes, q10c_offsets, q10c_pitches, DmabufImage::MAX_PLANES, q10c_mutable);
+			} else {
+				err = buffer.image->import_nv12(layout.fds[i], layout.size.width, layout.size.height, (int64_t)modifier, offsets, pitches);
+			}
 			if (err == OK) {
 				for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
 					buffer.planes[p] = RS::get_singleton()->texture_rd_create(buffer.image->get_plane_rid(p));
@@ -197,8 +225,12 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 		have_generation = true;
 		decoded_size = layout.size;
 		visible_rect = layout.visible;
+		packing = new_packing;
+		plane_sizes[0] = new_plane_sizes[0];
+		plane_sizes[1] = new_plane_sizes[1];
+		const String format_name = q10c ? vformat("Q10C (UBWC TP10, planes as %s%s)", new_packing == PACKING_TP10_RGBA8 ? "RGBA8" : "RGB10A2", q10c_mutable ? ", mutable" : "") : (layout.ubwc ? String("Q08C (UBWC)") : String("NV12"));
 		print_line(vformat("HWVideoTexture: imported %d decoder buffers (generation %d): %s %dx%d, pitch %d, %s at %d, visible %dx%d+%d+%d, %d Vulkan image(s) per buffer.", buffers.size(), p_generation,
-				layout.ubwc ? "Q08C (UBWC)" : "NV12", layout.size.width, layout.size.height, layout.pitch, layout.ubwc ? "UV metadata" : "chroma", layout.chroma_offset,
+				format_name, layout.size.width, layout.size.height, layout.pitch, layout.ubwc ? "UV metadata" : "chroma", layout.chroma_offset,
 				visible_rect.size.x, visible_rect.size.y, visible_rect.position.x, visible_rect.position.y, buffers.is_empty() ? 0 : buffers[0].image->get_image_count()));
 	}
 	if (!to_free.is_empty()) {
@@ -208,6 +240,11 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 		emit_signal(SNAME("format_changed"));
 	}
 	return err;
+}
+
+void HWVideoTexture::set_q10c_view(const String &p_view) {
+	ERR_FAIL_COND_MSG(p_view != "rgb10a2" && p_view != "rgb10a2_mutable" && p_view != "rgba8" && p_view != "rgba8_mutable", "q10c_view is rgb10a2, rgb10a2_mutable, rgba8 or rgba8_mutable.");
+	q10c_view = p_view;
 }
 
 void HWVideoTexture::_show(const ReadyFrame &p_frame, uint64_t p_frames_drawn) {
@@ -225,8 +262,8 @@ void HWVideoTexture::_show(const ReadyFrame &p_frame, uint64_t p_frames_drawn) {
 	shown = (int)p_frame.buffer;
 	frame_time = p_frame.time;
 	frames_shown++;
-	plane_textures[0]->set_source(buffer.planes[0], decoded_size);
-	plane_textures[1]->set_source(buffer.planes[1], decoded_size / 2);
+	plane_textures[0]->set_source(buffer.planes[0], plane_sizes[0]);
+	plane_textures[1]->set_source(buffer.planes[1], plane_sizes[1]);
 
 	if (have_orphan) {
 		// Nothing points at it any more.
@@ -412,6 +449,7 @@ void HWVideoTexture::close() {
 	have_orphan = false;
 	have_generation = false;
 	decoded_size = Size2i();
+	packing = PACKING_NV12;
 	visible_rect = Rect2i();
 	playing = false;
 	decoder->close();
@@ -530,6 +568,13 @@ void HWVideoTexture::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_decoded_size"), &HWVideoTexture::get_decoded_size);
 	ClassDB::bind_method(D_METHOD("get_visible_rect"), &HWVideoTexture::get_visible_rect);
 	ClassDB::bind_method(D_METHOD("get_visible_uv_rect"), &HWVideoTexture::get_visible_uv_rect);
+	ClassDB::bind_method(D_METHOD("get_packing"), &HWVideoTexture::get_packing);
+	ClassDB::bind_method(D_METHOD("set_q10c_view", "view"), &HWVideoTexture::set_q10c_view);
+	ClassDB::bind_method(D_METHOD("get_q10c_view"), &HWVideoTexture::get_q10c_view);
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "q10c_view", PROPERTY_HINT_ENUM, "rgb10a2,rgb10a2_mutable,rgba8,rgba8_mutable"), "set_q10c_view", "get_q10c_view");
+	BIND_ENUM_CONSTANT(PACKING_NV12);
+	BIND_ENUM_CONSTANT(PACKING_TP10_RGBA8);
+	BIND_ENUM_CONSTANT(PACKING_TP10_RGB10A2);
 	ClassDB::bind_method(D_METHOD("get_last_error"), &HWVideoTexture::get_last_error);
 	ClassDB::bind_method(D_METHOD("get_stats"), &HWVideoTexture::get_stats);
 

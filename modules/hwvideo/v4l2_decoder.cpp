@@ -778,21 +778,30 @@ Error V4L2Decoder::_setup_capture() {
 		return FAILED;
 	}
 	_log_verbose(vformat("G_FMT CAPTURE after SOURCE_CHANGE: %s %dx%d, %d plane(s).", _fourcc_to_string(format.fmt.pix_mp.pixelformat), format.fmt.pix_mp.width, format.fmt.pix_mp.height, format.fmt.pix_mp.num_planes));
-	if (capture_setups == 0 && (verbose || OS::get_singleton()->is_stdout_verbose())) {
-		for (uint32_t i = 0;; i++) {
-			struct v4l2_fmtdesc description = {};
-			description.index = i;
-			description.type = CAPTURE_TYPE;
-			if (IOCTL_QUIET(VIDIOC_ENUM_FMT, &description, EINVAL, 0) < 0) {
-				break;
-			}
+	// What the driver offers for this stream. Always logged for 10-bit streams: is a linear 10-bit format (P010) there?
+	const bool is_10bit = stream_sps.bit_depth > 8;
+	String offered;
+	for (uint32_t i = 0;; i++) {
+		struct v4l2_fmtdesc description = {};
+		description.index = i;
+		description.type = CAPTURE_TYPE;
+		if (IOCTL_QUIET(VIDIOC_ENUM_FMT, &description, EINVAL, 0) < 0) {
+			break;
+		}
+		offered += (offered.is_empty() ? "" : ", ") + _fourcc_to_string(description.pixelformat);
+		if (capture_setups == 0 && (verbose || OS::get_singleton()->is_stdout_verbose())) {
 			_log(vformat("  CAPTURE format %d: %s '%s'.", i, _fourcc_to_string(description.pixelformat), String::utf8((const char *)description.description)));
 		}
 	}
+	if (is_10bit && capture_setups == 0) {
+		_log(vformat("CAPTURE formats offered for this %d-bit stream: %s.", stream_sps.bit_depth, offered));
+	}
 
-	if (capture_fourcc && format.fmt.pix_mp.pixelformat != capture_fourcc) {
+	// 10-bit: Q10C is the only correct output on the 6.18 kernel (NV12 gets the low 8 bits of each sample).
+	const uint32_t want_fourcc = is_10bit ? V4L2_PIX_FMT_QC10C : capture_fourcc;
+	if (want_fourcc && format.fmt.pix_mp.pixelformat != want_fourcc) {
 		struct v4l2_format want = format;
-		want.fmt.pix_mp.pixelformat = capture_fourcc;
+		want.fmt.pix_mp.pixelformat = want_fourcc;
 		IOCTL(VIDIOC_S_FMT, &want);
 		format = {};
 		format.type = CAPTURE_TYPE;
@@ -800,8 +809,8 @@ Error V4L2Decoder::_setup_capture() {
 			_fail("G_FMT CAPTURE failed.");
 			return FAILED;
 		}
-		if (format.fmt.pix_mp.pixelformat != capture_fourcc) {
-			_log(vformat("WARNING: asked for CAPTURE %s, the driver chose %s.", _fourcc_to_string(capture_fourcc), _fourcc_to_string(format.fmt.pix_mp.pixelformat)));
+		if (format.fmt.pix_mp.pixelformat != want_fourcc) {
+			_log(vformat("WARNING: asked for CAPTURE %s, the driver chose %s.", _fourcc_to_string(want_fourcc), _fourcc_to_string(format.fmt.pix_mp.pixelformat)));
 		}
 	}
 	const struct v4l2_pix_format_mplane &pf = format.fmt.pix_mp;
@@ -814,8 +823,15 @@ Error V4L2Decoder::_setup_capture() {
 				pf.width, pf.height, pf.plane_fmt[0].sizeimage, stream_sps.display_width, stream_sps.display_height));
 		return FAILED;
 	}
-	if (stream_sps.bit_depth > 8 && pf.pixelformat != V4L2_PIX_FMT_QC10C) {
-		_log(vformat("NOTE: %d-bit stream decoded to %s; the driver is known to write only the low 8 bits (garbage). Q10C is the only correct 10-bit output.", stream_sps.bit_depth, _fourcc_to_string(pf.pixelformat)));
+	// Only formats HWVideoTexture can show: anything else would be garbage on screen.
+	const bool importable = is_10bit ? (experimental_10bit && pf.pixelformat == V4L2_PIX_FMT_QC10C) : (pf.pixelformat == V4L2_PIX_FMT_NV12 || pf.pixelformat == V4L2_PIX_FMT_QC08C);
+	if (!importable) {
+		if (is_10bit) {
+			_fail(vformat("%d-bit video is not supported yet on this kernel: the decoder writes it as %s (offered: %s), which the player can't display yet.", stream_sps.bit_depth, _fourcc_to_string(pf.pixelformat), offered));
+		} else {
+			_fail(vformat("The decoder chose the CAPTURE format %s (offered: %s), which the player can't display (NV12 and Q08C only).", _fourcc_to_string(pf.pixelformat), offered));
+		}
+		return ERR_UNAVAILABLE;
 	}
 
 	Rect2i visible;
@@ -869,8 +885,29 @@ Error V4L2Decoder::_setup_capture() {
 
 	uint32_t pitch = pf.plane_fmt[0].bytesperline;
 	uint64_t chroma_offset = 0;
-	const bool ubwc = pf.pixelformat == V4L2_PIX_FMT_QC08C;
-	if (ubwc) {
+	const bool ubwc = pf.pixelformat == V4L2_PIX_FMT_QC08C || pf.pixelformat == V4L2_PIX_FMT_QC10C;
+	if (pf.pixelformat == V4L2_PIX_FMT_QC10C) {
+		// QC10C (UBWC-compressed TP10: three 10-bit samples in each 32-bit word, top 2 bits unused; W is a multiple of 192):
+		// Y metadata, Y, UV metadata, UV, each padded to 4 KiB (iris_yuv_buffer_size_qc10c()). Tiles of 48x4 samples
+		// (16x4 words), metadata rows of 64 bytes in 16-row units, pitch W * 4/3 aligned to 256, heights aligned to 16. That
+		// is the layout of a UBWC image of a 32-bit format, W/3 texels wide, per plane.
+		const auto align = [](uint64_t v, uint64_t a) { return (v + a - 1) / a * a; };
+		const uint64_t w = pf.width;
+		const uint64_t h = pf.height;
+		const uint64_t stride = align(w * 4 / 3, 256);
+		const uint64_t y_meta = align(align((w + 47) / 48, 64) * align((h + 3) / 4, 16), 4096);
+		const uint64_t y_size = align(stride * align(h, 16), 4096);
+		const uint64_t uv_meta = align(align(((w + 1) / 2 + 23) / 24, 64) * align(((h + 1) / 2 + 3) / 4, 16), 4096);
+		const uint64_t uv_size = align(stride * align((h + 1) / 2, 16), 4096);
+		const uint64_t total = align(y_meta + y_size + uv_meta + uv_size, 4096);
+		if (stride != pitch || (w % 192) != 0) {
+			_log(vformat("WARNING: QC10C %dx%d with bytesperline %d; expected a width that is a multiple of 192 and %d.", pf.width, pf.height, pitch, (int64_t)stride));
+		}
+		pitch = stride;
+		chroma_offset = y_meta + y_size;
+		_log(vformat("QC10C layout: Y metadata %d bytes, Y %d, UV metadata %d, UV %d; total %d (sizeimage %d)%s.", (int64_t)y_meta, (int64_t)y_size, (int64_t)uv_meta, (int64_t)uv_size, (int64_t)total,
+				pf.plane_fmt[0].sizeimage, total == pf.plane_fmt[0].sizeimage ? "" : ": MISMATCH, the import may fail or show garbage"));
+	} else if (ubwc) {
 		// QC08C (UBWC-compressed NV12) in one buffer: Y metadata, Y, UV metadata, UV, each padded to 4 KiB, as computed by
 		// iris_yuv_buffer_size_qc08c(). Metadata: one byte per 32x8 Y tile or 16x8 UV tile, rows of 64 bytes, 16-row units.
 		// For DRM_FORMAT_MOD_QCOM_COMPRESSED it's two memory planes, each starting at its metadata, with the pitch of its pixels.
@@ -1401,8 +1438,10 @@ Error V4L2Decoder::open_source(const Ref<MediaSource> &p_source) {
 		_fail(vformat("%s has no video stream.", path));
 		return ERR_INVALID_DATA;
 	}
-	if (info.codec != MediaSource::VIDEO_CODEC_H264 && info.codec != MediaSource::VIDEO_CODEC_HEVC) {
-		_fail(vformat("%s: %s video has no hardware decode path here (H.264 and HEVC only: VP9 crashes the decoder firmware, AV1 isn't exposed).", path, info.codec_name));
+	// Refuse what can't be shown before the device is opened: VP9 (firmware crashes), AV1, 10-bit (Q10C only), 4:2:2.
+	const String reason = MediaSource::get_hw_unsupported_reason(info, experimental_10bit);
+	if (!reason.is_empty()) {
+		_fail(reason);
 		return ERR_UNAVAILABLE;
 	}
 	if (!info.sps.valid) {
@@ -1742,6 +1781,11 @@ void V4L2Decoder::set_loop(bool p_loop) {
 	loop = p_loop;
 }
 
+void V4L2Decoder::set_experimental_10bit(bool p_enabled) {
+	SETTING_GUARD();
+	experimental_10bit = p_enabled;
+}
+
 void V4L2Decoder::set_verbose(bool p_verbose) {
 	verbose = p_verbose;
 }
@@ -1789,6 +1833,8 @@ void V4L2Decoder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_loop", "loop"), &V4L2Decoder::set_loop);
 	ClassDB::bind_method(D_METHOD("get_loop"), &V4L2Decoder::get_loop);
 	ClassDB::bind_method(D_METHOD("set_verbose", "verbose"), &V4L2Decoder::set_verbose);
+	ClassDB::bind_method(D_METHOD("set_experimental_10bit", "enabled"), &V4L2Decoder::set_experimental_10bit);
+	ClassDB::bind_method(D_METHOD("is_experimental_10bit"), &V4L2Decoder::is_experimental_10bit);
 	ClassDB::bind_method(D_METHOD("is_verbose"), &V4L2Decoder::is_verbose);
 	ClassDB::bind_method(D_METHOD("set_seek_eos", "mode"), &V4L2Decoder::set_seek_eos);
 	ClassDB::bind_method(D_METHOD("get_seek_eos"), &V4L2Decoder::get_seek_eos);
@@ -1803,6 +1849,7 @@ void V4L2Decoder::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "timeout_ms"), "set_timeout_ms", "get_timeout_ms");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "loop"), "set_loop", "get_loop");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "verbose"), "set_verbose", "is_verbose");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "experimental_10bit"), "set_experimental_10bit", "is_experimental_10bit");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "seek_eos", PROPERTY_HINT_ENUM, "Off,Prepend,Separate"), "set_seek_eos", "get_seek_eos");
 
 	BIND_ENUM_CONSTANT(STATE_CLOSED);

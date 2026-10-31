@@ -1550,6 +1550,35 @@ void MediaSource::close() {
 	subtitle_header = String();
 }
 
+String MediaSource::get_hw_unsupported_reason(const VideoInfo &p_info, bool p_allow_10bit) {
+	if (!p_info.valid) {
+		return "There is no video stream.";
+	}
+	switch (p_info.codec) {
+		case VIDEO_CODEC_H264:
+		case VIDEO_CODEC_HEVC:
+			break;
+		case VIDEO_CODEC_VP9:
+			// Policy, not a driver refusal: the device is never opened for VP9 (docs/research-device.md, SteamOS #2865).
+			return "VP9 video isn't played in hardware: on this SteamOS kernel the video decoder's firmware crashes on VP9 (from the second VP9 session after boot), which can restart the headset.";
+		case VIDEO_CODEC_AV1:
+			return "AV1 video can't be decoded in hardware: this SteamOS kernel doesn't expose the AV1 decoder.";
+		default:
+			return vformat("%s video can't be decoded in hardware (the Frame decodes H.264 and HEVC).", p_info.codec_name.to_upper());
+	}
+	const int bit_depth = MAX(p_info.bit_depth, (int)p_info.sps.bit_depth);
+	if (bit_depth > 8 && !p_allow_10bit) {
+		return vformat("%d-bit video is not supported yet on this kernel: the decoder writes it only in a compressed 10-bit format (Q10C) that the player can't display yet.", bit_depth);
+	}
+	if (bit_depth > 10) {
+		return vformat("%d-bit video can't be decoded in hardware (8 and 10 bits only).", bit_depth);
+	}
+	if (p_info.sps.valid && p_info.sps.chroma_format != 1) {
+		return vformat("%s video can't be decoded in hardware (4:2:0 only).", p_info.sps.chroma_format == 2 ? "4:2:2" : (p_info.sps.chroma_format == 3 ? "4:4:4" : "Monochrome"));
+	}
+	return String();
+}
+
 Dictionary MediaSource::get_video_info() const {
 	Dictionary d;
 	if (!video.valid) {
@@ -1571,8 +1600,10 @@ Dictionary MediaSource::get_video_info() const {
 	d["is_hevc"] = video.codec == VIDEO_CODEC_HEVC;
 	d["is_vp9"] = video.codec == VIDEO_CODEC_VP9;
 	d["is_av1"] = video.codec == VIDEO_CODEC_AV1;
-	// What the Steam Frame decodes in hardware to a format we can import (spike 01): H.264 and HEVC, 8-bit.
-	d["hw_decodable"] = _is_annexb_codec() && video.bit_depth <= 8;
+	// What the Steam Frame decodes in hardware to a format we can import (spike 01): H.264 and HEVC, 8-bit, 4:2:0.
+	const String hw_reason = get_hw_unsupported_reason(video);
+	d["hw_decodable"] = hw_reason.is_empty();
+	d["hw_unsupported_reason"] = hw_reason;
 	d["annexb_filter"] = bsf != nullptr;
 	if (video.sps.valid) {
 		d["coded_width"] = video.sps.width;

@@ -67,6 +67,15 @@ public:
 class HWVideoTexture : public RefCounted {
 	GDCLASS(HWVideoTexture, RefCounted);
 
+public:
+	// How the plane textures hold the samples.
+	enum Packing {
+		PACKING_NV12, // Y as R8 (luminance), interleaved CbCr as R8G8 at half size (NV12 and Q08C).
+		PACKING_TP10_RGBA8, // Q10C: each texel is a 32-bit word of three 10-bit samples, as R8G8B8A8 (bytes, little-endian).
+		PACKING_TP10_RGB10A2, // Q10C: the same words as A2B10G10R10: r, g, b are the three samples.
+	};
+
+private:
 	enum BufferStatus {
 		BUFFER_DECODER, // Queued in the decoder (or never handed out).
 		BUFFER_READY, // Decoded, waiting for its time.
@@ -100,6 +109,10 @@ class HWVideoTexture : public RefCounted {
 	bool have_orphan = false;
 	Size2i decoded_size;
 	Rect2i visible_rect;
+	Size2i plane_sizes[DmabufImage::MAX_PLANES];
+	Packing packing = PACKING_NV12;
+	// Q10C import experiment: "rgb10a2", "rgb10a2_mutable", "rgba8" or "rgba8_mutable" (see q10c_view in the docs).
+	String q10c_view = "rgb10a2_mutable";
 	uint32_t serial = 0;
 	double clock = 0.0;
 	double frame_time = -1.0;
@@ -155,9 +168,14 @@ public:
 	Size2i get_decoded_size() const { return decoded_size; }
 	Rect2i get_visible_rect() const { return visible_rect; }
 	Rect2 get_visible_uv_rect() const;
+	Packing get_packing() const { return packing; }
+	void set_q10c_view(const String &p_view);
+	String get_q10c_view() const { return q10c_view; }
 	String get_last_error() const { return last_error; }
 	Dictionary get_stats() const;
 
 	HWVideoTexture();
 	~HWVideoTexture();
 };
+
+VARIANT_ENUM_CAST(HWVideoTexture::Packing);

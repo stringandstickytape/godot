@@ -402,6 +402,9 @@ public:
 
 	// C++ consumer API (V4L2Decoder).
 	const VideoInfo &get_video_stream_info() const { return video; }
+	// Why the Frame can't decode and show this video in hardware, as a sentence for the user; empty if it can.
+	// p_allow_10bit: V4L2Decoder.experimental_10bit (Q10C capture) is on.
+	static String get_hw_unsupported_reason(const VideoInfo &p_info, bool p_allow_10bit = false);
 	bool pop_video_packet(VideoPacket &r_packet);
 	void release_video_packet(VideoPacket &r_packet);
 	// The demux thread writes 1 to this eventfd when the video queue becomes non-empty, at the end and on seek. -1: none.

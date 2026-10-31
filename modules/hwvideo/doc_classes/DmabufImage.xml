@@ -67,6 +67,19 @@
 				For Qualcomm UBWC ([code]DRM_FORMAT_MOD_QCOM_COMPRESSED[/code], 0x0500000000000001, a decoder's Q08C buffers) give 2 memory planes: the offset of each is where its compression metadata starts, and the pitch is the pitch of its pixels. Turnip keeps UBWC on a mutable NV12 image only if all its view formats compress alike, which R8 and R8G8 don't. When the driver refuses the image with both view formats, the dmabuf is imported twice instead, as two images with the same layout: one with only the R8 view of plane 0, one with only the R8G8 view of plane 1. [method get_image_count] tells which.
 			</description>
 		</method>
+		<method name="import_planes">
+			<return type="int" enum="Error" />
+			<param index="0" name="fd" type="int" />
+			<param index="1" name="format" type="int" enum="RenderingDevice.DataFormat" />
+			<param index="2" name="drm_modifier" type="int" />
+			<param index="3" name="sizes" type="PackedVector2Array" />
+			<param index="4" name="offsets" type="PackedInt64Array" />
+			<param index="5" name="pitches" type="PackedInt64Array" />
+			<param index="6" name="mutable" type="bool" default="false" />
+			<description>
+				Imports each plane of the dmabuf [param fd] (1 or 2) as its own single-plane image of [param format] ([constant RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM], [constant RenderingDevice.DATA_FORMAT_A2B10G10R10_UNORM_PACK32], [constant RenderingDevice.DATA_FORMAT_R16G16_UNORM] or [constant RenderingDevice.DATA_FORMAT_R32_UINT]), with the given size in texels, offset and row pitch; the modifier must have one memory plane for that format. Plane [code]i[/code] is then the whole of image [code]i[/code]. With [param mutable], the images are mutable to a format of another UBWC class (R32_UINT, or R8G8B8A8 for R32_UINT); the driver's format query is reported but not enforced then. Experimental: used for 10-bit [code]Q10C[/code] decoder buffers (see [member HWVideoTexture.q10c_view]).
+			</description>
+		</method>
 		<method name="import_test_pattern">
 			<return type="int" enum="Error" />
 			<param index="0" name="width" type="int" />

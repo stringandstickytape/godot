@@ -36,6 +36,7 @@
 #include "core/variant/variant.h"
 
 #include "drivers/vulkan/godot_vulkan.h"
+#include "servers/rendering/rendering_device.h"
 
 // A dmabuf (e.g. a decoded video frame) imported once as a multi-planar VkImage, with one RenderingDevice texture per plane.
 // The memory is shared, not copied. The producer and the GPU take turns: acquire() after the producer has written a frame,
@@ -82,6 +83,7 @@ private:
 	Error _create_planes(VkDevice p_device, const VkImage *p_images, const VkDeviceMemory *p_memories, uint32_t p_image_count, int p_width, int p_height, uint64_t p_drm_modifier);
 	Error _import_host_test_pattern(int p_width, int p_height, bool p_split);
 	Error _transfer(bool p_acquire);
+	Error _import_planes_bind(int p_fd, RD::DataFormat p_format, int64_t p_drm_modifier, const PackedVector2Array &p_sizes, const PackedInt64Array &p_offsets, const PackedInt64Array &p_pitches, bool p_mutable);
 
 protected:
 	static void _bind_methods();
@@ -91,6 +93,9 @@ public:
 
 	Error import_nv12(int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches);
 	Error import_test_pattern(int p_width, int p_height, const String &p_device = "/dev/dri/card0");
+	// Imports each plane of a dmabuf as a single-plane image of p_format, one memory plane each (e.g. Q10C: each plane is laid
+	// out like a UBWC image of a 32-bit format). Plane i is the whole of image i. Experimental; see Q10C in HWVideoTexture.
+	Error import_planes(int p_fd, RD::DataFormat p_format, int64_t p_drm_modifier, const Size2i *p_sizes, const uint64_t *p_offsets, const uint64_t *p_pitches, uint32_t p_count, bool p_mutable);
 	void free_image();
 
 	Error acquire();

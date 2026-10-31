@@ -53,6 +53,12 @@
 				Returns the [RenderingDevice] texture of a plane of the frame on screen. It changes with every frame.
 			</description>
 		</method>
+		<method name="get_packing" qualifiers="const">
+			<return type="int" enum="HWVideoTexture.Packing" />
+			<description>
+				Returns how the plane textures hold the samples of the current decoder buffers. The shader must unpack [constant PACKING_TP10_RGBA8] and [constant PACKING_TP10_RGB10A2] itself, with [code]texelFetch[/code] (see [member q10c_view]).
+			</description>
+		</method>
 		<method name="get_plane_texture" qualifiers="const">
 			<return type="Texture2D" />
 			<param index="0" name="plane" type="int" />
@@ -146,6 +152,11 @@
 			</description>
 		</method>
 	</methods>
+	<members>
+		<member name="q10c_view" type="String" setter="set_q10c_view" getter="get_q10c_view" default="&quot;rgb10a2_mutable&quot;">
+			Experimental, with [member V4L2Decoder.experimental_10bit]: how a 10-bit decoder buffer ([code]Q10C[/code], UBWC-compressed TP10) is imported. Turnip has no TP10 format, but each plane of a Q10C buffer is laid out like a UBWC image of a 32-bit format, a third of the width in texels, and the Adreno 750 can read UBWC data as another format. Each texel is then a 32-bit word with three 10-bit samples (bits 0-9, 10-19, 20-29); the CbCr plane holds Cb and Cr alternately. [code]"rgb10a2"[/code] imports the planes as A2B10G10R10 (the three samples are r, g and b), [code]"rgba8"[/code] as R8G8B8A8 (the shader rebuilds the word from the bytes). The [code]_mutable[/code] variants make the images mutable to a format of another UBWC class, which on the A750 sets the descriptors' bit for reading UBWC across formats. Which, if any, gives a correct picture is what the experiment is for.
+		</member>
+	</members>
 	<signals>
 		<signal name="format_changed">
 			<description>
@@ -153,4 +164,15 @@
 			</description>
 		</signal>
 	</signals>
+	<constants>
+		<constant name="PACKING_NV12" value="0" enum="Packing">
+			Y as R8 (reads as luminance) and interleaved CbCr as R8G8 at half size (reads as luminance and alpha): NV12 and Q08C buffers.
+		</constant>
+		<constant name="PACKING_TP10_RGBA8" value="1" enum="Packing">
+			Q10C: each texel is a 32-bit word of three 10-bit samples, as R8G8B8A8 (the word's bytes, least significant in r).
+		</constant>
+		<constant name="PACKING_TP10_RGB10A2" value="2" enum="Packing">
+			Q10C: each texel is a 32-bit word of three 10-bit samples, as A2B10G10R10 (the samples are r, g and b).
+		</constant>
+	</constants>
 </class>

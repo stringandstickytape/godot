@@ -82,15 +82,15 @@ public:
 		double time = 0.0; // Presentation time in seconds. File: display-order index / fps. Source: the access unit's PTS.
 	};
 
-	// Layout of the CAPTURE buffers of one generation. Only single-buffer NV12 and QC08C are described.
+	// Layout of the CAPTURE buffers of one generation. Only single-buffer NV12, QC08C and QC10C are described.
 	struct CaptureLayout {
 		uint32_t generation = 0;
 		uint32_t fourcc = 0;
 		Size2i size; // G_FMT width and height. The height can include the driver's padding (e.g. 1088 for 1080).
-		uint32_t pitch = 0;
-		// NV12: where the chroma rows start. QC08C: where the UV metadata starts (the second memory plane of the modifier).
+		uint32_t pitch = 0; // Bytes per row of pixels (QC10C: of 32-bit words holding 3 samples each).
+		// NV12: where the chroma rows start. QC08C, QC10C: where the UV metadata starts (the second plane of the layout).
 		uint64_t chroma_offset = 0;
-		bool ubwc = false; // QC08C: DRM_FORMAT_MOD_QCOM_COMPRESSED.
+		bool ubwc = false; // QC08C, QC10C: DRM_FORMAT_MOD_QCOM_COMPRESSED.
 		uint64_t buffer_size = 0;
 		Rect2i visible;
 		LocalVector<int> fds; // One per buffer. get_capture_layout() returns duplicates, which the caller closes.
@@ -172,6 +172,7 @@ private:
 	int timeout_ms = 5000;
 	bool loop = false;
 	bool verbose = false;
+	bool experimental_10bit = false; // Decode 10-bit streams to Q10C for HWVideoTexture's experimental import.
 	SeekEOS seek_eos = SEEK_EOS_SEPARATE; // iris rejects the NAL unit in the keyframe's buffer (1 decoder error per seek).
 
 	// The stream, read-only while the worker runs. With a MediaSource (source valid) there is no file mapping: access
@@ -358,6 +359,8 @@ public:
 	void set_loop(bool p_loop);
 	bool get_loop() const { return loop; }
 	void set_verbose(bool p_verbose);
+	void set_experimental_10bit(bool p_enabled);
+	bool is_experimental_10bit() const { return experimental_10bit; }
 	bool is_verbose() const { return verbose; }
 	void set_seek_eos(SeekEOS p_mode);
 	SeekEOS get_seek_eos() const { return seek_eos; }
