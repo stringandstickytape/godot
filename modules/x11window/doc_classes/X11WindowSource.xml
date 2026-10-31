@@ -36,6 +36,20 @@
 				Stops the capture and closes the X connection.
 			</description>
 		</method>
+		<method name="close_window">
+			<return type="int" enum="Error" />
+			<param index="0" name="window" type="int" />
+			<description>
+				Asks the window to close (ICCCM [code]WM_DELETE_WINDOW[/code]), as a window manager's close button does.
+			</description>
+		</method>
+		<method name="get_atom">
+			<return type="int" />
+			<param index="0" name="name" type="String" />
+			<description>
+				The X atom for [param name] (created if needed), e.g. for [method send_client_message] data.
+			</description>
+		</method>
 		<method name="delete_window_property">
 			<return type="int" enum="Error" />
 			<param index="0" name="window" type="int" />
