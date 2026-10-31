@@ -61,9 +61,13 @@ void AudioStreamMedia::_bind_methods() {
 
 /* AudioStreamPlaybackMedia */
 
+// Seeking flushes the source's queues and the decoder's input, so it is skipped when the source is already there
+// (AudioStreamPlayer.play(t) right after MediaSource.seek(t), or play(source.get_position()) to resume).
+static constexpr double SEEK_TOLERANCE = 0.05;
+
 void AudioStreamPlaybackMedia::start(double p_from_pos) {
 	active = true;
-	if (p_from_pos > 0.0 && source.is_valid() && source->is_open()) {
+	if (p_from_pos > 0.0 && source.is_valid() && source->is_open() && Math::abs(p_from_pos - source->get_audio_position()) > SEEK_TOLERANCE) {
 		source->seek(p_from_pos);
 	}
 }
@@ -81,7 +85,7 @@ double AudioStreamPlaybackMedia::get_playback_position() const {
 }
 
 void AudioStreamPlaybackMedia::seek(double p_time) {
-	if (source.is_valid() && source->is_open()) {
+	if (source.is_valid() && source->is_open() && Math::abs(p_time - source->get_audio_position()) > SEEK_TOLERANCE) {
 		source->seek(p_time);
 	}
 }

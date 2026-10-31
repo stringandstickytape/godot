@@ -360,7 +360,13 @@ void MediaSource::_open_audio_track(int p_track) {
 			if (r >= 0) {
 				audio_codec->pkt_timebase = stream->time_base;
 				audio_codec->thread_count = 1;
-				r = avcodec_open2(audio_codec, codec, nullptr);
+				AVDictionary *options = nullptr;
+				for (const KeyValue<Variant, Variant> &kv : audio_decoder_options) {
+					av_dict_set(&options, String(kv.key).utf8().get_data(), String(kv.value).utf8().get_data(), 0);
+				}
+				r = avcodec_open2(audio_codec, codec, &options);
+				// Options the decoder doesn't have stay in the dictionary: other codecs' options are fine to pass.
+				av_dict_free(&options);
 			}
 			if (r < 0) {
 				problem = vformat("opening the %s decoder failed: %s", codec->name, _av_error(r));
@@ -369,6 +375,7 @@ void MediaSource::_open_audio_track(int p_track) {
 		}
 		if (problem.is_empty()) {
 			current_audio_stream = index;
+			print_line(vformat("MediaSource: audio track %d: %s decoder%s.", p_track, codec->name, audio_decoder_options.is_empty() ? String() : vformat(" with options %s", Variant(audio_decoder_options))));
 		} else {
 			// Not fatal: the video plays on, without audio (AudioStreamMedia finishes at once).
 			MutexLock lock(mutex);
@@ -1072,6 +1079,8 @@ Error MediaSource::open(const String &p_path) {
 		video.height = par->height;
 		const AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
 		video.fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
+		const AVRational sar = av_guess_sample_aspect_ratio(format, format->streams[best_video], nullptr);
+		video.sample_aspect_ratio = sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0;
 		const AVPixFmtDescriptor *pixel = av_pix_fmt_desc_get((AVPixelFormat)par->format);
 		video.pixel_format = pixel ? String::utf8(pixel->name) : String();
 		video.bit_depth = pixel ? pixel->comp[0].depth : par->bits_per_raw_sample;
@@ -1253,6 +1262,8 @@ Dictionary MediaSource::get_video_info() const {
 	d["width"] = video.width;
 	d["height"] = video.height;
 	d["fps"] = video.fps;
+	d["sample_aspect_ratio"] = video.sample_aspect_ratio;
+	d["display_aspect"] = video.height > 0 ? video.width * video.sample_aspect_ratio / video.height : 0.0;
 	d["bit_depth"] = video.bit_depth;
 	d["profile"] = video.profile;
 	d["pixel_format"] = video.pixel_format;
@@ -1528,6 +1539,11 @@ void MediaSource::set_downmix_normalize(bool p_normalize) {
 	downmix_normalize = p_normalize;
 }
 
+void MediaSource::set_audio_decoder_options(const Dictionary &p_options) {
+	SETTING_GUARD();
+	audio_decoder_options = p_options.duplicate();
+}
+
 MediaSource::~MediaSource() {
 	_close_internal();
 	for (AVPacket *packet : packet_pool) {
@@ -1568,10 +1584,13 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_audio_queue_seconds"), &MediaSource::get_audio_queue_seconds);
 	ClassDB::bind_method(D_METHOD("set_downmix_normalize", "normalize"), &MediaSource::set_downmix_normalize);
 	ClassDB::bind_method(D_METHOD("is_downmix_normalize"), &MediaSource::is_downmix_normalize);
+	ClassDB::bind_method(D_METHOD("set_audio_decoder_options", "options"), &MediaSource::set_audio_decoder_options);
+	ClassDB::bind_method(D_METHOD("get_audio_decoder_options"), &MediaSource::get_audio_decoder_options);
 
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "video_queue_seconds"), "set_video_queue_seconds", "get_video_queue_seconds");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "audio_queue_seconds"), "set_audio_queue_seconds", "get_audio_queue_seconds");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "downmix_normalize"), "set_downmix_normalize", "is_downmix_normalize");
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "audio_decoder_options"), "set_audio_decoder_options", "get_audio_decoder_options");
 
 	BIND_ENUM_CONSTANT(STATE_CLOSED);
 	BIND_ENUM_CONSTANT(STATE_READING);

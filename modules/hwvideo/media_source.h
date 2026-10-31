@@ -87,6 +87,7 @@ public:
 		int width = 0; // From the container / codec parameters (display size).
 		int height = 0;
 		double fps = 0.0;
+		double sample_aspect_ratio = 1.0; // Pixel aspect (anamorphic DVD, some broadcasts); 1 if square or unknown.
 		int bit_depth = 0;
 		String profile;
 		String pixel_format;
@@ -162,6 +163,7 @@ private:
 	double video_queue_seconds = 1.0;
 	double audio_queue_seconds = 1.0;
 	bool downmix_normalize = false;
+	Dictionary audio_decoder_options; // FFmpeg decoder AVOptions, e.g. {"core_only": "1"} for DTS without its extensions.
 
 	// Set up by open(), read-only while the thread runs.
 	String path;
@@ -350,6 +352,8 @@ public:
 	double get_audio_queue_seconds() const { return audio_queue_seconds; }
 	void set_downmix_normalize(bool p_normalize);
 	bool is_downmix_normalize() const { return downmix_normalize; }
+	void set_audio_decoder_options(const Dictionary &p_options);
+	Dictionary get_audio_decoder_options() const { return audio_decoder_options; }
 
 	~MediaSource();
 };

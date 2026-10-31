@@ -67,7 +67,8 @@ protected:
 	static void _bind_methods() {}
 
 public:
-	// p_from_pos > 0 seeks the source (and with it the video); 0 plays from where the source is.
+	// p_from_pos > 0 seeks the source (and with it the video) unless it is already within 50 ms of it; 0 plays from
+	// where the source is.
 	virtual void start(double p_from_pos = 0.0) override;
 	virtual void stop() override;
 	virtual bool is_playing() const override;
