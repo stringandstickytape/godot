@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="HWVideoPlaneTexture" inherits="Texture2D" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		One plane of the frame an [HWVideoTexture] shows.
+	</brief_description>
+	<description>
+		Returned by [method HWVideoTexture.get_plane_texture]. Its texture always points at the plane of the decoder buffer on screen, so a material that uses it never has to be changed. Before the first frame it shows limited-range black.
+	</description>
+	<tutorials>
+	</tutorials>
+</class>

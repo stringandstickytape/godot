@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="HWVideoTexture" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Shows the frames of a [V4L2Decoder] with no copy.
+	</brief_description>
+	<description>
+		Imports every decoder CAPTURE buffer once as a [DmabufImage], shows the frame that is due at the clock through two plane textures ([method get_plane_texture]), and gives buffers back to the decoder once the GPU is done with them. Call [method update] once per frame from the main thread.
+		Sample plane 0 (Y) with [code].r[/code] and plane 1 (CbCr) with [code].ra[/code], and crop to [method get_visible_uv_rect]: the decoder pads the height.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="close">
+			<return type="void" />
+			<description>
+				Frees the imported buffers and closes the decoder.
+			</description>
+		</method>
+		<method name="get_decoded_size" qualifiers="const">
+			<return type="Vector2i" />
+			<description>
+				Returns the size of the decoder buffers, including padding (for example 3840x1088 for 3840x1080 video).
+			</description>
+		</method>
+		<method name="get_decoder" qualifiers="const">
+			<return type="V4L2Decoder" />
+			<description>
+				Returns the decoder, to change its settings before [method open].
+			</description>
+		</method>
+		<method name="get_frame_time" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the time of the frame on screen, or -1.
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the last error.
+			</description>
+		</method>
+		<method name="get_plane_rd_rid" qualifiers="const">
+			<return type="RID" />
+			<param index="0" name="plane" type="int" />
+			<description>
+				Returns the [RenderingDevice] texture of a plane of the frame on screen. It changes with every frame.
+			</description>
+		</method>
+		<method name="get_plane_texture" qualifiers="const">
+			<return type="Texture2D" />
+			<param index="0" name="plane" type="int" />
+			<description>
+				Returns a texture that always shows the given plane (0: Y, 1: CbCr) of the frame on screen.
+			</description>
+		</method>
+		<method name="get_position" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the clock in seconds.
+			</description>
+		</method>
+		<method name="get_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns the decoder's [method V4L2Decoder.get_stats] plus [code]frames_shown[/code], [code]frames_dropped[/code] (late), [code]frames_stale[/code] (from before a seek), [code]position[/code] and [code]frame_time[/code].
+			</description>
+		</method>
+		<method name="get_visible_rect" qualifiers="const">
+			<return type="Rect2i" />
+			<description>
+				Returns the visible rectangle inside the decoded buffer, in pixels.
+			</description>
+		</method>
+		<method name="get_visible_uv_rect" qualifiers="const">
+			<return type="Rect2" />
+			<description>
+				Returns the visible rectangle in UV coordinates of the plane textures.
+			</description>
+		</method>
+		<method name="has_frame" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] once a frame is on screen.
+			</description>
+		</method>
+		<method name="is_playing" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] while the clock runs.
+			</description>
+		</method>
+		<method name="open">
+			<return type="int" enum="Error" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="codec" type="String" />
+			<param index="2" name="fps" type="float" />
+			<description>
+				Opens the decoder (see [method V4L2Decoder.open]). The first frame is shown as soon as it is decoded; the clock starts with [method play].
+			</description>
+		</method>
+		<method name="pause">
+			<return type="void" />
+			<description>
+				Stops the clock.
+			</description>
+		</method>
+		<method name="play">
+			<return type="void" />
+			<description>
+				Starts the clock.
+			</description>
+		</method>
+		<method name="seek_to_start">
+			<return type="void" />
+			<description>
+				Sets the clock to 0 and decodes from the start again. The current frame stays on screen until the first new one.
+			</description>
+		</method>
+		<method name="update">
+			<return type="void" />
+			<param index="0" name="delta" type="float" />
+			<param index="1" name="master_clock" type="float" default="-1.0" />
+			<description>
+				While playing, advances the clock by [param delta], or sets it to [param master_clock] if that is 0 or more (for example the audio position). Then shows the newest decoded frame whose time is at or before the clock and drops the older ones.
+			</description>
+		</method>
+	</methods>
+	<signals>
+		<signal name="format_changed">
+			<description>
+				Emitted when a new set of decoder buffers was imported: the decoded size or visible rectangle may have changed.
+			</description>
+		</signal>
+	</signals>
+</class>

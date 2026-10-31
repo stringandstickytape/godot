@@ -1,5 +1,5 @@
 def can_build(env, platform):
-    # Imports Linux dmabufs (e.g. hardware video decoder output) into the Vulkan RenderingDevice.
+    # V4L2 hardware video decoding, and Linux dmabufs (e.g. decoder output) imported into the Vulkan RenderingDevice.
     return platform == "linuxbsd" and env["vulkan"]
 
 
@@ -10,6 +10,9 @@ def configure(env):
 def get_doc_classes():
     return [
         "DmabufImage",
+        "HWVideoPlaneTexture",
+        "HWVideoTexture",
+        "V4L2Decoder",
     ]
 
 

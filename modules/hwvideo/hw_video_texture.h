@@ -1,0 +1,147 @@
+/**************************************************************************/
+/*  hw_video_texture.h                                                    */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
+#pragma once
+
+#include "dmabuf_image.h"
+#include "v4l2_decoder.h"
+
+#include "scene/resources/texture.h"
+
+// One plane of the current video frame, as a Texture2D that a ShaderMaterial can use. Its RenderingServer RID is a proxy
+// that is pointed at the plane of whichever decoder buffer is shown, so the material never has to change.
+class HWVideoPlaneTexture : public Texture2D {
+	GDCLASS(HWVideoPlaneTexture, Texture2D);
+
+	RID placeholder;
+	RID proxy;
+	Size2i size;
+
+protected:
+	static void _bind_methods() {}
+
+public:
+	void init(int p_plane);
+	// An invalid RID shows the placeholder (black for plane 0, neutral chroma for plane 1).
+	void set_source(RID p_texture, const Size2i &p_size);
+
+	virtual int get_width() const override { return size.width; }
+	virtual int get_height() const override { return size.height; }
+	virtual RID get_rid() const override { return proxy; }
+	virtual bool has_alpha() const override { return false; }
+
+	~HWVideoPlaneTexture();
+};
+
+// Plays a V4L2Decoder's output with no copy: every CAPTURE buffer is imported once as a DmabufImage (per CAPTURE setup),
+// the frame due at the clock is shown through two plane textures, and buffers go back to the decoder only once the GPU is
+// done with them. Call update() once per frame from the main thread.
+class HWVideoTexture : public RefCounted {
+	GDCLASS(HWVideoTexture, RefCounted);
+
+	enum BufferStatus {
+		BUFFER_DECODER, // Queued in the decoder (or never handed out).
+		BUFFER_READY, // Decoded, waiting for its time.
+		BUFFER_SHOWN, // Acquired by the GPU; the plane textures point at it.
+		BUFFER_RETIRING, // Released; back to the decoder once the frames that sampled it are done.
+	};
+
+	struct Buffer {
+		Ref<DmabufImage> image;
+		RID planes[DmabufImage::MAX_PLANES]; // RenderingServer textures of the image's plane views.
+		BufferStatus status = BUFFER_DECODER;
+		uint64_t release_frame = 0;
+	};
+
+	struct ReadyFrame {
+		uint32_t buffer = 0;
+		double time = 0.0;
+	};
+
+	Ref<V4L2Decoder> decoder;
+	Ref<HWVideoPlaneTexture> plane_textures[DmabufImage::MAX_PLANES];
+	LocalVector<Buffer> buffers;
+	LocalVector<ReadyFrame> ready;
+	uint32_t generation = 0;
+	bool have_generation = false;
+	uint32_t failed_generation = UINT32_MAX;
+	int shown = -1;
+	// The shown buffer of an earlier CAPTURE generation: freed once the next frame is shown.
+	Buffer orphan;
+	bool have_orphan = false;
+	Size2i decoded_size;
+	Rect2i visible_rect;
+	uint32_t serial = 0;
+	double clock = 0.0;
+	double frame_time = -1.0;
+	bool playing = false;
+	uint64_t frames_shown = 0;
+	uint64_t frames_dropped = 0;
+	uint64_t frames_stale = 0;
+	String last_error;
+
+	static void _render_thread_swap(const Ref<DmabufImage> &p_release, const Ref<DmabufImage> &p_acquire, const Array &p_free);
+
+	Error _import_generation(uint32_t p_generation);
+	void _release_generation(Array &r_free);
+	void _free_buffer(Buffer &p_buffer, Array &r_free);
+	void _show(const ReadyFrame &p_frame, uint64_t p_frames_drawn);
+
+protected:
+	static void _bind_methods();
+
+public:
+	Error open(const String &p_path, const String &p_codec, double p_fps);
+	void close();
+
+	// Advances the clock by p_delta while playing, or sets it to p_master_clock when that is >= 0 (e.g. the audio
+	// position), then shows the newest frame whose time is <= the clock. Older frames are dropped.
+	void update(double p_delta, double p_master_clock = -1.0);
+
+	void play();
+	void pause();
+	bool is_playing() const { return playing; }
+	void seek_to_start();
+	double get_position() const { return clock; }
+	double get_frame_time() const { return frame_time; }
+	bool has_frame() const { return shown >= 0 || have_orphan; }
+
+	Ref<V4L2Decoder> get_decoder() const { return decoder; }
+	Ref<Texture2D> get_plane_texture(int p_plane) const;
+	RID get_plane_rd_rid(int p_plane) const;
+	Size2i get_decoded_size() const { return decoded_size; }
+	Rect2i get_visible_rect() const { return visible_rect; }
+	Rect2 get_visible_uv_rect() const;
+	String get_last_error() const { return last_error; }
+	Dictionary get_stats() const;
+
+	HWVideoTexture();
+	~HWVideoTexture();
+};

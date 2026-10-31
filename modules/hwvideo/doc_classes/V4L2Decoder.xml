@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="V4L2Decoder" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		A V4L2 stateful hardware video decoder session, fed from a raw H.264 or HEVC file.
+	</brief_description>
+	<description>
+		Decodes a raw Annex-B elementary stream ([code].h264[/code] or [code].h265[/code]) with a Linux V4L2 stateful memory-to-memory decoder (the Steam Frame's Qualcomm iris decoder, [code]/dev/video-dec0[/code]) on a worker thread. The input is split into access units, one per OUTPUT buffer, and fed no further than [member lead_time] ahead of the clock set with [method set_clock]. Decoded CAPTURE buffers are exported as dmabufs once per CAPTURE setup.
+		Use it through [HWVideoTexture], which imports the decoded buffers into the [RenderingDevice] and hands them back. Only available on Linux with the Vulkan rendering driver.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="close">
+			<return type="void" />
+			<description>
+				Stops the worker thread, then STREAMOFFs and closes the device. Ioctls in progress are never interrupted.
+			</description>
+		</method>
+		<method name="get_clock" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the clock set with [method set_clock].
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the message of the last error, or an empty string.
+			</description>
+		</method>
+		<method name="get_state" qualifiers="const">
+			<return type="int" enum="V4L2Decoder.State" />
+			<description>
+				Returns the state of the session.
+			</description>
+		</method>
+		<method name="get_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns counters: [code]frames_decoded[/code], [code]frames_error[/code], [code]aus_queued[/code], [code]aus_skipped[/code], [code]queued_rate[/code] (the driver's estimate of the input rate), [code]latency_avg_ms[/code] and [code]latency_max_ms[/code] (OUTPUT QBUF to CAPTURE DQBUF), [code]source_changes[/code], [code]restarts[/code], the buffer counts, [code]state_name[/code] and [code]last_error[/code].
+			</description>
+		</method>
+		<method name="get_stream_info" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns the path, codec, frame rate, and the coded and display size and bit depth from the first SPS.
+			</description>
+		</method>
+		<method name="is_open" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] between a successful [method open] and [method close].
+			</description>
+		</method>
+		<method name="open">
+			<return type="int" enum="Error" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="codec" type="String" />
+			<param index="2" name="fps" type="float" />
+			<description>
+				Maps the file, reads the coded size from its first SPS, opens [member device_path] and starts the worker thread. [param codec] is [code]"h264"[/code] or [code]"hevc"[/code]. [param fps] sets the frame times (display index / fps) and the timestamps given to the driver.
+			</description>
+		</method>
+		<method name="probe_file" qualifiers="static">
+			<return type="Dictionary" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="codec" type="String" />
+			<description>
+				Splits the whole file into access units without decoding and returns [code]access_units[/code], [code]max_au_bytes[/code], [code]avg_au_bytes[/code], the first SPS ([code]width[/code], [code]height[/code], [code]display_width[/code], [code]display_height[/code], [code]bit_depth[/code]), [code]sps_size_changes[/code] and [code]parse_seconds[/code].
+			</description>
+		</method>
+		<method name="seek_to_start">
+			<return type="int" />
+			<description>
+				Feeds from the first access unit again and returns the new seek serial. Frames fed before are dropped by the consumer. After the end of the stream was drained, the session is restarted.
+			</description>
+		</method>
+		<method name="set_clock">
+			<param index="0" name="seconds" type="float" />
+			<return type="void" />
+			<description>
+				Sets the playback position that paces the input.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="capture_buffer_count" type="int" setter="set_capture_buffer_count" getter="get_capture_buffer_count" default="12">
+			Number of CAPTURE buffers to request. The driver may give more.
+		</member>
+		<member name="capture_format" type="String" setter="set_capture_format" getter="get_capture_format" default="&quot;NV12&quot;">
+			CAPTURE fourcc to ask for after SOURCE_CHANGE, or empty for the driver's choice. [HWVideoTexture] can import only NV12.
+		</member>
+		<member name="device_path" type="String" setter="set_device_path" getter="get_device_path" default="&quot;/dev/video-dec0&quot;">
+			The decoder device.
+		</member>
+		<member name="lead_time" type="float" setter="set_lead_time" getter="get_lead_time" default="0.25">
+			How far ahead of the clock, in seconds, access units are fed.
+		</member>
+		<member name="loop" type="bool" setter="set_loop" getter="get_loop" default="false">
+			If [code]true[/code], the input continues from the first access unit at the end of the file, with no gap in the frame times.
+		</member>
+		<member name="output_buffer_count" type="int" setter="set_output_buffer_count" getter="get_output_buffer_count" default="8">
+			Number of OUTPUT (bitstream) buffers.
+		</member>
+		<member name="output_buffer_size" type="int" setter="set_output_buffer_size" getter="get_output_buffer_size" default="0">
+			Size of each OUTPUT buffer in bytes, or 0 to derive it from the coded size. Larger access units are skipped.
+		</member>
+		<member name="reconfig_rate" type="float" setter="set_reconfig_rate" getter="get_reconfig_rate" default="25.0">
+			Before a CAPTURE re-setup, the input pauses until the driver's queued-rate estimate is at most this rate, so the driver's admission check passes. 0 disables the pause.
+		</member>
+		<member name="timeout_ms" type="int" setter="set_timeout_ms" getter="get_timeout_ms" default="5000">
+			No-progress time after which the session is declared hung and closed.
+		</member>
+		<member name="verbose" type="bool" setter="set_verbose" getter="is_verbose" default="false">
+			Logs every setup step.
+		</member>
+	</members>
+	<constants>
+		<constant name="STATE_CLOSED" value="0" enum="State">
+		</constant>
+		<constant name="STATE_STARTING" value="1" enum="State">
+			Fed, waiting for the first SOURCE_CHANGE.
+		</constant>
+		<constant name="STATE_DECODING" value="2" enum="State">
+		</constant>
+		<constant name="STATE_RECONFIGURING" value="3" enum="State">
+			Handling a resolution change.
+		</constant>
+		<constant name="STATE_ENDED" value="4" enum="State">
+			The end of the stream was drained.
+		</constant>
+		<constant name="STATE_ERROR" value="5" enum="State">
+			See [method get_last_error]. The device is closed.
+		</constant>
+	</constants>
+</class>

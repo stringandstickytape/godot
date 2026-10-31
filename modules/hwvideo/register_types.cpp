@@ -31,6 +31,8 @@
 #include "register_types.h"
 
 #include "dmabuf_image.h"
+#include "hw_video_texture.h"
+#include "v4l2_decoder.h"
 
 #include "core/object/class_db.h"
 
@@ -40,6 +42,9 @@ void initialize_hwvideo_module(ModuleInitializationLevel p_level) {
 	}
 
 	GDREGISTER_CLASS(DmabufImage);
+	GDREGISTER_CLASS(V4L2Decoder);
+	GDREGISTER_CLASS(HWVideoTexture);
+	GDREGISTER_ABSTRACT_CLASS(HWVideoPlaneTexture);
 }
 
 void uninitialize_hwvideo_module(ModuleInitializationLevel p_level) {
