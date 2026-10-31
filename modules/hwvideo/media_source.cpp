@@ -356,7 +356,7 @@ bool MediaSource::_needs_input_locked() const {
 	bool audio_enough = true;
 	if (current_audio_stream >= 0 && audio_fifo_count == 0 && scratch_frames == 0) {
 		MutexLock audio_lock(audio_mutex);
-		audio_enough = audio_eof || (double)(ring_write - ring_read) >= audio_queue_seconds * output_rate;
+		audio_enough = audio_eof || (double)(ring_write - ring_read) >= audio_target_seconds * output_rate;
 	}
 	return !(video_enough && audio_enough);
 }
@@ -847,7 +847,11 @@ void MediaSource::_mix(int p_reader, AudioFrame *p_buffer, int p_frames) {
 	{
 		MutexLock audio_lock(audio_mutex);
 		bool counts = true; // The reader that starts a mix step counts frames, underruns and moves the clock.
-		if (ring_capacity > 0) {
+		if (live_preroll_frames > 0 && !live_playing && (audio_eof || ring_write - ring_read >= live_preroll_frames)) {
+			live_playing = true;
+		}
+		const bool live_hold = live_preroll_frames > 0 && !live_playing; // Every reader holds: nothing is taken.
+		if (ring_capacity > 0 && !live_hold) {
 			if (playback_speed != 1.0 && tempo != nullptr) {
 				// The time stretch is for the stereo mix only: channel streams are silent at other speeds.
 				if (p_reader == 0) {
@@ -917,6 +921,7 @@ void MediaSource::_mix(int p_reader, AudioFrame *p_buffer, int p_frames) {
 		if (!counts) {
 			// Another reader of this step keeps the counts.
 		} else if (got < (uint32_t)p_frames && !audio_eof) {
+			live_playing = false; // Live: buffer live_latency again before going on.
 			if (!audio_in_underrun) {
 				if (audio_mixed_since_seek) {
 					audio_underruns++;
@@ -930,7 +935,7 @@ void MediaSource::_mix(int p_reader, AudioFrame *p_buffer, int p_frames) {
 		}
 		const uint64_t fill = ring_write - ring_read;
 		const uint32_t wanted = audio_space_wanted.get();
-		wake = (wanted > 0 && ring_capacity - fill >= wanted) || (double)fill < audio_queue_seconds * 0.75 * output_rate;
+		wake = (wanted > 0 && ring_capacity - fill >= wanted) || (double)fill < audio_target_seconds * 0.75 * output_rate;
 	}
 	if (got < (uint32_t)p_frames) {
 		memset((void *)(p_buffer + got), 0, (size_t)(p_frames - got) * sizeof(AudioFrame));
@@ -1790,6 +1795,10 @@ Error MediaSource::open(const String &p_path) {
 		audio_eof = false;
 		audio_in_underrun = false;
 		audio_mixed_since_seek = false;
+		live_preroll_frames = is_live() ? (uint64_t)(live_latency * output_rate) : 0;
+		live_playing = false;
+		// The thread must read past the pre-roll, or the hold would never end.
+		audio_target_seconds = is_live() ? MAX(audio_queue_seconds, live_latency + 0.25) : audio_queue_seconds;
 		audio_underruns = 0;
 		audio_seek_waits = 0;
 		audio_frames_mixed = 0;
@@ -2287,6 +2296,7 @@ int MediaSource::seek(double p_seconds) {
 		audio_eof = audio_track < 0;
 		audio_in_underrun = false;
 		audio_mixed_since_seek = false;
+		live_playing = false;
 	}
 	condition.notify_one();
 	_wake_consumer_locked();
@@ -2384,6 +2394,7 @@ Dictionary MediaSource::get_stats() const {
 		d["net_packets"] = n.packets;
 		d["net_overruns"] = n.overruns;
 		d["net_skips"] = n.skips;
+		d["net_wakeups"] = n.wakeups;
 		d["net_average_mbps"] = n.open_seconds > 0.0 ? (double)n.bytes_read * 8.0 / n.open_seconds / 1e6 : 0.0;
 		d["net_thread_cpu_seconds"] = n.thread_cpu_seconds;
 	}
@@ -2708,7 +2719,7 @@ void MediaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "playback_speed", PROPERTY_HINT_RANGE, "0.5,2,0.05"), "set_playback_speed", "get_playback_speed");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "discrete_channels"), "set_discrete_channels", "is_discrete_channels");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "network_tls_verify"), "set_network_tls_verify", "is_network_tls_verify");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "live_latency", PROPERTY_HINT_RANGE, "0.1,10,0.1,suffix:s"), "set_live_latency", "get_live_latency");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "live_latency", PROPERTY_HINT_RANGE, "0.1,2.5,0.1,suffix:s"), "set_live_latency", "get_live_latency");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "night_mode"), "set_night_mode", "is_night_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "night_mode_strength", PROPERTY_HINT_RANGE, "0,1,0.05"), "set_night_mode_strength", "get_night_mode_strength");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "dialogue_boost", PROPERTY_HINT_RANGE, "0,12,0.5,suffix:dB"), "set_dialogue_boost", "get_dialogue_boost");

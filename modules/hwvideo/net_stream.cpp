@@ -212,30 +212,44 @@ void NetStream::set_live_limit(double p_seconds) {
 void NetStream::_wrote_locked(uint64_t p_bytes) {
 	ring_end += p_bytes;
 	stats.bytes_read += p_bytes;
-	if (live) {
-		const uint64_t now = now_usec();
-		if (rate_since_usec == 0) {
-			rate_since_usec = now;
-		}
-		rate_bytes += p_bytes;
-		const double elapsed = (now - rate_since_usec) / 1e6;
-		if (elapsed >= 1.0) {
-			const double rate = rate_bytes / elapsed;
-			arrival_rate = arrival_rate > 0.0 ? arrival_rate * 0.7 + rate * 0.3 : rate;
-			rate_bytes = 0;
-			rate_since_usec = now;
-		}
-		if (live_limit > 0.0 && arrival_rate > 0.0) {
-			const uint64_t limit = MIN(MAX((uint64_t)(arrival_rate * live_limit), (uint64_t)64 << 10), capacity / 2);
-			if (ring_end - position > limit) {
-				const uint64_t to = ring_end - limit / 2;
-				stats.overruns += to - MAX(position, ring_start);
-				stats.skips++;
-				position = to;
-			}
+	if (!live) {
+		condition.notify_all();
+		return;
+	}
+	const uint64_t now = now_usec();
+	if (rate_since_usec == 0) {
+		rate_since_usec = now;
+	}
+	rate_bytes += p_bytes;
+	const double elapsed = (now - rate_since_usec) / 1e6;
+	if (elapsed >= 1.0) {
+		const double rate = rate_bytes / elapsed;
+		arrival_rate = arrival_rate > 0.0 ? arrival_rate * 0.7 + rate * 0.3 : rate;
+		rate_bytes = 0;
+		rate_since_usec = now;
+	}
+	if (live_limit > 0.0 && arrival_rate > 0.0) {
+		const uint64_t limit = MIN(MAX((uint64_t)(arrival_rate * live_limit), (uint64_t)64 << 10), capacity / 2);
+		if (ring_end - position > limit) {
+			const uint64_t to = ring_end - limit / 2;
+			stats.overruns += to - MAX(position, ring_start);
+			stats.skips++;
+			position = to;
 		}
 	}
-	condition.notify_all();
+	_wake_reader_locked(now, true);
+}
+
+// mutex held, live: wakes a waiting reader once it has enough, or has waited long enough with something to read.
+// Without p_wrote (a quiet socket), only the second.
+void NetStream::_wake_reader_locked(uint64_t p_now, bool p_wrote) {
+	if (reader_wait_usec == 0) {
+		return;
+	}
+	const uint64_t ready = ring_end > position ? ring_end - position : 0;
+	if ((p_wrote && ready >= reader_want) || (ready > 0 && p_now - reader_wait_usec >= GATHER_USEC)) {
+		condition.notify_all();
+	}
 }
 
 bool NetStream::_stop_requested() const {
@@ -700,7 +714,11 @@ bool NetStream::_open_udp(String &r_error) {
 			return false;
 		}
 	}
-	description = multicast ? vformat("UDP multicast %s port %d (%d interfaces, live)", url.host, url.port, joined) : vformat("UDP port %d (live)", url.port);
+	// What the kernel granted (net.core.rmem_max caps it, often at 208 KiB, reported doubled): the burst it can hold.
+	socklen_t length = sizeof(receive_buffer);
+	getsockopt(udp_socket, SOL_SOCKET, SO_RCVBUF, &receive_buffer, &length);
+	const String buffer_kib = vformat("%d KiB socket buffer", receive_buffer >> 10);
+	description = multicast ? vformat("UDP multicast %s port %d (%d interfaces, live, %s)", url.host, url.port, joined, buffer_kib) : vformat("UDP port %d (live, %s)", url.port, buffer_kib);
 	return true;
 }
 
@@ -716,15 +734,25 @@ void NetStream::_reader_loop() {
 	if (udp) {
 		datagram.resize(65536);
 	}
+	uint64_t cpu_checked_usec = 0;
 	for (;;) {
 		bool reset = false;
 		uint64_t reset_offset = 0;
 		uint32_t gen;
 		uint8_t *span = nullptr;
 		uint64_t span_size = 0;
+		int poll_ms = 250;
 		{
 			MutexLock lock(mutex);
-			stats.thread_cpu_seconds = thread_cpu_now();
+			stats.wakeups++;
+			const uint64_t now = now_usec();
+			if (now - cpu_checked_usec >= 100000) { // A system call: not for every datagram.
+				cpu_checked_usec = now;
+				stats.thread_cpu_seconds = thread_cpu_now();
+			}
+			if (reader_wait_usec != 0 && ring_end > position) {
+				poll_ms = (int)(GATHER_USEC / 1000); // Hand what there is to the reader soon even if nothing more comes.
+			}
 			if (abort_flag.is_set()) {
 				return;
 			}
@@ -736,8 +764,9 @@ void NetStream::_reader_loop() {
 			gen = generation;
 			if (!reset) {
 				if (live) {
-					// Make room by dropping the oldest data, even data not read yet.
-					const uint64_t need = udp ? 65536 : 64 << 10;
+					// Make room by dropping the oldest data, even data not read yet. A whole span's worth at once: with
+					// only 64 KiB free, UDP would take one datagram per wake-up.
+					const uint64_t need = 256 << 10;
 					if (capacity - (ring_end - ring_start) < need) {
 						const uint64_t drop = need - (capacity - (ring_end - ring_start));
 						if (position < ring_start + drop) {
@@ -776,29 +805,59 @@ void NetStream::_reader_loop() {
 		int got = 0;
 		if (udp) {
 			struct pollfd fds[2] = { { udp_socket, POLLIN, 0 }, { wake_fd, POLLIN, 0 } };
-			if (poll(fds, 2, 250) <= 0 || !(fds[0].revents & POLLIN)) {
-				uint64_t value;
-				ssize_t drained = read(wake_fd, &value, sizeof(value));
-				(void)drained;
+			if (poll(fds, 2, poll_ms) <= 0 || !(fds[0].revents & POLLIN)) {
+				if (fds[1].revents & POLLIN) {
+					uint64_t value;
+					ssize_t drained = read(wake_fd, &value, sizeof(value));
+					(void)drained;
+				}
+				MutexLock lock(mutex);
+				_wake_reader_locked(now_usec(), false);
 				continue;
 			}
-			// One datagram: straight into the ring if it fits there, else through the side buffer.
-			const bool direct = span_size >= 65536;
-			const ssize_t n = recv(udp_socket, direct ? span : datagram.ptr(), direct ? span_size : datagram.size(), 0);
+			// Every datagram waiting (up to UDP_BATCH), straight into the ring while 64 KiB still fit there contiguously.
+			uint64_t filled = 0;
+			int count = 0;
+			bool empty = false;
+			while (count < UDP_BATCH && span_size - filled >= 65536) {
+				const ssize_t n = recv(udp_socket, span + filled, span_size - filled, MSG_DONTWAIT);
+				if (n <= 0) {
+					empty = true;
+					break;
+				}
+				filled += (uint64_t)n;
+				count++;
+			}
+			if (count > 0) {
+				{
+					MutexLock lock(mutex);
+					stats.packets += count;
+					_wrote_locked(filled);
+				}
+				if (empty && UDP_GATHER_MS > 0) {
+					// The socket is empty: let the next datagrams gather in its buffer (4 MiB asked for), so there is
+					// one wake-up per UDP_GATHER_MS, not one per datagram, at any rate. close() still ends it at once.
+					struct pollfd wake = { wake_fd, POLLIN, 0 };
+					poll(&wake, 1, UDP_GATHER_MS);
+				}
+				continue;
+			}
+			if (span_size >= 65536) {
+				continue; // Nothing there after all.
+			}
+			// Near the ring's end: one datagram through the side buffer, in two pieces (the drop above left 64 KiB).
+			const ssize_t n = recv(udp_socket, datagram.ptr(), datagram.size(), MSG_DONTWAIT);
 			if (n <= 0) {
 				continue;
 			}
 			MutexLock lock(mutex);
 			stats.packets++;
-			if (!direct) {
-				// Two pieces around the ring's end (the drop above left room for 64 KiB).
-				uint64_t done = 0;
-				while (done < (uint64_t)n) {
-					const uint64_t at = (ring_end + done) % capacity;
-					const uint64_t piece = MIN((uint64_t)n - done, capacity - at);
-					memcpy(ring + at, datagram.ptr() + done, piece);
-					done += piece;
-				}
+			uint64_t done = 0;
+			while (done < (uint64_t)n) {
+				const uint64_t at = (ring_end + done) % capacity;
+				const uint64_t piece = MIN((uint64_t)n - done, capacity - at);
+				memcpy(ring + at, datagram.ptr() + done, piece);
+				done += piece;
 			}
 			_wrote_locked((uint64_t)n);
 			continue;
@@ -812,6 +871,10 @@ void NetStream::_reader_loop() {
 			continue;
 		}
 		if (got == 0) {
+			if (live) {
+				MutexLock lock(mutex);
+				_wake_reader_locked(now_usec(), false);
+			}
 			continue;
 		}
 		// The body ended.
@@ -852,7 +915,13 @@ int NetStream::_read(uint8_t *p_buffer, int p_size) {
 		if (position < ring_start) {
 			position = ring_start; // Live: what was not read in time is gone.
 		}
-		if (position < ring_end) {
+		bool ready = position < ring_end;
+		if (ready && live && wait_start && !failed && !eof) {
+			// It ran dry: take a batch, not each datagram as it comes (the thread wakes it, _wake_reader_locked).
+			ready = ring_end - position >= reader_want || now_usec() - wait_start >= GATHER_USEC;
+		}
+		if (ready) {
+			reader_wait_usec = 0;
 			const uint64_t n = MIN((uint64_t)p_size, ring_end - position);
 			uint64_t done = 0;
 			while (done < n) {
@@ -869,15 +938,19 @@ int NetStream::_read(uint8_t *p_buffer, int p_size) {
 			return (int)n;
 		}
 		if (failed) {
+			reader_wait_usec = 0;
 			return AVERROR(EIO);
 		}
 		if (eof) {
+			reader_wait_usec = 0;
 			return AVERROR_EOF;
 		}
 		if (!wait_start) {
 			wait_start = now_usec();
 			stats.waits++;
 		}
+		reader_want = live ? MIN((uint64_t)p_size, GATHER_BYTES) : 1;
+		reader_wait_usec = wait_start;
 		condition.wait(lock);
 	}
 }

@@ -252,6 +252,7 @@ private:
 	static constexpr uint32_t AUDIO_FIFO_MAX = 8192; // Compressed audio packets (TrueHD: 1200 per second).
 	static constexpr uint64_t AUDIO_FIFO_MAX_BYTES = 32ull << 20;
 	static constexpr double AUDIO_RING_SECONDS = 4.0;
+	static constexpr double LIVE_LATENCY_MAX = 2.5; // The pre-roll plus a margin must fit the audio ring.
 	static constexpr uint32_t SUBTITLE_QUEUE_MAX = 512;
 	static constexpr int SEEK_RETRIES_MAX = 6;
 	static constexpr uint32_t BITRATE_SECONDS = 128; // Seconds of video bytes kept (behind and ahead of the read position).
@@ -299,7 +300,8 @@ private:
 	int64_t network_buffer_size = 16 << 20;
 	int network_requests = 4;
 	bool network_tls_verify = true;
-	double live_latency = 0.5; // Live streams: the probe, and how far behind the newest data the reader may fall.
+	double live_latency = 0.5; // Live streams: the audio buffered before playing, the probe, and the skip-ahead limit.
+	double audio_target_seconds = 1.0; // Decoded audio the thread keeps ahead: audio_queue_seconds, more for live.
 
 	Thread thread;
 
@@ -357,6 +359,10 @@ private:
 	bool audio_eof = false;
 	bool audio_in_underrun = false;
 	bool audio_mixed_since_seek = false; // An empty ring before the first frame after open/seek is a wait, not an underrun.
+	// Live: the mixer holds (silence, the clock stands) until this much audio is buffered, at the start and after an
+	// underrun, so live_latency of network jitter is absorbed. 0: not live.
+	uint64_t live_preroll_frames = 0;
+	bool live_playing = false;
 	uint64_t audio_underruns = 0;
 	uint64_t audio_seek_waits = 0;
 	uint64_t audio_frames_mixed = 0;
@@ -580,7 +586,7 @@ public:
 	int get_network_requests() const { return network_requests; }
 	void set_network_tls_verify(bool p_verify) { network_tls_verify = p_verify; } // Applies at the next open().
 	bool is_network_tls_verify() const { return network_tls_verify; }
-	void set_live_latency(double p_seconds) { live_latency = CLAMP(p_seconds, 0.1, 10.0); } // Applies at the next open().
+	void set_live_latency(double p_seconds) { live_latency = CLAMP(p_seconds, 0.1, LIVE_LATENCY_MAX); } // At the next open().
 	double get_live_latency() const { return live_latency; }
 	bool is_live() const;
 	bool is_seekable() const;

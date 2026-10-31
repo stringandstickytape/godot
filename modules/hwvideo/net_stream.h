@@ -65,6 +65,7 @@ public:
 		uint64_t packets = 0; // UDP datagrams.
 		uint64_t overruns = 0; // Live: bytes dropped because the reader was too far behind.
 		uint64_t skips = 0; // Live: times the reader was moved ahead.
+		uint64_t wakeups = 0; // Times the reader thread woke (loop turns): its share of the system calls.
 		double open_seconds = 0.0;
 		double thread_cpu_seconds = 0.0;
 	};
@@ -108,6 +109,10 @@ private:
 	static constexpr int RECONNECT_TRIES = 5;
 	static constexpr int WAIT_MS = 25; // Socket waits, so seeks, close() and abort() are seen this quickly.
 	static constexpr uint64_t SEEK_AHEAD = 256 << 10; // A seek this little past the ring waits for the reader instead.
+	static constexpr uint64_t GATHER_BYTES = 32 << 10; // Live: wake a waiting reader for this much...
+	static constexpr uint64_t GATHER_USEC = 20000; // ...or after this long (adds at most this to the latency).
+	static constexpr int UDP_BATCH = 64; // Datagrams taken per wake-up of the UDP thread...
+	static constexpr int UDP_GATHER_MS = 10; // ...which then waits this long for more to gather.
 
 	Url url;
 	bool tls_verify = true;
@@ -136,6 +141,10 @@ private:
 	bool eof = false;
 	bool failed = false;
 	String error;
+	// Live: a reader that ran dry is woken once it can take reader_want bytes or has waited GATHER_USEC, not for every
+	// datagram. reader_wait_usec: when it began to wait; 0 while it isn't waiting.
+	uint64_t reader_want = 0;
+	uint64_t reader_wait_usec = 0;
 	double live_limit = 0.0; // Seconds.
 	double arrival_rate = 0.0; // Bytes a second coming in (live), averaged.
 	uint64_t rate_bytes = 0;
@@ -168,6 +177,7 @@ private:
 
 	bool _stop_requested() const;
 	void _wrote_locked(uint64_t p_bytes);
+	void _wake_reader_locked(uint64_t p_now, bool p_wrote);
 	void _reader_loop();
 	static void _thread_func(void *p_userdata);
 	int _read(uint8_t *p_buffer, int p_size);
