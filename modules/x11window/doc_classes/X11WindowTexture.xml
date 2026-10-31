@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="X11WindowTexture" inherits="Texture2D" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		The picture of the window an [X11WindowSource] captures.
+	</brief_description>
+	<description>
+		Returned by [method X11WindowSource.get_texture]. Its RID is a RenderingServer proxy that follows the window's current buffer, so a material set up once keeps working. Values are sRGB-encoded in a UNORM format.
+	</description>
+	<tutorials>
+	</tutorials>
+</class>
