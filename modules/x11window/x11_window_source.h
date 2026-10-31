@@ -317,6 +317,9 @@ public:
 	Error set_window_property(int64_t p_window, const String &p_name, const String &p_type, const PackedInt64Array &p_values);
 	Error delete_window_property(int64_t p_window, const String &p_name);
 	Error send_client_message(int64_t p_window, const String &p_type, const PackedInt64Array &p_data, int64_t p_destination = 0);
+	// Asks the window to close (ICCCM WM_DELETE_WINDOW), as a window manager's close button does.
+	Error close_window(int64_t p_window);
+	int64_t get_atom(const String &p_name);
 
 	X11WindowSource();
 	~X11WindowSource();

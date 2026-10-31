@@ -1762,6 +1762,19 @@ Error X11WindowSource::send_client_message(int64_t p_window, const String &p_typ
 	return OK;
 }
 
+Error X11WindowSource::close_window(int64_t p_window) {
+	ERR_FAIL_NULL_V_MSG(connection, ERR_UNCONFIGURED, "Call open() first.");
+	PackedInt64Array data;
+	data.push_back(_atom("WM_DELETE_WINDOW"));
+	data.push_back(_server_time());
+	return send_client_message(p_window, "WM_PROTOCOLS", data, p_window);
+}
+
+int64_t X11WindowSource::get_atom(const String &p_name) {
+	ERR_FAIL_NULL_V_MSG(connection, 0, "Call open() first.");
+	return _atom(p_name);
+}
+
 /* Object */
 
 void X11WindowSource::_bind_methods() {
@@ -1812,6 +1825,8 @@ void X11WindowSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_window_property", "window", "name", "type", "values"), &X11WindowSource::set_window_property);
 	ClassDB::bind_method(D_METHOD("delete_window_property", "window", "name"), &X11WindowSource::delete_window_property);
 	ClassDB::bind_method(D_METHOD("send_client_message", "window", "type", "data", "destination"), &X11WindowSource::send_client_message, DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("close_window", "window"), &X11WindowSource::close_window);
+	ClassDB::bind_method(D_METHOD("get_atom", "name"), &X11WindowSource::get_atom);
 
 	ADD_SIGNAL(MethodInfo("window_closed"));
 	ADD_SIGNAL(MethodInfo("mapped_changed", PropertyInfo(Variant::BOOL, "mapped")));
