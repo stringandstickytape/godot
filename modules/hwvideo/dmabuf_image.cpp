@@ -52,6 +52,12 @@ static constexpr uint32_t MAX_MEMORY_PLANES = 4;
 static constexpr VkFormat NV12_FORMAT = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
 // The image format plus the formats of the plane views made by import_nv12().
 static const VkFormat NV12_VIEW_FORMATS[] = { NV12_FORMAT, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM };
+// Split import: image i has only the view format of plane i.
+static const VkFormat SPLIT_VIEW_FORMATS[DmabufImage::MAX_PLANES] = { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM };
+
+#ifndef DRM_FORMAT_MOD_QCOM_COMPRESSED
+#define DRM_FORMAT_MOD_QCOM_COMPRESSED fourcc_mod_code(QCOM, 1)
+#endif
 
 Mutex DmabufImage::pending_frees_mutex;
 LocalVector<DmabufImage::PendingFree> DmabufImage::pending_frees;
@@ -102,6 +108,160 @@ PackedInt64Array DmabufImage::get_supported_nv12_modifiers() {
 		}
 	}
 	return modifiers;
+}
+
+// Can a sampled NV12 image with this modifier, mutable to these view formats, be imported from a dmabuf?
+static VkResult _query_nv12_import(VkPhysicalDevice p_physical_device, uint64_t p_modifier, const VkFormat *p_view_formats, uint32_t p_view_format_count, VkExtent3D &r_max_extent, bool &r_importable) {
+	VkImageFormatListCreateInfo format_list = {};
+	format_list.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+	format_list.viewFormatCount = p_view_format_count;
+	format_list.pViewFormats = p_view_formats;
+
+	VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {};
+	modifier_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
+	modifier_info.pNext = &format_list;
+	modifier_info.drmFormatModifier = p_modifier;
+	modifier_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+	VkPhysicalDeviceExternalImageFormatInfo external_info = {};
+	external_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+	external_info.pNext = &modifier_info;
+	external_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+	VkPhysicalDeviceImageFormatInfo2 format_info = {};
+	format_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+	format_info.pNext = &external_info;
+	format_info.format = NV12_FORMAT;
+	format_info.type = VK_IMAGE_TYPE_2D;
+	format_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+	format_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+	format_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+	VkExternalImageFormatProperties external_properties = {};
+	external_properties.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+
+	VkImageFormatProperties2 image_format_properties = {};
+	image_format_properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+	image_format_properties.pNext = &external_properties;
+
+	const VkResult err = vkGetPhysicalDeviceImageFormatProperties2(p_physical_device, &format_info, &image_format_properties);
+	r_max_extent = image_format_properties.imageFormatProperties.maxExtent;
+	r_importable = external_properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+	return err;
+}
+
+// Creates an NV12 image with an explicit layout and binds it to a new import of the dmabuf (dedicated, of a duplicate fd: the
+// caller keeps theirs).
+static Error _create_imported_image(VkDevice p_device, PFN_vkGetMemoryFdPropertiesKHR p_get_memory_fd_properties, int p_fd, int p_width, int p_height, uint64_t p_modifier,
+		const VkSubresourceLayout *p_plane_layouts, uint32_t p_memory_plane_count, const VkFormat *p_view_formats, uint32_t p_view_format_count,
+		VkImage &r_image, VkDeviceMemory &r_memory, uint64_t &r_size, uint32_t &r_memory_type) {
+	VkImageFormatListCreateInfo format_list = {};
+	format_list.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+	format_list.viewFormatCount = p_view_format_count;
+	format_list.pViewFormats = p_view_formats;
+
+	VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_create_info = {};
+	modifier_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+	modifier_create_info.pNext = &format_list;
+	modifier_create_info.drmFormatModifier = p_modifier;
+	modifier_create_info.drmFormatModifierPlaneCount = p_memory_plane_count;
+	modifier_create_info.pPlaneLayouts = p_plane_layouts;
+
+	VkExternalMemoryImageCreateInfo external_create_info = {};
+	external_create_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+	external_create_info.pNext = &modifier_create_info;
+	external_create_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+	VkImageCreateInfo image_create_info = {};
+	image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	image_create_info.pNext = &external_create_info;
+	image_create_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+	image_create_info.imageType = VK_IMAGE_TYPE_2D;
+	image_create_info.format = NV12_FORMAT;
+	image_create_info.extent = { (uint32_t)p_width, (uint32_t)p_height, 1 };
+	image_create_info.mipLevels = 1;
+	image_create_info.arrayLayers = 1;
+	image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+	image_create_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+	image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+	image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VkImage image = VK_NULL_HANDLE;
+	VkResult err = vkCreateImage(p_device, &image_create_info, nullptr, &image);
+	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("vkCreateImage failed for NV12 dmabuf (VkResult %d). VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT (%d) means the offsets or pitches don't suit the driver.", err, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT));
+
+	VkMemoryRequirements memory_requirements = {};
+	vkGetImageMemoryRequirements(p_device, image, &memory_requirements);
+
+	VkMemoryFdPropertiesKHR fd_properties = {};
+	fd_properties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+	err = p_get_memory_fd_properties(p_device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, p_fd, &fd_properties);
+	if (err != VK_SUCCESS) {
+		vkDestroyImage(p_device, image, nullptr);
+		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("vkGetMemoryFdPropertiesKHR failed (VkResult %d). Is the fd a dmabuf?", err));
+	}
+
+	const uint32_t memory_type_bits = memory_requirements.memoryTypeBits & fd_properties.memoryTypeBits;
+	if (memory_type_bits == 0) {
+		vkDestroyImage(p_device, image, nullptr);
+		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("No memory type suits both the image (0x%x) and the dmabuf (0x%x).", memory_requirements.memoryTypeBits, fd_properties.memoryTypeBits));
+	}
+	uint32_t memory_type_index = 0;
+	while (!(memory_type_bits & (1u << memory_type_index))) {
+		memory_type_index++;
+	}
+
+	// The driver refuses to import less memory than the dmabuf holds; report it here rather than as a generic import failure.
+	const off_t dmabuf_size = lseek(p_fd, 0, SEEK_END);
+	if (dmabuf_size >= 0 && (uint64_t)dmabuf_size < memory_requirements.size) {
+		vkDestroyImage(p_device, image, nullptr);
+		ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, vformat("The dmabuf holds %d bytes, but the image needs %d.", (int64_t)dmabuf_size, (int64_t)memory_requirements.size));
+	}
+
+	// A successful import takes ownership of the fd, so give it a duplicate: the caller keeps theirs.
+	const int import_fd = fcntl(p_fd, F_DUPFD_CLOEXEC, 0);
+	if (import_fd < 0) {
+		vkDestroyImage(p_device, image, nullptr);
+		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("Couldn't duplicate the dmabuf fd: %s.", strerror(errno)));
+	}
+
+	VkMemoryDedicatedAllocateInfo dedicated_info = {};
+	dedicated_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+	dedicated_info.image = image;
+
+	VkImportMemoryFdInfoKHR import_info = {};
+	import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+	import_info.pNext = &dedicated_info;
+	import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	import_info.fd = import_fd;
+
+	VkMemoryAllocateInfo allocate_info = {};
+	allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate_info.pNext = &import_info;
+	allocate_info.allocationSize = memory_requirements.size;
+	allocate_info.memoryTypeIndex = memory_type_index;
+
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	err = vkAllocateMemory(p_device, &allocate_info, nullptr, &memory);
+	if (err != VK_SUCCESS) {
+		close(import_fd);
+		vkDestroyImage(p_device, image, nullptr);
+		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("Importing the dmabuf failed (VkResult %d).", err));
+	}
+
+	err = vkBindImageMemory(p_device, image, memory, 0);
+	if (err != VK_SUCCESS) {
+		vkFreeMemory(p_device, memory, nullptr);
+		vkDestroyImage(p_device, image, nullptr);
+		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("vkBindImageMemory failed (VkResult %d).", err));
+	}
+
+	r_image = image;
+	r_memory = memory;
+	r_size = memory_requirements.size;
+	r_memory_type = memory_type_index;
+	return OK;
 }
 
 Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches) {
@@ -158,48 +318,34 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 	}
 
 	// Plane views (R8 and R8G8 over the planes) need a mutable format, which must be listed with DRM format modifier tiling.
-	VkImageFormatListCreateInfo format_list = {};
-	format_list.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
-	format_list.viewFormatCount = std_size(NV12_VIEW_FORMATS);
-	format_list.pViewFormats = NV12_VIEW_FORMATS;
-
 	// Check the full combination up front: it gives a clearer error than vkCreateImage().
-	{
-		VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_info = {};
-		modifier_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
-		modifier_info.pNext = &format_list;
-		modifier_info.drmFormatModifier = modifier;
-		modifier_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-		VkPhysicalDeviceExternalImageFormatInfo external_info = {};
-		external_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
-		external_info.pNext = &modifier_info;
-		external_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-
-		VkPhysicalDeviceImageFormatInfo2 format_info = {};
-		format_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
-		format_info.pNext = &external_info;
-		format_info.format = NV12_FORMAT;
-		format_info.type = VK_IMAGE_TYPE_2D;
-		format_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-		format_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-		format_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-
-		VkExternalImageFormatProperties external_properties = {};
-		external_properties.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
-
-		VkImageFormatProperties2 image_format_properties = {};
-		image_format_properties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
-		image_format_properties.pNext = &external_properties;
-
-		VkResult err = vkGetPhysicalDeviceImageFormatProperties2(physical_device, &format_info, &image_format_properties);
-		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_UNAVAILABLE, vformat("NV12 + modifier %s + mutable format (plane views) + dmabuf import is not supported (VkResult %d).", _modifier_to_string(modifier), err));
-		ERR_FAIL_COND_V_MSG(!(external_properties.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT), ERR_UNAVAILABLE, "dmabufs can't be imported for this image.");
-		const VkExtent3D &max_extent = image_format_properties.imageFormatProperties.maxExtent;
-		ERR_FAIL_COND_V_MSG((uint32_t)p_width > max_extent.width || (uint32_t)p_height > max_extent.height, ERR_INVALID_PARAMETER, vformat("Size %dx%d is larger than the maximum %dx%d.", p_width, p_height, max_extent.width, max_extent.height));
+	VkExtent3D max_extent = {};
+	bool importable = false;
+	uint32_t count = 1;
+	VkResult err = _query_nv12_import(physical_device, modifier, NV12_VIEW_FORMATS, std_size(NV12_VIEW_FORMATS), max_extent, importable);
+	if (err != VK_SUCCESS && modifier != DRM_FORMAT_MOD_LINEAR) {
+		// Turnip refuses a UBWC NV12 image with views of formats that compress differently (R8 and R8G8): it would have to
+		// fall back to linear, which an explicit modifier doesn't allow. One image per plane view keeps the layout.
+		VkExtent3D max_extent_uv = {};
+		bool importable_uv = false;
+		const VkResult err_y = _query_nv12_import(physical_device, modifier, &SPLIT_VIEW_FORMATS[0], 1, max_extent, importable);
+		const VkResult err_uv = _query_nv12_import(physical_device, modifier, &SPLIT_VIEW_FORMATS[1], 1, max_extent_uv, importable_uv);
+		if (err_y == VK_SUCCESS && err_uv == VK_SUCCESS) {
+			print_verbose(vformat("DmabufImage: NV12 + modifier %s can't have R8 and R8G8 views on one image (VkResult %d); importing it as two images.", _modifier_to_string(modifier), err));
+			err = VK_SUCCESS;
+			count = 2;
+			importable = importable && importable_uv;
+			max_extent.width = MIN(max_extent.width, max_extent_uv.width);
+			max_extent.height = MIN(max_extent.height, max_extent_uv.height);
+		} else {
+			print_verbose(vformat("DmabufImage: one image per plane view is refused too (VkResult %d and %d).", err_y, err_uv));
+		}
 	}
+	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_UNAVAILABLE, vformat("NV12 + modifier %s + mutable format (plane views) + dmabuf import is not supported (VkResult %d).", _modifier_to_string(modifier), err));
+	ERR_FAIL_COND_V_MSG(!importable, ERR_UNAVAILABLE, "dmabufs can't be imported for this image.");
+	ERR_FAIL_COND_V_MSG((uint32_t)p_width > max_extent.width || (uint32_t)p_height > max_extent.height, ERR_INVALID_PARAMETER, vformat("Size %dx%d is larger than the maximum %dx%d.", p_width, p_height, max_extent.width, max_extent.height));
 
-	// One image, not disjoint: every plane lives in the same memory object, at the given offsets.
+	// Not disjoint: every plane lives in the same memory object, at the given offsets.
 	VkSubresourceLayout plane_layouts[MAX_MEMORY_PLANES] = {};
 	for (uint32_t i = 0; i < memory_plane_count; i++) {
 		ERR_FAIL_COND_V(p_plane_offsets[i] < 0 || p_plane_pitches[i] <= 0, ERR_INVALID_PARAMETER);
@@ -207,135 +353,60 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 		plane_layouts[i].rowPitch = p_plane_pitches[i];
 	}
 
-	VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_create_info = {};
-	modifier_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
-	modifier_create_info.pNext = &format_list;
-	modifier_create_info.drmFormatModifier = modifier;
-	modifier_create_info.drmFormatModifierPlaneCount = memory_plane_count;
-	modifier_create_info.pPlaneLayouts = plane_layouts;
+	// A split import imports the dmabuf once per image; the kernel and the driver share the buffer object.
+	VkImage images[MAX_PLANES] = {};
+	VkDeviceMemory memories[MAX_PLANES] = {};
+	for (uint32_t i = 0; i < count; i++) {
+		uint64_t memory_size = 0;
+		uint32_t memory_type = 0;
+		const VkFormat *view_formats = count == 1 ? NV12_VIEW_FORMATS : &SPLIT_VIEW_FORMATS[i];
+		const uint32_t view_format_count = count == 1 ? std_size(NV12_VIEW_FORMATS) : 1;
+		const Error import_err = _create_imported_image(device, get_memory_fd_properties, p_fd, p_width, p_height, modifier, plane_layouts, memory_plane_count, view_formats, view_format_count, images[i], memories[i], memory_size, memory_type);
+		if (import_err != OK) {
+			for (uint32_t j = 0; j < i; j++) {
+				vkFreeMemory(device, memories[j], nullptr);
+				vkDestroyImage(device, images[j], nullptr);
+			}
+			return import_err;
+		}
 
-	VkExternalMemoryImageCreateInfo external_create_info = {};
-	external_create_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-	external_create_info.pNext = &modifier_create_info;
-	external_create_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-
-	VkImageCreateInfo image_create_info = {};
-	image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	image_create_info.pNext = &external_create_info;
-	image_create_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-	image_create_info.imageType = VK_IMAGE_TYPE_2D;
-	image_create_info.format = NV12_FORMAT;
-	image_create_info.extent = { (uint32_t)p_width, (uint32_t)p_height, 1 };
-	image_create_info.mipLevels = 1;
-	image_create_info.arrayLayers = 1;
-	image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
-	image_create_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-	image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-	image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-	VkImage image = VK_NULL_HANDLE;
-	VkResult err = vkCreateImage(device, &image_create_info, nullptr, &image);
-	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("vkCreateImage failed for NV12 dmabuf (VkResult %d). VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT (%d) means the offsets or pitches don't suit the driver.", err, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT));
-
-	VkMemoryRequirements memory_requirements = {};
-	vkGetImageMemoryRequirements(device, image, &memory_requirements);
-
-	VkMemoryFdPropertiesKHR fd_properties = {};
-	fd_properties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
-	err = get_memory_fd_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, p_fd, &fd_properties);
-	if (err != VK_SUCCESS) {
-		vkDestroyImage(device, image, nullptr);
-		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("vkGetMemoryFdPropertiesKHR failed (VkResult %d). Is the fd a dmabuf?", err));
-	}
-
-	const uint32_t memory_type_bits = memory_requirements.memoryTypeBits & fd_properties.memoryTypeBits;
-	if (memory_type_bits == 0) {
-		vkDestroyImage(device, image, nullptr);
-		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("No memory type suits both the image (0x%x) and the dmabuf (0x%x).", memory_requirements.memoryTypeBits, fd_properties.memoryTypeBits));
-	}
-	uint32_t memory_type_index = 0;
-	while (!(memory_type_bits & (1u << memory_type_index))) {
-		memory_type_index++;
-	}
-
-	// The driver refuses to import less memory than the dmabuf holds; report it here rather than as a generic import failure.
-	const off_t dmabuf_size = lseek(p_fd, 0, SEEK_END);
-	if (dmabuf_size >= 0 && (uint64_t)dmabuf_size < memory_requirements.size) {
-		vkDestroyImage(device, image, nullptr);
-		ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, vformat("The dmabuf holds %d bytes, but the image needs %d.", (int64_t)dmabuf_size, (int64_t)memory_requirements.size));
-	}
-
-	// A successful import takes ownership of the fd, so give it a duplicate: the caller keeps theirs.
-	const int import_fd = fcntl(p_fd, F_DUPFD_CLOEXEC, 0);
-	if (import_fd < 0) {
-		vkDestroyImage(device, image, nullptr);
-		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("Couldn't duplicate the dmabuf fd: %s.", strerror(errno)));
-	}
-
-	VkMemoryDedicatedAllocateInfo dedicated_info = {};
-	dedicated_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-	dedicated_info.image = image;
-
-	VkImportMemoryFdInfoKHR import_info = {};
-	import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
-	import_info.pNext = &dedicated_info;
-	import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-	import_info.fd = import_fd;
-
-	VkMemoryAllocateInfo allocate_info = {};
-	allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	allocate_info.pNext = &import_info;
-	allocate_info.allocationSize = memory_requirements.size;
-	allocate_info.memoryTypeIndex = memory_type_index;
-
-	VkDeviceMemory memory = VK_NULL_HANDLE;
-	err = vkAllocateMemory(device, &allocate_info, nullptr, &memory);
-	if (err != VK_SUCCESS) {
-		close(import_fd);
-		vkDestroyImage(device, image, nullptr);
-		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("Importing the dmabuf failed (VkResult %d).", err));
-	}
-
-	err = vkBindImageMemory(device, image, memory, 0);
-	if (err != VK_SUCCESS) {
-		vkFreeMemory(device, memory, nullptr);
-		vkDestroyImage(device, image, nullptr);
-		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("vkBindImageMemory failed (VkResult %d).", err));
-	}
-
-	if (OS::get_singleton()->is_stdout_verbose()) {
-		VkImageDrmFormatModifierPropertiesEXT image_modifier = {};
-		image_modifier.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
-		get_image_drm_format_modifier_properties(device, image, &image_modifier);
-		print_line(vformat("DmabufImage: imported %dx%d NV12, modifier %s, %d bytes, memory type %d.", p_width, p_height, _modifier_to_string(image_modifier.drmFormatModifier), (int64_t)memory_requirements.size, memory_type_index));
-		for (uint32_t i = 0; i < memory_plane_count; i++) {
-			VkImageSubresource subresource = {};
-			subresource.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i;
-			VkSubresourceLayout layout = {};
-			vkGetImageSubresourceLayout(device, image, &subresource, &layout);
-			print_line(vformat("DmabufImage:   memory plane %d: offset %d, pitch %d, size %d.", i, (int64_t)layout.offset, (int64_t)layout.rowPitch, (int64_t)layout.size));
+		if (OS::get_singleton()->is_stdout_verbose()) {
+			VkImageDrmFormatModifierPropertiesEXT image_modifier = {};
+			image_modifier.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
+			get_image_drm_format_modifier_properties(device, images[i], &image_modifier);
+			print_line(vformat("DmabufImage: imported %dx%d NV12 (image %d of %d), modifier %s, %d bytes, memory type %d.", p_width, p_height, i + 1, count, _modifier_to_string(image_modifier.drmFormatModifier), (int64_t)memory_size, memory_type));
+			for (uint32_t p = 0; p < memory_plane_count; p++) {
+				VkImageSubresource subresource = {};
+				subresource.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << p;
+				VkSubresourceLayout layout = {};
+				vkGetImageSubresourceLayout(device, images[i], &subresource, &layout);
+				print_line(vformat("DmabufImage:   memory plane %d: offset %d, pitch %d, size %d.", p, (int64_t)layout.offset, (int64_t)layout.rowPitch, (int64_t)layout.size));
+			}
 		}
 	}
 
-	return _create_planes(device, image, memory, p_width, p_height, modifier);
+	return _create_planes(device, images, memories, count, p_width, p_height, modifier);
 }
 
-Error DmabufImage::_create_planes(VkDevice p_device, VkImage p_image, VkDeviceMemory p_memory, int p_width, int p_height, uint64_t p_drm_modifier) {
-	// From here on the image is ours to free, with free_image().
+Error DmabufImage::_create_planes(VkDevice p_device, const VkImage *p_images, const VkDeviceMemory *p_memories, uint32_t p_image_count, int p_width, int p_height, uint64_t p_drm_modifier) {
+	// From here on the images are ours to free, with free_image().
 	vk_device = p_device;
-	vk_image = p_image;
-	vk_memory = p_memory;
+	for (uint32_t i = 0; i < p_image_count; i++) {
+		vk_images[i] = p_images[i];
+		vk_memories[i] = p_memories[i];
+	}
+	image_count = p_image_count;
 	size = Size2i(p_width, p_height);
 	drm_modifier = p_drm_modifier;
 	acquired = false;
 
-	// One RenderingDevice texture per plane: Y as R8 at full size, interleaved CbCr as R8G8 at half size.
+	// One RenderingDevice texture per plane: Y as R8 at full size, interleaved CbCr as R8G8 at half size. Split: plane i of image i.
 	RenderingDevice *rd = RenderingDevice::get_singleton();
 	const RD::DataFormat plane_formats[MAX_PLANES] = { RD::DATA_FORMAT_R8_UNORM, RD::DATA_FORMAT_R8G8_UNORM };
 	const Size2i plane_sizes[MAX_PLANES] = { Size2i(p_width, p_height), Size2i(p_width / 2, p_height / 2) };
 	for (uint32_t i = 0; i < MAX_PLANES; i++) {
-		planes[i] = rd->texture_create_from_extension(RD::TEXTURE_TYPE_2D, plane_formats[i], RD::TEXTURE_SAMPLES_1, RD::TEXTURE_USAGE_SAMPLING_BIT, (uint64_t)p_image, plane_sizes[i].width, plane_sizes[i].height, 1, 1, 1, i);
+		const VkImage image = p_image_count == 1 ? p_images[0] : p_images[i];
+		planes[i] = rd->texture_create_from_extension(RD::TEXTURE_TYPE_2D, plane_formats[i], RD::TEXTURE_SAMPLES_1, RD::TEXTURE_USAGE_SAMPLING_BIT, (uint64_t)image, plane_sizes[i].width, plane_sizes[i].height, 1, 1, 1, i);
 		if (planes[i].is_null()) {
 			plane_count = i;
 			free_image();
@@ -346,9 +417,10 @@ Error DmabufImage::_create_planes(VkDevice p_device, VkImage p_image, VkDeviceMe
 	return OK;
 }
 
-Error DmabufImage::_import_host_test_pattern(int p_width, int p_height) {
+Error DmabufImage::_import_host_test_pattern(int p_width, int p_height, bool p_split) {
 	// Test path for machines without dmabufs (e.g. lavapipe): a linear NV12 image in host-visible memory, written through a
 	// mapping. It goes through the same plane views, ownership transfers and shader as an imported dmabuf, but not the import.
+	// Split: two images bound to the same memory, as a split dmabuf import makes them.
 	RenderingDeviceDriverVulkan *driver = _get_vulkan_driver();
 	ERR_FAIL_NULL_V(driver, ERR_UNAVAILABLE);
 	ERR_FAIL_COND_V_MSG(!driver->is_sampler_ycbcr_conversion_enabled(), ERR_UNAVAILABLE, "samplerYcbcrConversion is not enabled, multi-planar images can't be created.");
@@ -359,32 +431,49 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height) {
 	VkDevice device = (VkDevice)rd->get_driver_resource(RD::DRIVER_RESOURCE_LOGICAL_DEVICE);
 	VkPhysicalDevice physical_device = (VkPhysicalDevice)rd->get_driver_resource(RD::DRIVER_RESOURCE_PHYSICAL_DEVICE);
 
-	VkImageFormatListCreateInfo format_list = {};
-	format_list.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
-	format_list.viewFormatCount = std_size(NV12_VIEW_FORMATS);
-	format_list.pViewFormats = NV12_VIEW_FORMATS;
+	const uint32_t count = p_split ? 2 : 1;
+	VkImage images[MAX_PLANES] = {};
+	VkResult err = VK_SUCCESS;
+	for (uint32_t i = 0; i < count && err == VK_SUCCESS; i++) {
+		VkImageFormatListCreateInfo format_list = {};
+		format_list.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+		format_list.viewFormatCount = p_split ? 1 : std_size(NV12_VIEW_FORMATS);
+		format_list.pViewFormats = p_split ? &SPLIT_VIEW_FORMATS[i] : NV12_VIEW_FORMATS;
 
-	VkImageCreateInfo image_create_info = {};
-	image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	image_create_info.pNext = &format_list;
-	image_create_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-	image_create_info.imageType = VK_IMAGE_TYPE_2D;
-	image_create_info.format = NV12_FORMAT;
-	image_create_info.extent = { (uint32_t)p_width, (uint32_t)p_height, 1 };
-	image_create_info.mipLevels = 1;
-	image_create_info.arrayLayers = 1;
-	image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
-	image_create_info.tiling = VK_IMAGE_TILING_LINEAR;
-	image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-	image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	image_create_info.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+		VkImageCreateInfo image_create_info = {};
+		image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		image_create_info.pNext = &format_list;
+		image_create_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (p_split ? VK_IMAGE_CREATE_ALIAS_BIT : 0);
+		image_create_info.imageType = VK_IMAGE_TYPE_2D;
+		image_create_info.format = NV12_FORMAT;
+		image_create_info.extent = { (uint32_t)p_width, (uint32_t)p_height, 1 };
+		image_create_info.mipLevels = 1;
+		image_create_info.arrayLayers = 1;
+		image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+		image_create_info.tiling = VK_IMAGE_TILING_LINEAR;
+		image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+		image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		image_create_info.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+		err = vkCreateImage(device, &image_create_info, nullptr, &images[i]);
+	}
+	if (err != VK_SUCCESS) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (images[i] != VK_NULL_HANDLE) {
+				vkDestroyImage(device, images[i], nullptr);
+			}
+		}
+		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("vkCreateImage failed for a linear NV12 image (VkResult %d).", err));
+	}
 
-	VkImage image = VK_NULL_HANDLE;
-	VkResult err = vkCreateImage(device, &image_create_info, nullptr, &image);
-	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("vkCreateImage failed for a linear NV12 image (VkResult %d).", err));
-
+	// One allocation that suits every image.
 	VkMemoryRequirements memory_requirements = {};
-	vkGetImageMemoryRequirements(device, image, &memory_requirements);
+	vkGetImageMemoryRequirements(device, images[0], &memory_requirements);
+	for (uint32_t i = 1; i < count; i++) {
+		VkMemoryRequirements other = {};
+		vkGetImageMemoryRequirements(device, images[i], &other);
+		memory_requirements.size = MAX(memory_requirements.size, other.size);
+		memory_requirements.memoryTypeBits &= other.memoryTypeBits;
+	}
 	VkPhysicalDeviceMemoryProperties memory_properties = {};
 	vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
 	const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -396,7 +485,9 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height) {
 		}
 	}
 	if (memory_type_index == UINT32_MAX) {
-		vkDestroyImage(device, image, nullptr);
+		for (uint32_t i = 0; i < count; i++) {
+			vkDestroyImage(device, images[i], nullptr);
+		}
 		ERR_FAIL_V_MSG(ERR_UNAVAILABLE, "No host-visible memory type for a linear NV12 image.");
 	}
 
@@ -406,8 +497,8 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height) {
 	allocate_info.memoryTypeIndex = memory_type_index;
 	VkDeviceMemory memory = VK_NULL_HANDLE;
 	err = vkAllocateMemory(device, &allocate_info, nullptr, &memory);
-	if (err == VK_SUCCESS) {
-		err = vkBindImageMemory(device, image, memory, 0);
+	for (uint32_t i = 0; i < count && err == VK_SUCCESS; i++) {
+		err = vkBindImageMemory(device, images[i], memory, 0);
 	}
 	void *data = nullptr;
 	if (err == VK_SUCCESS) {
@@ -417,7 +508,9 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height) {
 		if (memory != VK_NULL_HANDLE) {
 			vkFreeMemory(device, memory, nullptr);
 		}
-		vkDestroyImage(device, image, nullptr);
+		for (uint32_t i = 0; i < count; i++) {
+			vkDestroyImage(device, images[i], nullptr);
+		}
 		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("Allocating or mapping host memory for the test pattern failed (VkResult %d).", err));
 	}
 
@@ -425,13 +518,22 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height) {
 	for (uint32_t i = 0; i < MAX_PLANES; i++) {
 		VkImageSubresource subresource = {};
 		subresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT << i;
-		vkGetImageSubresourceLayout(device, image, &subresource, &plane_layouts[i]);
+		vkGetImageSubresourceLayout(device, images[0], &subresource, &plane_layouts[i]);
+		if (p_split) {
+			VkSubresourceLayout other = {};
+			vkGetImageSubresourceLayout(device, images[1], &subresource, &other);
+			if (other.offset != plane_layouts[i].offset || other.rowPitch != plane_layouts[i].rowPitch) {
+				WARN_PRINT(vformat("DmabufImage: the two images of the split test pattern lay out plane %d differently.", i));
+			}
+		}
 	}
 	_fill_test_pattern((uint8_t *)data + plane_layouts[0].offset, plane_layouts[0].rowPitch, (uint8_t *)data + plane_layouts[1].offset, plane_layouts[1].rowPitch, p_width, p_height);
 	vkUnmapMemory(device, memory);
-	print_line(vformat("DmabufImage: test pattern %dx%d in host memory (no dmabuf), planes at %d and %d, pitches %d and %d.", p_width, p_height, (int64_t)plane_layouts[0].offset, (int64_t)plane_layouts[1].offset, (int64_t)plane_layouts[0].rowPitch, (int64_t)plane_layouts[1].rowPitch));
+	print_line(vformat("DmabufImage: test pattern %dx%d in host memory (no dmabuf, %d image(s)), planes at %d and %d, pitches %d and %d.", p_width, p_height, count, (int64_t)plane_layouts[0].offset, (int64_t)plane_layouts[1].offset, (int64_t)plane_layouts[0].rowPitch, (int64_t)plane_layouts[1].rowPitch));
 
-	return _create_planes(device, image, memory, p_width, p_height, DRM_FORMAT_MOD_LINEAR);
+	// The memory is freed with the first image; a second image only aliases it.
+	VkDeviceMemory memories[MAX_PLANES] = { memory, VK_NULL_HANDLE };
+	return _create_planes(device, images, memories, count, p_width, p_height, DRM_FORMAT_MOD_LINEAR);
 }
 
 void DmabufImage::_fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uint8_t *p_chroma, uint64_t p_chroma_pitch, uint32_t p_width, uint32_t p_height) {
@@ -594,8 +696,8 @@ Error DmabufImage::_create_test_pattern_udmabuf(uint32_t p_width, uint32_t p_hei
 Error DmabufImage::import_test_pattern(int p_width, int p_height, const String &p_device) {
 	ERR_FAIL_COND_V_MSG(p_width < 16 || p_height < 16 || (p_width % 2) != 0 || (p_height % 2) != 0, ERR_INVALID_PARAMETER, "Width and height must be even and at least 16.");
 	ERR_FAIL_COND_V_MSG(is_imported(), ERR_ALREADY_IN_USE, "An image is already imported. Call free_image() first.");
-	if (p_device == "host") {
-		return _import_host_test_pattern(p_width, p_height);
+	if (p_device == "host" || p_device == "host-split") {
+		return _import_host_test_pattern(p_width, p_height, p_device == "host-split");
 	}
 
 	int fd = -1;
@@ -637,9 +739,23 @@ Error DmabufImage::acquire() {
 
 	_process_pending_frees();
 
-	Error err = RenderingDevice::get_singleton()->texture_external_acquire(planes[0], VectorView<RID>(&planes[1], plane_count - 1));
+	Error err = _transfer(true);
 	ERR_FAIL_COND_V(err != OK, err);
 	acquired = true;
+	return OK;
+}
+
+// One ownership transfer per VkImage: all planes at once, or each plane of a split import on its own.
+Error DmabufImage::_transfer(bool p_acquire) {
+	RenderingDevice *rd = RenderingDevice::get_singleton();
+	if (image_count == 1) {
+		const VectorView<RID> aliases(&planes[1], plane_count - 1);
+		return p_acquire ? rd->texture_external_acquire(planes[0], aliases) : rd->texture_external_release(planes[0], aliases);
+	}
+	for (uint32_t i = 0; i < plane_count; i++) {
+		const Error err = p_acquire ? rd->texture_external_acquire(planes[i]) : rd->texture_external_release(planes[i]);
+		ERR_FAIL_COND_V(err != OK, err);
+	}
 	return OK;
 }
 
@@ -651,24 +767,26 @@ Error DmabufImage::release() {
 
 	_process_pending_frees();
 
-	Error err = RenderingDevice::get_singleton()->texture_external_release(planes[0], VectorView<RID>(&planes[1], plane_count - 1));
+	Error err = _transfer(false);
 	ERR_FAIL_COND_V(err != OK, err);
 	acquired = false;
 	return OK;
 }
 
 void DmabufImage::free_image() {
-	if (vk_image == VK_NULL_HANDLE) {
+	if (vk_images[0] == VK_NULL_HANDLE) {
 		return;
 	}
 
-	// The RenderingDevice destroys the plane views once the frames that may use them have completed. The image and its memory
-	// must outlive them, so they're destroyed a frame after that.
+	// The RenderingDevice destroys the plane views once the frames that may use them have completed. The images and their
+	// memory must outlive them, so they're destroyed a frame after that.
 	RenderingDevice *rd = RenderingDevice::get_singleton();
 	PendingFree pending;
 	pending.device = vk_device;
-	pending.image = vk_image;
-	pending.memory = vk_memory;
+	for (uint32_t i = 0; i < MAX_PLANES; i++) {
+		pending.images[i] = vk_images[i];
+		pending.memories[i] = vk_memories[i];
+	}
 	if (rd != nullptr) {
 		for (uint32_t i = 0; i < plane_count; i++) {
 			if (planes[i].is_valid()) {
@@ -682,8 +800,11 @@ void DmabufImage::free_image() {
 		planes[i] = RID();
 	}
 	vk_device = VK_NULL_HANDLE;
-	vk_image = VK_NULL_HANDLE;
-	vk_memory = VK_NULL_HANDLE;
+	for (uint32_t i = 0; i < MAX_PLANES; i++) {
+		vk_images[i] = VK_NULL_HANDLE;
+		vk_memories[i] = VK_NULL_HANDLE;
+	}
+	image_count = 0;
 	plane_count = 0;
 	size = Size2i();
 	drm_modifier = 0;
@@ -717,8 +838,16 @@ void DmabufImage::_process_pending_frees() {
 		if (frames_drawn < pending.frame + frame_delay + 1) {
 			continue;
 		}
-		vkDestroyImage(pending.device, pending.image, nullptr);
-		vkFreeMemory(pending.device, pending.memory, nullptr);
+		for (uint32_t j = 0; j < MAX_PLANES; j++) {
+			if (pending.images[j] != VK_NULL_HANDLE) {
+				vkDestroyImage(pending.device, pending.images[j], nullptr);
+			}
+		}
+		for (uint32_t j = 0; j < MAX_PLANES; j++) {
+			if (pending.memories[j] != VK_NULL_HANDLE) {
+				vkFreeMemory(pending.device, pending.memories[j], nullptr);
+			}
+		}
 		pending_frees.remove_at_unordered(i);
 		i--;
 	}
@@ -749,6 +878,7 @@ void DmabufImage::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_acquired"), &DmabufImage::is_acquired);
 
 	ClassDB::bind_method(D_METHOD("is_imported"), &DmabufImage::is_imported);
+	ClassDB::bind_method(D_METHOD("get_image_count"), &DmabufImage::get_image_count);
 	ClassDB::bind_method(D_METHOD("get_plane_rid", "plane"), &DmabufImage::get_plane_rid);
 	ClassDB::bind_method(D_METHOD("get_size"), &DmabufImage::get_size);
 	ClassDB::bind_method(D_METHOD("get_drm_modifier"), &DmabufImage::get_drm_modifier);

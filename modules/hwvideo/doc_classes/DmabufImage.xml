@@ -29,6 +29,12 @@
 				Returns the DRM format modifier of the imported image.
 			</description>
 		</method>
+		<method name="get_image_count" qualifiers="const">
+			<return type="int" />
+			<description>
+				Returns 1 when both planes are views of one Vulkan image. Returns 2 when the dmabuf was imported as two Vulkan images with the same layout, one per plane view (see [method import_nv12]). Returns 0 when nothing is imported.
+			</description>
+		</method>
 		<method name="get_plane_rid" qualifiers="const">
 			<return type="RID" />
 			<param index="0" name="plane" type="int" />
@@ -58,6 +64,7 @@
 			<param index="5" name="plane_pitches" type="PackedInt64Array" />
 			<description>
 				Imports the dmabuf [param fd] as an NV12 image. Give one offset and one row pitch per memory plane of the modifier (2 for [code]DRM_FORMAT_MOD_LINEAR[/code]). The fd is duplicated, so the caller still owns it.
+				For Qualcomm UBWC ([code]DRM_FORMAT_MOD_QCOM_COMPRESSED[/code], 0x0500000000000001, a decoder's Q08C buffers) give 2 memory planes: the offset of each is where its compression metadata starts, and the pitch is the pitch of its pixels. Turnip keeps UBWC on a mutable NV12 image only if all its view formats compress alike, which R8 and R8G8 don't. When the driver refuses the image with both view formats, the dmabuf is imported twice instead, as two images with the same layout: one with only the R8 view of plane 0, one with only the R8G8 view of plane 1. [method get_image_count] tells which.
 			</description>
 		</method>
 		<method name="import_test_pattern">
@@ -66,7 +73,7 @@
 			<param index="1" name="height" type="int" />
 			<param index="2" name="device" type="String" default="&quot;/dev/dri/card0&quot;" />
 			<description>
-				Creates a linear NV12 dmabuf filled with a test pattern and imports it with [method import_nv12]. The buffer is a DRM dumb buffer on [param device], or comes from [code]/dev/udmabuf[/code] if that fails. With [param device] set to [code]"host"[/code], no dmabuf is used: the pattern goes into a linear image in host-visible Vulkan memory, which tests the plane views, ownership transfers and shader on any Vulkan driver (e.g. lavapipe). Luma rises from left to right with a white grid every eighth of the size; Cb rises from top to bottom and Cr from left to right.
+				Creates a linear NV12 dmabuf filled with a test pattern and imports it with [method import_nv12]. The buffer is a DRM dumb buffer on [param device], or comes from [code]/dev/udmabuf[/code] if that fails. With [param device] set to [code]"host"[/code], no dmabuf is used: the pattern goes into a linear image in host-visible Vulkan memory, which tests the plane views, ownership transfers and shader on any Vulkan driver (e.g. lavapipe). [code]"host-split"[/code] does the same with two images bound to the same memory, one per plane view, as a split import makes them. Luma rises from left to right with a white grid every eighth of the size; Cb rises from top to bottom and Cr from left to right.
 			</description>
 		</method>
 		<method name="is_acquired" qualifiers="const">

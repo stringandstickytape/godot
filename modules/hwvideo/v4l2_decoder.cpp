@@ -867,11 +867,34 @@ Error V4L2Decoder::_setup_capture() {
 		_log_verbose(vformat("  CAPTURE[%d]: dmabuf fd %d, %d bytes.", i, export_buffer.fd, (int64_t)lseek(export_buffer.fd, 0, SEEK_END)));
 	}
 
-	// NV12 in one plane: luma rows, then interleaved chroma rows. The luma plane is padded to a multiple of 32 lines.
-	const uint32_t pitch = pf.plane_fmt[0].bytesperline;
-	uint64_t chroma_offset = (uint64_t)pitch * ((pf.height + 31) & ~31u);
-	if (chroma_offset + (uint64_t)pitch * (pf.height / 2) > pf.plane_fmt[0].sizeimage) {
-		chroma_offset = (uint64_t)pitch * pf.height;
+	uint32_t pitch = pf.plane_fmt[0].bytesperline;
+	uint64_t chroma_offset = 0;
+	const bool ubwc = pf.pixelformat == V4L2_PIX_FMT_QC08C;
+	if (ubwc) {
+		// QC08C (UBWC-compressed NV12) in one buffer: Y metadata, Y, UV metadata, UV, each padded to 4 KiB, as computed by
+		// iris_yuv_buffer_size_qc08c(). Metadata: one byte per 32x8 Y tile or 16x8 UV tile, rows of 64 bytes, 16-row units.
+		// For DRM_FORMAT_MOD_QCOM_COMPRESSED it's two memory planes, each starting at its metadata, with the pitch of its pixels.
+		const auto align = [](uint64_t v, uint64_t a) { return (v + a - 1) / a * a; };
+		const uint64_t w = pf.width;
+		const uint64_t h = pf.height;
+		const uint64_t y_meta = align(align((w + 31) / 32, 64) * align((h + 7) / 8, 16), 4096);
+		const uint64_t y_size = align(align(w, 128) * align(h, 32), 4096);
+		const uint64_t uv_meta = align(align((w / 2 + 15) / 16, 64) * align((h / 2 + 7) / 8, 16), 4096);
+		const uint64_t uv_size = align(align(w, 128) * align(h / 2, 32), 4096);
+		const uint64_t total = align(y_meta + y_size + uv_meta + uv_size, 4096);
+		if (align(w, 128) != pitch) {
+			_log(vformat("WARNING: QC08C bytesperline is %d, expected %d; using %d.", pitch, (int64_t)align(w, 128), (int64_t)align(w, 128)));
+		}
+		pitch = align(w, 128);
+		chroma_offset = y_meta + y_size;
+		_log(vformat("QC08C layout: Y metadata %d bytes, Y %d, UV metadata %d, UV %d; total %d (sizeimage %d)%s.", (int64_t)y_meta, (int64_t)y_size, (int64_t)uv_meta, (int64_t)uv_size, (int64_t)total,
+				pf.plane_fmt[0].sizeimage, total == pf.plane_fmt[0].sizeimage ? "" : ": MISMATCH, the import may fail or show garbage"));
+	} else {
+		// NV12 in one plane: luma rows, then interleaved chroma rows. The luma plane is padded to a multiple of 32 lines.
+		chroma_offset = (uint64_t)pitch * ((pf.height + 31) & ~31u);
+		if (chroma_offset + (uint64_t)pitch * (pf.height / 2) > pf.plane_fmt[0].sizeimage) {
+			chroma_offset = (uint64_t)pitch * pf.height;
+		}
 	}
 	{
 		MutexLock lock(mutex);
@@ -880,6 +903,7 @@ Error V4L2Decoder::_setup_capture() {
 		layout.size = Size2i(pf.width, pf.height);
 		layout.pitch = pitch;
 		layout.chroma_offset = chroma_offset;
+		layout.ubwc = ubwc;
 		layout.buffer_size = pf.plane_fmt[0].sizeimage;
 		layout.visible = visible;
 		layout.fds.clear();
@@ -1546,6 +1570,7 @@ Error V4L2Decoder::get_capture_layout(uint32_t p_generation, CaptureLayout &r_la
 	r_layout.size = layout.size;
 	r_layout.pitch = layout.pitch;
 	r_layout.chroma_offset = layout.chroma_offset;
+	r_layout.ubwc = layout.ubwc;
 	r_layout.buffer_size = layout.buffer_size;
 	r_layout.visible = layout.visible;
 	r_layout.fds.clear();

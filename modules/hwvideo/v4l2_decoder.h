@@ -82,13 +82,15 @@ public:
 		double time = 0.0; // Presentation time in seconds. File: display-order index / fps. Source: the access unit's PTS.
 	};
 
-	// Layout of the CAPTURE buffers of one generation. Only single-plane formats (NV12) are described.
+	// Layout of the CAPTURE buffers of one generation. Only single-buffer NV12 and QC08C are described.
 	struct CaptureLayout {
 		uint32_t generation = 0;
 		uint32_t fourcc = 0;
 		Size2i size; // G_FMT width and height. The height can include the driver's padding (e.g. 1088 for 1080).
 		uint32_t pitch = 0;
+		// NV12: where the chroma rows start. QC08C: where the UV metadata starts (the second memory plane of the modifier).
 		uint64_t chroma_offset = 0;
+		bool ubwc = false; // QC08C: DRM_FORMAT_MOD_QCOM_COMPRESSED.
 		uint64_t buffer_size = 0;
 		Rect2i visible;
 		LocalVector<int> fds; // One per buffer. get_capture_layout() returns duplicates, which the caller closes.

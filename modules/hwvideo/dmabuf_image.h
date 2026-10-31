@@ -40,6 +40,10 @@
 // A dmabuf (e.g. a decoded video frame) imported once as a multi-planar VkImage, with one RenderingDevice texture per plane.
 // The memory is shared, not copied. The producer and the GPU take turns: acquire() after the producer has written a frame,
 // sample the planes, release() before handing the buffer back to the producer.
+//
+// When the driver can't make plane views of both formats on one image without giving up the image's layout (Turnip keeps
+// UBWC on a mutable NV12 image only if its format list has a single format), the dmabuf is imported twice, as two VkImages
+// with the same layout: one for the R8 view of the luma plane, one for the R8G8 view of the chroma plane ("split").
 class DmabufImage : public RefCounted {
 	GDCLASS(DmabufImage, RefCounted);
 
@@ -51,8 +55,8 @@ public:
 private:
 	struct PendingFree {
 		VkDevice device = VK_NULL_HANDLE;
-		VkImage image = VK_NULL_HANDLE;
-		VkDeviceMemory memory = VK_NULL_HANDLE;
+		VkImage images[MAX_PLANES] = {};
+		VkDeviceMemory memories[MAX_PLANES] = {};
 		uint64_t frame = 0;
 	};
 
@@ -60,8 +64,10 @@ private:
 	static LocalVector<PendingFree> pending_frees;
 
 	VkDevice vk_device = VK_NULL_HANDLE;
-	VkImage vk_image = VK_NULL_HANDLE;
-	VkDeviceMemory vk_memory = VK_NULL_HANDLE;
+	// One image for all planes, or one per plane when split.
+	VkImage vk_images[MAX_PLANES] = {};
+	VkDeviceMemory vk_memories[MAX_PLANES] = {};
+	uint32_t image_count = 0;
 	RID planes[MAX_PLANES];
 	uint32_t plane_count = 0;
 	Size2i size;
@@ -73,8 +79,9 @@ private:
 	static Error _create_test_pattern_udmabuf(uint32_t p_width, uint32_t p_height, int &r_fd, uint64_t &r_pitch, uint64_t &r_uv_offset);
 	static void _fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uint8_t *p_chroma, uint64_t p_chroma_pitch, uint32_t p_width, uint32_t p_height);
 
-	Error _create_planes(VkDevice p_device, VkImage p_image, VkDeviceMemory p_memory, int p_width, int p_height, uint64_t p_drm_modifier);
-	Error _import_host_test_pattern(int p_width, int p_height);
+	Error _create_planes(VkDevice p_device, const VkImage *p_images, const VkDeviceMemory *p_memories, uint32_t p_image_count, int p_width, int p_height, uint64_t p_drm_modifier);
+	Error _import_host_test_pattern(int p_width, int p_height, bool p_split);
+	Error _transfer(bool p_acquire);
 
 protected:
 	static void _bind_methods();
@@ -90,7 +97,9 @@ public:
 	Error release();
 	bool is_acquired() const { return acquired; }
 
-	bool is_imported() const { return vk_image != VK_NULL_HANDLE; }
+	bool is_imported() const { return vk_images[0] != VK_NULL_HANDLE; }
+	// 1, or 2 when the planes are views of two images over the same memory (see above).
+	int get_image_count() const { return image_count; }
 	RID get_plane_rid(int p_plane) const;
 	Size2i get_size() const { return size; }
 	int64_t get_drm_modifier() const { return (int64_t)drm_modifier; }

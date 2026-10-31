@@ -39,6 +39,10 @@
 #include <linux/videodev2.h>
 #include <unistd.h>
 
+#ifndef DRM_FORMAT_MOD_QCOM_COMPRESSED
+#define DRM_FORMAT_MOD_QCOM_COMPRESSED fourcc_mod_code(QCOM, 1)
+#endif
+
 /* HWVideoPlaneTexture */
 
 void HWVideoPlaneTexture::init(int p_plane) {
@@ -145,18 +149,20 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 	Array to_free;
 	_release_generation(to_free);
 
-	if (layout.fourcc != V4L2_PIX_FMT_NV12) {
+	if (layout.fourcc != V4L2_PIX_FMT_NV12 && !layout.ubwc) {
 		for (int fd : layout.fds) {
 			::close(fd);
 		}
 		failed_generation = p_generation;
-		last_error = "Only NV12 CAPTURE buffers can be imported for now (UBWC Q08C needs its plane layout).";
+		last_error = "Only NV12 and Q08C (UBWC NV12) CAPTURE buffers can be imported.";
 		ERR_PRINT("HWVideoTexture: " + last_error);
 		RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));
 		return ERR_UNAVAILABLE;
 	}
 
 	// One import per buffer and CAPTURE generation, never per frame: per-frame dmabuf imports can oops the 6.18 kernel.
+	// Q08C: two memory planes, each starting at its UBWC metadata (DmabufImage imports it as two images, see there).
+	const uint64_t modifier = layout.ubwc ? DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
 	PackedInt64Array offsets;
 	offsets.push_back(0);
 	offsets.push_back((int64_t)layout.chroma_offset);
@@ -169,7 +175,7 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 		buffer = Buffer();
 		if (err == OK) {
 			buffer.image.instantiate();
-			err = buffer.image->import_nv12(layout.fds[i], layout.size.width, layout.size.height, (int64_t)DRM_FORMAT_MOD_LINEAR, offsets, pitches);
+			err = buffer.image->import_nv12(layout.fds[i], layout.size.width, layout.size.height, (int64_t)modifier, offsets, pitches);
 			if (err == OK) {
 				for (uint32_t p = 0; p < DmabufImage::MAX_PLANES; p++) {
 					buffer.planes[p] = RS::get_singleton()->texture_rd_create(buffer.image->get_plane_rid(p));
@@ -191,8 +197,9 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 		have_generation = true;
 		decoded_size = layout.size;
 		visible_rect = layout.visible;
-		print_line(vformat("HWVideoTexture: imported %d decoder buffers (generation %d): NV12 %dx%d, pitch %d, chroma at %d, visible %dx%d+%d+%d.", buffers.size(), p_generation,
-				layout.size.width, layout.size.height, layout.pitch, layout.chroma_offset, visible_rect.size.x, visible_rect.size.y, visible_rect.position.x, visible_rect.position.y));
+		print_line(vformat("HWVideoTexture: imported %d decoder buffers (generation %d): %s %dx%d, pitch %d, %s at %d, visible %dx%d+%d+%d, %d Vulkan image(s) per buffer.", buffers.size(), p_generation,
+				layout.ubwc ? "Q08C (UBWC)" : "NV12", layout.size.width, layout.size.height, layout.pitch, layout.ubwc ? "UV metadata" : "chroma", layout.chroma_offset,
+				visible_rect.size.x, visible_rect.size.y, visible_rect.position.x, visible_rect.position.y, buffers.is_empty() ? 0 : buffers[0].image->get_image_count()));
 	}
 	if (!to_free.is_empty()) {
 		RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));

@@ -103,7 +103,7 @@
 			Number of CAPTURE buffers to request. The driver may give more.
 		</member>
 		<member name="capture_format" type="String" setter="set_capture_format" getter="get_capture_format" default="&quot;NV12&quot;">
-			CAPTURE fourcc to ask for after SOURCE_CHANGE, or empty for the driver's choice. [HWVideoTexture] can import only NV12.
+			CAPTURE fourcc to ask for after SOURCE_CHANGE, or empty for the driver's choice. [HWVideoTexture] can import NV12 and [code]Q08C[/code] (Qualcomm UBWC-compressed NV12, imported with [code]DRM_FORMAT_MOD_QCOM_COMPRESSED[/code]; experimental).
 		</member>
 		<member name="device_path" type="String" setter="set_device_path" getter="get_device_path" default="&quot;/dev/video-dec0&quot;">
 			The decoder device.
