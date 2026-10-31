@@ -236,21 +236,16 @@ private:
 			float prev_model_precision[4];
 #endif
 
-			// These setters allow us to copy the data over with operation when using floats.
+			// Store element-wise. Writing through Vector3/Vector4/Rect2 pointers into these float arrays violates
+			// strict aliasing, and GCC -O2 (seen with 13.3 on arm64) then copies the struct out before those stores.
 			inline void set_lightmap_uv_scale(const Rect2 &p_rect) {
-#ifdef REAL_T_IS_DOUBLE
 				lightmap_uv_scale[0] = p_rect.position.x;
 				lightmap_uv_scale[1] = p_rect.position.y;
 				lightmap_uv_scale[2] = p_rect.size.x;
 				lightmap_uv_scale[3] = p_rect.size.y;
-#else
-				Rect2 *rect = reinterpret_cast<Rect2 *>(lightmap_uv_scale);
-				*rect = p_rect;
-#endif
 			}
 
 			inline void set_compressed_aabb(const AABB &p_aabb) {
-#ifdef REAL_T_IS_DOUBLE
 				compressed_aabb_position[0] = p_aabb.position.x;
 				compressed_aabb_position[1] = p_aabb.position.y;
 				compressed_aabb_position[2] = p_aabb.position.z;
@@ -258,24 +253,13 @@ private:
 				compressed_aabb_size[0] = p_aabb.size.x;
 				compressed_aabb_size[1] = p_aabb.size.y;
 				compressed_aabb_size[2] = p_aabb.size.z;
-#else
-				Vector3 *compressed_aabb_position_vec3 = reinterpret_cast<Vector3 *>(compressed_aabb_position);
-				Vector3 *compressed_aabb_size_vec3 = reinterpret_cast<Vector3 *>(compressed_aabb_size);
-				*compressed_aabb_position_vec3 = p_aabb.position;
-				*compressed_aabb_size_vec3 = p_aabb.size;
-#endif
 			}
 
 			inline void set_uv_scale(const Vector4 &p_uv_scale) {
-#ifdef REAL_T_IS_DOUBLE
 				uv_scale[0] = p_uv_scale.x;
 				uv_scale[1] = p_uv_scale.y;
 				uv_scale[2] = p_uv_scale.z;
 				uv_scale[3] = p_uv_scale.w;
-#else
-				Vector4 *uv_scale_vec4 = reinterpret_cast<Vector4 *>(uv_scale);
-				*uv_scale_vec4 = p_uv_scale;
-#endif
 			}
 		};
 
