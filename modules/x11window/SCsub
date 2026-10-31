@@ -1,0 +1,13 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+Import("env")
+Import("env_modules")
+
+env_x11window = env_modules.Clone()
+
+# thirdparty/xcb: the generated libxcb 1.15 headers (MIT/X11 licence, see thirdparty/xcb/COPYING). The libraries are
+# loaded with dlopen() at run time (xcb_loader.cpp), so nothing is linked.
+env.Append(LIBS=["dl"])
+
+env_x11window.add_source_files(env.modules_sources, "*.cpp")
