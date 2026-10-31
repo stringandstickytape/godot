@@ -94,6 +94,11 @@ public:
 		int bit_depth = 0;
 		String profile;
 		String pixel_format;
+		// Colour description from the container / codec parameters (FFmpeg's names; empty if unspecified).
+		String color_primaries; // "bt709", "bt2020", ...
+		String color_transfer; // "bt709", "smpte2084" (PQ), "arib-std-b67" (HLG), ...
+		String color_matrix; // "bt709", "bt2020nc", "bt470bg" / "smpte170m" (BT.601), ...
+		String color_range; // "tv" (limited) or "pc" (full).
 		AnnexBSplitter::SPSInfo sps; // H.264/HEVC: the first SPS (coded size, cropped size, bit depth).
 	};
 
@@ -128,6 +133,7 @@ public:
 	};
 
 private:
+	static inline SafeFlag hw_10bit_available{ false }; // Set from the decoder thread too.
 	struct AudioTrack {
 		int stream_index = -1;
 		String codec;
@@ -405,6 +411,10 @@ public:
 	// Why the Frame can't decode and show this video in hardware, as a sentence for the user; empty if it can.
 	// p_allow_10bit: V4L2Decoder.experimental_10bit (Q10C capture) is on.
 	static String get_hw_unsupported_reason(const VideoInfo &p_info, bool p_allow_10bit = false);
+	// Whether the hardware path can show 10-bit (the decoder offers P010). V4L2Decoder sets it once it has looked;
+	// get_video_info()'s hw_decodable uses it.
+	static void set_hw_10bit_available(bool p_available) { hw_10bit_available.set_to(p_available); }
+	static bool is_hw_10bit_available() { return hw_10bit_available.is_set(); }
 	bool pop_video_packet(VideoPacket &r_packet);
 	void release_video_packet(VideoPacket &r_packet);
 	// The demux thread writes 1 to this eventfd when the video queue becomes non-empty, at the end and on seek. -1: none.

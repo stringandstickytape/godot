@@ -163,7 +163,8 @@ private:
 
 	// Settings, read by the worker thread; change them only while closed (lead_time and verbose can change any time).
 	String device_path = "/dev/video-dec0";
-	String capture_format = "NV12";
+	String capture_format = "Q08C"; // UBWC NV12: same picture as NV12, less bandwidth (device A/B, 2026-10-31).
+	int64_t capture_chroma_offset = 0; // > 0: use this chroma offset for NV12/P010 instead of computing it.
 	int output_buffer_count = 8;
 	int capture_buffer_count = 12;
 	int output_buffer_size = 0;
@@ -205,6 +206,9 @@ private:
 
 	static Mutex device_close_mutex;
 	static uint64_t device_close_usec;
+	static Mutex p010_mutex;
+	static int p010_state; // -1 not looked yet, 0 no, 1 yes.
+	static String p010_formats;
 
 	// Worker thread only.
 	int fd = -1;
@@ -220,6 +224,7 @@ private:
 	uint32_t capture_in_driver = 0;
 	uint32_t capture_min = 0;
 	uint32_t capture_setups = 0;
+	bool data_offset_logged = false;
 	uint32_t generation = 0;
 	uint32_t serial = 0;
 	double worker_clock = 0.0;
@@ -343,6 +348,14 @@ public:
 	void set_device_path(const String &p_path);
 	String get_device_path() const { return device_path; }
 	void set_capture_format(const String &p_fourcc);
+	void set_capture_chroma_offset(int64_t p_offset);
+	int64_t get_capture_chroma_offset() const { return capture_chroma_offset; }
+	// Whether the decoder offers linear P010 CAPTURE (a patched iris module): looks once per process (opens the device at
+	// idle, ENUM_FMT on CAPTURE with an HEVC OUTPUT format, closes it), then answers from the cache. HWVIDEO_P010=1 or 0
+	// overrides. Also tells MediaSource (hw_decodable for 10-bit).
+	static bool is_p010_available(const String &p_device_path = "/dev/video-dec0");
+	static String get_idle_capture_formats() { return p010_formats; }
+	static void _note_p010_offered(bool p_offered, const String &p_formats);
 	String get_capture_format() const { return capture_format; }
 	void set_output_buffer_count(int p_count);
 	int get_output_buffer_count() const { return output_buffer_count; }

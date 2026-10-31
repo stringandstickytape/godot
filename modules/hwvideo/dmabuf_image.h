@@ -45,6 +45,8 @@
 // When the driver can't make plane views of both formats on one image without giving up the image's layout (Turnip keeps
 // UBWC on a mutable NV12 image only if its format list has a single format), the dmabuf is imported twice, as two VkImages
 // with the same layout: one for the R8 view of the luma plane, one for the R8G8 view of the chroma plane ("split").
+struct DmabufYUVFormat;
+
 class DmabufImage : public RefCounted {
 	GDCLASS(DmabufImage, RefCounted);
 
@@ -78,10 +80,11 @@ private:
 	static void _process_pending_frees();
 	static Error _create_test_pattern_dumb(const String &p_device, uint32_t p_width, uint32_t p_height, int &r_fd, uint64_t &r_pitch, uint64_t &r_uv_offset);
 	static Error _create_test_pattern_udmabuf(uint32_t p_width, uint32_t p_height, int &r_fd, uint64_t &r_pitch, uint64_t &r_uv_offset);
-	static void _fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uint8_t *p_chroma, uint64_t p_chroma_pitch, uint32_t p_width, uint32_t p_height);
+	static void _fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uint8_t *p_chroma, uint64_t p_chroma_pitch, uint32_t p_width, uint32_t p_height, uint32_t p_bytes);
 
-	Error _create_planes(VkDevice p_device, const VkImage *p_images, const VkDeviceMemory *p_memories, uint32_t p_image_count, int p_width, int p_height, uint64_t p_drm_modifier);
-	Error _import_host_test_pattern(int p_width, int p_height, bool p_split);
+	Error _create_planes(VkDevice p_device, const VkImage *p_images, const VkDeviceMemory *p_memories, uint32_t p_image_count, int p_width, int p_height, uint64_t p_drm_modifier, const RD::DataFormat *p_plane_formats);
+	Error _import_yuv420(const DmabufYUVFormat &p_yuv, int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches);
+	Error _import_host_test_pattern(int p_width, int p_height, bool p_split, bool p_p010);
 	Error _transfer(bool p_acquire);
 	Error _import_planes_bind(int p_fd, RD::DataFormat p_format, int64_t p_drm_modifier, const PackedVector2Array &p_sizes, const PackedInt64Array &p_offsets, const PackedInt64Array &p_pitches, bool p_mutable);
 
@@ -92,6 +95,8 @@ public:
 	static void flush_pending_frees();
 
 	Error import_nv12(int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches);
+	// P010 (16-bit samples, 10 valid bits at the top) as G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16; the plane textures are R16 and R16G16.
+	Error import_p010(int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches);
 	Error import_test_pattern(int p_width, int p_height, const String &p_device = "/dev/dri/card0");
 	// Imports each plane of a dmabuf as a single-plane image of p_format, one memory plane each (e.g. Q10C: each plane is laid
 	// out like a UBWC image of a 32-bit format). Plane i is the whole of image i. Experimental; see Q10C in HWVideoTexture.

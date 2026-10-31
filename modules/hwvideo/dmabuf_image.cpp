@@ -55,6 +55,23 @@ static const VkFormat NV12_VIEW_FORMATS[] = { NV12_FORMAT, VK_FORMAT_R8_UNORM, V
 // Split import: image i has only the view format of plane i.
 static const VkFormat SPLIT_VIEW_FORMATS[DmabufImage::MAX_PLANES] = { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM };
 
+// The 2-plane 4:2:0 formats: the image format, its plane view formats (one image, or one per plane when split) and the
+// RenderingDevice formats of the plane textures.
+struct DmabufYUVFormat {
+	const char *name;
+	VkFormat format;
+	VkFormat views[3];
+	VkFormat split_views[DmabufImage::MAX_PLANES];
+	RD::DataFormat plane_formats[DmabufImage::MAX_PLANES];
+	uint32_t bytes_per_sample;
+};
+static const DmabufYUVFormat YUV_NV12 = { "NV12", NV12_FORMAT, { NV12_FORMAT, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM },
+	{ VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM }, { RD::DATA_FORMAT_R8_UNORM, RD::DATA_FORMAT_R8G8_UNORM }, 1 };
+// P010: 16-bit samples, the 10 bits at the top. The plane views are plain 16-bit unorm (the same size class as R10X6).
+static const DmabufYUVFormat YUV_P010 = { "P010", VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+	{ VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16, VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM },
+	{ VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM }, { RD::DATA_FORMAT_R16_UNORM, RD::DATA_FORMAT_R16G16_UNORM }, 2 };
+
 #ifndef DRM_FORMAT_MOD_QCOM_COMPRESSED
 #define DRM_FORMAT_MOD_QCOM_COMPRESSED fourcc_mod_code(QCOM, 1)
 #endif
@@ -265,9 +282,17 @@ static Error _create_imported_image(VkDevice p_device, PFN_vkGetMemoryFdProperti
 }
 
 Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches) {
+	return _import_yuv420(YUV_NV12, p_fd, p_width, p_height, p_drm_modifier, p_plane_offsets, p_plane_pitches);
+}
+
+Error DmabufImage::import_p010(int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches) {
+	return _import_yuv420(YUV_P010, p_fd, p_width, p_height, p_drm_modifier, p_plane_offsets, p_plane_pitches);
+}
+
+Error DmabufImage::_import_yuv420(const DmabufYUVFormat &p_yuv, int p_fd, int p_width, int p_height, int64_t p_drm_modifier, const PackedInt64Array &p_plane_offsets, const PackedInt64Array &p_plane_pitches) {
 	ERR_FAIL_COND_V_MSG(is_imported(), ERR_ALREADY_IN_USE, "An image is already imported. Call free_image() first.");
 	ERR_FAIL_COND_V(p_fd < 0, ERR_INVALID_PARAMETER);
-	ERR_FAIL_COND_V_MSG(p_width <= 0 || p_height <= 0 || (p_width % 2) != 0 || (p_height % 2) != 0, ERR_INVALID_PARAMETER, "NV12 width and height must be positive and even.");
+	ERR_FAIL_COND_V_MSG(p_width <= 0 || p_height <= 0 || (p_width % 2) != 0 || (p_height % 2) != 0, ERR_INVALID_PARAMETER, vformat("%s width and height must be positive and even.", p_yuv.name));
 	ERR_FAIL_COND_V_MSG(p_plane_offsets.is_empty() || p_plane_offsets.size() > (int)MAX_MEMORY_PLANES || p_plane_offsets.size() != p_plane_pitches.size(), ERR_INVALID_PARAMETER, "Give one offset and one pitch per memory plane (1 to 4).");
 
 	RenderingDeviceDriverVulkan *driver = _get_vulkan_driver();
@@ -303,7 +328,7 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 	// The modifier must be supported for NV12, sampleable, and have as many memory planes as we were given.
 	{
 		LocalVector<VkDrmFormatModifierPropertiesEXT> properties;
-		_get_modifier_properties(physical_device, NV12_FORMAT, properties);
+		_get_modifier_properties(physical_device, p_yuv.format, properties);
 		const VkDrmFormatModifierPropertiesEXT *modifier_properties = nullptr;
 		String supported;
 		for (const VkDrmFormatModifierPropertiesEXT &p : properties) {
@@ -312,8 +337,8 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 				modifier_properties = &p;
 			}
 		}
-		ERR_FAIL_NULL_V_MSG(modifier_properties, ERR_UNAVAILABLE, vformat("DRM format modifier %s is not supported for NV12. Supported: %s.", _modifier_to_string(modifier), supported));
-		ERR_FAIL_COND_V_MSG(!(modifier_properties->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT), ERR_UNAVAILABLE, vformat("NV12 with modifier %s can't be sampled.", _modifier_to_string(modifier)));
+		ERR_FAIL_NULL_V_MSG(modifier_properties, ERR_UNAVAILABLE, vformat("DRM format modifier %s is not supported for %s. Supported: %s.", _modifier_to_string(modifier), p_yuv.name, supported));
+		ERR_FAIL_COND_V_MSG(!(modifier_properties->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT), ERR_UNAVAILABLE, vformat("%s with modifier %s can't be sampled.", p_yuv.name, _modifier_to_string(modifier)));
 		ERR_FAIL_COND_V_MSG(modifier_properties->drmFormatModifierPlaneCount != memory_plane_count, ERR_INVALID_PARAMETER, vformat("Modifier %s has %d memory plane(s), but %d offset(s) were given.", _modifier_to_string(modifier), modifier_properties->drmFormatModifierPlaneCount, memory_plane_count));
 	}
 
@@ -322,16 +347,16 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 	VkExtent3D max_extent = {};
 	bool importable = false;
 	uint32_t count = 1;
-	VkResult err = _query_import(physical_device, NV12_FORMAT, modifier, NV12_VIEW_FORMATS, std_size(NV12_VIEW_FORMATS), max_extent, importable);
+	VkResult err = _query_import(physical_device, p_yuv.format, modifier, p_yuv.views, std_size(p_yuv.views), max_extent, importable);
 	if (err != VK_SUCCESS && modifier != DRM_FORMAT_MOD_LINEAR) {
 		// Turnip refuses a UBWC NV12 image with views of formats that compress differently (R8 and R8G8): it would have to
 		// fall back to linear, which an explicit modifier doesn't allow. One image per plane view keeps the layout.
 		VkExtent3D max_extent_uv = {};
 		bool importable_uv = false;
-		const VkResult err_y = _query_import(physical_device, NV12_FORMAT, modifier, &SPLIT_VIEW_FORMATS[0], 1, max_extent, importable);
-		const VkResult err_uv = _query_import(physical_device, NV12_FORMAT, modifier, &SPLIT_VIEW_FORMATS[1], 1, max_extent_uv, importable_uv);
+		const VkResult err_y = _query_import(physical_device, p_yuv.format, modifier, &p_yuv.split_views[0], 1, max_extent, importable);
+		const VkResult err_uv = _query_import(physical_device, p_yuv.format, modifier, &p_yuv.split_views[1], 1, max_extent_uv, importable_uv);
 		if (err_y == VK_SUCCESS && err_uv == VK_SUCCESS) {
-			print_verbose(vformat("DmabufImage: NV12 + modifier %s can't have R8 and R8G8 views on one image (VkResult %d); importing it as two images.", _modifier_to_string(modifier), err));
+			print_verbose(vformat("DmabufImage: %s + modifier %s can't have both plane views on one image (VkResult %d); importing it as two images.", p_yuv.name, _modifier_to_string(modifier), err));
 			err = VK_SUCCESS;
 			count = 2;
 			importable = importable && importable_uv;
@@ -341,7 +366,7 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 			print_verbose(vformat("DmabufImage: one image per plane view is refused too (VkResult %d and %d).", err_y, err_uv));
 		}
 	}
-	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_UNAVAILABLE, vformat("NV12 + modifier %s + mutable format (plane views) + dmabuf import is not supported (VkResult %d).", _modifier_to_string(modifier), err));
+	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_UNAVAILABLE, vformat("%s + modifier %s + mutable format (plane views) + dmabuf import is not supported (VkResult %d).", p_yuv.name, _modifier_to_string(modifier), err));
 	ERR_FAIL_COND_V_MSG(!importable, ERR_UNAVAILABLE, "dmabufs can't be imported for this image.");
 	ERR_FAIL_COND_V_MSG((uint32_t)p_width > max_extent.width || (uint32_t)p_height > max_extent.height, ERR_INVALID_PARAMETER, vformat("Size %dx%d is larger than the maximum %dx%d.", p_width, p_height, max_extent.width, max_extent.height));
 
@@ -359,9 +384,9 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 	for (uint32_t i = 0; i < count; i++) {
 		uint64_t memory_size = 0;
 		uint32_t memory_type = 0;
-		const VkFormat *view_formats = count == 1 ? NV12_VIEW_FORMATS : &SPLIT_VIEW_FORMATS[i];
-		const uint32_t view_format_count = count == 1 ? std_size(NV12_VIEW_FORMATS) : 1;
-		const Error import_err = _create_imported_image(device, get_memory_fd_properties, p_fd, NV12_FORMAT, p_width, p_height, modifier, plane_layouts, memory_plane_count, view_formats, view_format_count, images[i], memories[i], memory_size, memory_type);
+		const VkFormat *view_formats = count == 1 ? p_yuv.views : &p_yuv.split_views[i];
+		const uint32_t view_format_count = count == 1 ? std_size(p_yuv.views) : 1;
+		const Error import_err = _create_imported_image(device, get_memory_fd_properties, p_fd, p_yuv.format, p_width, p_height, modifier, plane_layouts, memory_plane_count, view_formats, view_format_count, images[i], memories[i], memory_size, memory_type);
 		if (import_err != OK) {
 			for (uint32_t j = 0; j < i; j++) {
 				vkFreeMemory(device, memories[j], nullptr);
@@ -374,7 +399,7 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 			VkImageDrmFormatModifierPropertiesEXT image_modifier = {};
 			image_modifier.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
 			get_image_drm_format_modifier_properties(device, images[i], &image_modifier);
-			print_line(vformat("DmabufImage: imported %dx%d NV12 (image %d of %d), modifier %s, %d bytes, memory type %d.", p_width, p_height, i + 1, count, _modifier_to_string(image_modifier.drmFormatModifier), (int64_t)memory_size, memory_type));
+			print_line(vformat("DmabufImage: imported %dx%d %s (image %d of %d), modifier %s, %d bytes, memory type %d.", p_width, p_height, p_yuv.name, i + 1, count, _modifier_to_string(image_modifier.drmFormatModifier), (int64_t)memory_size, memory_type));
 			for (uint32_t p = 0; p < memory_plane_count; p++) {
 				VkImageSubresource subresource = {};
 				subresource.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << p;
@@ -385,10 +410,10 @@ Error DmabufImage::import_nv12(int p_fd, int p_width, int p_height, int64_t p_dr
 		}
 	}
 
-	return _create_planes(device, images, memories, count, p_width, p_height, modifier);
+	return _create_planes(device, images, memories, count, p_width, p_height, modifier, p_yuv.plane_formats);
 }
 
-Error DmabufImage::_create_planes(VkDevice p_device, const VkImage *p_images, const VkDeviceMemory *p_memories, uint32_t p_image_count, int p_width, int p_height, uint64_t p_drm_modifier) {
+Error DmabufImage::_create_planes(VkDevice p_device, const VkImage *p_images, const VkDeviceMemory *p_memories, uint32_t p_image_count, int p_width, int p_height, uint64_t p_drm_modifier, const RD::DataFormat *p_plane_formats) {
 	// From here on the images are ours to free, with free_image().
 	vk_device = p_device;
 	for (uint32_t i = 0; i < p_image_count; i++) {
@@ -400,9 +425,10 @@ Error DmabufImage::_create_planes(VkDevice p_device, const VkImage *p_images, co
 	drm_modifier = p_drm_modifier;
 	acquired = false;
 
-	// One RenderingDevice texture per plane: Y as R8 at full size, interleaved CbCr as R8G8 at half size. Split: plane i of image i.
+	// One RenderingDevice texture per plane: Y at full size, interleaved CbCr at half size (R8 and R8G8 for NV12, R16 and
+	// R16G16 for P010). Split: plane i of image i.
 	RenderingDevice *rd = RenderingDevice::get_singleton();
-	const RD::DataFormat plane_formats[MAX_PLANES] = { RD::DATA_FORMAT_R8_UNORM, RD::DATA_FORMAT_R8G8_UNORM };
+	const RD::DataFormat *plane_formats = p_plane_formats;
 	const Size2i plane_sizes[MAX_PLANES] = { Size2i(p_width, p_height), Size2i(p_width / 2, p_height / 2) };
 	for (uint32_t i = 0; i < MAX_PLANES; i++) {
 		const VkImage image = p_image_count == 1 ? p_images[0] : p_images[i];
@@ -552,7 +578,8 @@ Error DmabufImage::_import_planes_bind(int p_fd, RD::DataFormat p_format, int64_
 	return import_planes(p_fd, p_format, p_drm_modifier, sizes, offsets, pitches, count, p_mutable);
 }
 
-Error DmabufImage::_import_host_test_pattern(int p_width, int p_height, bool p_split) {
+Error DmabufImage::_import_host_test_pattern(int p_width, int p_height, bool p_split, bool p_p010) {
+	const DmabufYUVFormat &yuv = p_p010 ? YUV_P010 : YUV_NV12;
 	// Test path for machines without dmabufs (e.g. lavapipe): a linear NV12 image in host-visible memory, written through a
 	// mapping. It goes through the same plane views, ownership transfers and shader as an imported dmabuf, but not the import.
 	// Split: two images bound to the same memory, as a split dmabuf import makes them.
@@ -572,15 +599,15 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height, bool p_s
 	for (uint32_t i = 0; i < count && err == VK_SUCCESS; i++) {
 		VkImageFormatListCreateInfo format_list = {};
 		format_list.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
-		format_list.viewFormatCount = p_split ? 1 : std_size(NV12_VIEW_FORMATS);
-		format_list.pViewFormats = p_split ? &SPLIT_VIEW_FORMATS[i] : NV12_VIEW_FORMATS;
+		format_list.viewFormatCount = p_split ? 1 : std_size(yuv.views);
+		format_list.pViewFormats = p_split ? &yuv.split_views[i] : yuv.views;
 
 		VkImageCreateInfo image_create_info = {};
 		image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 		image_create_info.pNext = &format_list;
 		image_create_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (p_split ? VK_IMAGE_CREATE_ALIAS_BIT : 0);
 		image_create_info.imageType = VK_IMAGE_TYPE_2D;
-		image_create_info.format = NV12_FORMAT;
+		image_create_info.format = yuv.format;
 		image_create_info.extent = { (uint32_t)p_width, (uint32_t)p_height, 1 };
 		image_create_info.mipLevels = 1;
 		image_create_info.arrayLayers = 1;
@@ -597,7 +624,7 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height, bool p_s
 				vkDestroyImage(device, images[i], nullptr);
 			}
 		}
-		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("vkCreateImage failed for a linear NV12 image (VkResult %d).", err));
+		ERR_FAIL_V_MSG(ERR_CANT_CREATE, vformat("vkCreateImage failed for a linear %s image (VkResult %d).", yuv.name, err));
 	}
 
 	// One allocation that suits every image.
@@ -662,16 +689,24 @@ Error DmabufImage::_import_host_test_pattern(int p_width, int p_height, bool p_s
 			}
 		}
 	}
-	_fill_test_pattern((uint8_t *)data + plane_layouts[0].offset, plane_layouts[0].rowPitch, (uint8_t *)data + plane_layouts[1].offset, plane_layouts[1].rowPitch, p_width, p_height);
+	_fill_test_pattern((uint8_t *)data + plane_layouts[0].offset, plane_layouts[0].rowPitch, (uint8_t *)data + plane_layouts[1].offset, plane_layouts[1].rowPitch, p_width, p_height, yuv.bytes_per_sample);
 	vkUnmapMemory(device, memory);
-	print_line(vformat("DmabufImage: test pattern %dx%d in host memory (no dmabuf, %d image(s)), planes at %d and %d, pitches %d and %d.", p_width, p_height, count, (int64_t)plane_layouts[0].offset, (int64_t)plane_layouts[1].offset, (int64_t)plane_layouts[0].rowPitch, (int64_t)plane_layouts[1].rowPitch));
+	print_line(vformat("DmabufImage: %s test pattern %dx%d in host memory (no dmabuf, %d image(s)), planes at %d and %d, pitches %d and %d.", yuv.name, p_width, p_height, count, (int64_t)plane_layouts[0].offset, (int64_t)plane_layouts[1].offset, (int64_t)plane_layouts[0].rowPitch, (int64_t)plane_layouts[1].rowPitch));
 
 	// The memory is freed with the first image; a second image only aliases it.
 	VkDeviceMemory memories[MAX_PLANES] = { memory, VK_NULL_HANDLE };
-	return _create_planes(device, images, memories, count, p_width, p_height, DRM_FORMAT_MOD_LINEAR);
+	return _create_planes(device, images, memories, count, p_width, p_height, DRM_FORMAT_MOD_LINEAR, yuv.plane_formats);
 }
 
-void DmabufImage::_fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uint8_t *p_chroma, uint64_t p_chroma_pitch, uint32_t p_width, uint32_t p_height) {
+static void _put_sample(uint8_t *p_row, uint32_t p_index, uint8_t p_value, uint32_t p_bytes) {
+	if (p_bytes == 2) {
+		((uint16_t *)p_row)[p_index] = (uint16_t)(p_value << 8); // P010: the 10-bit code (v << 2) in the high bits.
+	} else {
+		p_row[p_index] = p_value;
+	}
+}
+
+void DmabufImage::_fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uint8_t *p_chroma, uint64_t p_chroma_pitch, uint32_t p_width, uint32_t p_height, uint32_t p_bytes) {
 	// Luma: dark to bright from left to right (limited range, 16-235), with a white grid every 1/8 of the size.
 	const uint32_t grid_x = MAX(p_width / 8, 1u);
 	const uint32_t grid_y = MAX(p_height / 8, 1u);
@@ -679,7 +714,7 @@ void DmabufImage::_fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uin
 		uint8_t *row = p_luma + y * p_luma_pitch;
 		for (uint32_t x = 0; x < p_width; x++) {
 			const bool grid = (x % grid_x) < 4 || (y % grid_y) < 4;
-			row[x] = grid ? 235 : uint8_t(16 + (219 * x) / (p_width - 1));
+			_put_sample(row, x, grid ? 235 : uint8_t(16 + (219 * x) / (p_width - 1)), p_bytes);
 		}
 	}
 
@@ -689,8 +724,8 @@ void DmabufImage::_fill_test_pattern(uint8_t *p_luma, uint64_t p_luma_pitch, uin
 	for (uint32_t y = 0; y < chroma_height; y++) {
 		uint8_t *row = p_chroma + y * p_chroma_pitch;
 		for (uint32_t x = 0; x < chroma_width; x++) {
-			row[x * 2 + 0] = uint8_t(16 + (224 * y) / (chroma_height - 1));
-			row[x * 2 + 1] = uint8_t(16 + (224 * x) / (chroma_width - 1));
+			_put_sample(row, x * 2 + 0, uint8_t(16 + (224 * y) / (chroma_height - 1)), p_bytes);
+			_put_sample(row, x * 2 + 1, uint8_t(16 + (224 * x) / (chroma_width - 1)), p_bytes);
 		}
 	}
 }
@@ -760,7 +795,7 @@ Error DmabufImage::_create_test_pattern_dumb(const String &p_device, uint32_t p_
 	}
 
 	_dmabuf_sync(prime.fd, DMA_BUF_SYNC_START);
-	_fill_test_pattern((uint8_t *)data, pitch, (uint8_t *)data + uv_offset, pitch, p_width, p_height);
+	_fill_test_pattern((uint8_t *)data, pitch, (uint8_t *)data + uv_offset, pitch, p_width, p_height, 1);
 	_dmabuf_sync(prime.fd, DMA_BUF_SYNC_END);
 	munmap(data, create.size);
 
@@ -818,7 +853,7 @@ Error DmabufImage::_create_test_pattern_udmabuf(uint32_t p_width, uint32_t p_hei
 	}
 
 	_dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_START);
-	_fill_test_pattern((uint8_t *)data, pitch, (uint8_t *)data + uv_offset, pitch, p_width, p_height);
+	_fill_test_pattern((uint8_t *)data, pitch, (uint8_t *)data + uv_offset, pitch, p_width, p_height, 1);
 	_dmabuf_sync(dmabuf_fd, DMA_BUF_SYNC_END);
 	munmap(data, size);
 
@@ -831,8 +866,9 @@ Error DmabufImage::_create_test_pattern_udmabuf(uint32_t p_width, uint32_t p_hei
 Error DmabufImage::import_test_pattern(int p_width, int p_height, const String &p_device) {
 	ERR_FAIL_COND_V_MSG(p_width < 16 || p_height < 16 || (p_width % 2) != 0 || (p_height % 2) != 0, ERR_INVALID_PARAMETER, "Width and height must be even and at least 16.");
 	ERR_FAIL_COND_V_MSG(is_imported(), ERR_ALREADY_IN_USE, "An image is already imported. Call free_image() first.");
-	if (p_device == "host" || p_device == "host-split") {
-		return _import_host_test_pattern(p_width, p_height, p_device == "host-split");
+	if (p_device.begins_with("host")) {
+		// "host", "host-split", "host-p010", "host-p010-split".
+		return _import_host_test_pattern(p_width, p_height, p_device.ends_with("split"), p_device.contains("p010"));
 	}
 
 	int fd = -1;
@@ -1005,6 +1041,7 @@ DmabufImage::~DmabufImage() {
 
 void DmabufImage::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("import_nv12", "fd", "width", "height", "drm_modifier", "plane_offsets", "plane_pitches"), &DmabufImage::import_nv12);
+	ClassDB::bind_method(D_METHOD("import_p010", "fd", "width", "height", "drm_modifier", "plane_offsets", "plane_pitches"), &DmabufImage::import_p010);
 	ClassDB::bind_method(D_METHOD("import_planes", "fd", "format", "drm_modifier", "sizes", "offsets", "pitches", "mutable"), &DmabufImage::_import_planes_bind, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("import_test_pattern", "width", "height", "device"), &DmabufImage::import_test_pattern, DEFVAL("/dev/dri/card0"));
 	ClassDB::bind_method(D_METHOD("free_image"), &DmabufImage::free_image);

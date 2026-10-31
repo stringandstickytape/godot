@@ -52,6 +52,9 @@
 #ifndef V4L2_PIX_FMT_QC10C
 #define V4L2_PIX_FMT_QC10C v4l2_fourcc('Q', '1', '0', 'C')
 #endif
+#ifndef V4L2_PIX_FMT_P010
+#define V4L2_PIX_FMT_P010 v4l2_fourcc('P', '0', '1', '0')
+#endif
 
 static constexpr uint32_t OUTPUT_TYPE = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 static constexpr uint32_t CAPTURE_TYPE = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -61,6 +64,9 @@ static constexpr uint64_t DEVICE_REOPEN_USEC = 1000000;
 
 Mutex V4L2Decoder::device_close_mutex;
 uint64_t V4L2Decoder::device_close_usec = 0;
+Mutex V4L2Decoder::p010_mutex;
+int V4L2Decoder::p010_state = -1;
+String V4L2Decoder::p010_formats;
 
 #define IOCTL(m_request, m_arg) _ioctl(fd, (m_request), (m_arg), #m_request)
 #define IOCTL_QUIET(m_request, m_arg, m_quiet_1, m_quiet_2) _ioctl(fd, (m_request), (m_arg), #m_request, (m_quiet_1), (m_quiet_2))
@@ -781,6 +787,7 @@ Error V4L2Decoder::_setup_capture() {
 	// What the driver offers for this stream. Always logged for 10-bit streams: is a linear 10-bit format (P010) there?
 	const bool is_10bit = stream_sps.bit_depth > 8;
 	String offered;
+	bool offers_p010 = false;
 	for (uint32_t i = 0;; i++) {
 		struct v4l2_fmtdesc description = {};
 		description.index = i;
@@ -789,6 +796,7 @@ Error V4L2Decoder::_setup_capture() {
 			break;
 		}
 		offered += (offered.is_empty() ? "" : ", ") + _fourcc_to_string(description.pixelformat);
+		offers_p010 = offers_p010 || description.pixelformat == V4L2_PIX_FMT_P010;
 		if (capture_setups == 0 && (verbose || OS::get_singleton()->is_stdout_verbose())) {
 			_log(vformat("  CAPTURE format %d: %s '%s'.", i, _fourcc_to_string(description.pixelformat), String::utf8((const char *)description.description)));
 		}
@@ -797,8 +805,12 @@ Error V4L2Decoder::_setup_capture() {
 		_log(vformat("CAPTURE formats offered for this %d-bit stream: %s.", stream_sps.bit_depth, offered));
 	}
 
-	// 10-bit: Q10C is the only correct output on the 6.18 kernel (NV12 gets the low 8 bits of each sample).
-	const uint32_t want_fourcc = is_10bit ? V4L2_PIX_FMT_QC10C : capture_fourcc;
+	if (is_10bit) {
+		_note_p010_offered(offers_p010, offered);
+	}
+	// 10-bit: linear P010 when the driver offers it (a patched module); Q10C otherwise (experiment), the only correct 10-bit
+	// output of the stock 6.18 kernel (NV12 gets the low 8 bits of each sample).
+	const uint32_t want_fourcc = is_10bit ? ((offers_p010 && !experimental_10bit) ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_QC10C) : capture_fourcc;
 	if (want_fourcc && format.fmt.pix_mp.pixelformat != want_fourcc) {
 		struct v4l2_format want = format;
 		want.fmt.pix_mp.pixelformat = want_fourcc;
@@ -824,12 +836,12 @@ Error V4L2Decoder::_setup_capture() {
 		return FAILED;
 	}
 	// Only formats HWVideoTexture can show: anything else would be garbage on screen.
-	const bool importable = is_10bit ? (experimental_10bit && pf.pixelformat == V4L2_PIX_FMT_QC10C) : (pf.pixelformat == V4L2_PIX_FMT_NV12 || pf.pixelformat == V4L2_PIX_FMT_QC08C);
+	const bool importable = is_10bit ? (pf.pixelformat == V4L2_PIX_FMT_P010 || (experimental_10bit && pf.pixelformat == V4L2_PIX_FMT_QC10C)) : (pf.pixelformat == V4L2_PIX_FMT_NV12 || pf.pixelformat == V4L2_PIX_FMT_QC08C);
 	if (!importable) {
 		if (is_10bit) {
 			_fail(vformat("%d-bit video is not supported yet on this kernel: the decoder writes it as %s (offered: %s), which the player can't display yet.", stream_sps.bit_depth, _fourcc_to_string(pf.pixelformat), offered));
 		} else {
-			_fail(vformat("The decoder chose the CAPTURE format %s (offered: %s), which the player can't display (NV12 and Q08C only).", _fourcc_to_string(pf.pixelformat), offered));
+			_fail(vformat("The decoder chose the CAPTURE format %s (offered: %s), which the player can't display (NV12 and Q08C only for 8-bit).", _fourcc_to_string(pf.pixelformat), offered));
 		}
 		return ERR_UNAVAILABLE;
 	}
@@ -927,10 +939,20 @@ Error V4L2Decoder::_setup_capture() {
 		_log(vformat("QC08C layout: Y metadata %d bytes, Y %d, UV metadata %d, UV %d; total %d (sizeimage %d)%s.", (int64_t)y_meta, (int64_t)y_size, (int64_t)uv_meta, (int64_t)uv_size, (int64_t)total,
 				pf.plane_fmt[0].sizeimage, total == pf.plane_fmt[0].sizeimage ? "" : ": MISMATCH, the import may fail or show garbage"));
 	} else {
-		// NV12 in one plane: luma rows, then interleaved chroma rows. The luma plane is padded to a multiple of 32 lines.
+		// NV12 or P010 in one plane: luma rows, then interleaved chroma rows right after them (mainline iris pads the luma
+		// plane to a multiple of 32 lines, P010 included: iris_yuv_buffer_size_p010()). bytesperline is the pitch.
 		chroma_offset = (uint64_t)pitch * ((pf.height + 31) & ~31u);
 		if (chroma_offset + (uint64_t)pitch * (pf.height / 2) > pf.plane_fmt[0].sizeimage) {
 			chroma_offset = (uint64_t)pitch * pf.height;
+		}
+		if (capture_chroma_offset > 0) {
+			_log(vformat("capture_chroma_offset overrides the chroma offset: %d instead of %d.", capture_chroma_offset, (int64_t)chroma_offset));
+			chroma_offset = (uint64_t)capture_chroma_offset;
+		}
+		if (pf.pixelformat == V4L2_PIX_FMT_P010) {
+			const uint64_t luma_bytes = (uint64_t)pf.width * 2;
+			_log(vformat("P010 layout: pitch %d (luma row %d bytes), chroma at %d, sizeimage %d%s.", pitch, (int64_t)luma_bytes, (int64_t)chroma_offset, pf.plane_fmt[0].sizeimage,
+					pitch < luma_bytes || chroma_offset + (uint64_t)pitch * (pf.height / 2) > pf.plane_fmt[0].sizeimage ? ": DOESN'T FIT, set capture_chroma_offset from the driver's layout" : ""));
 		}
 	}
 	{
@@ -1076,6 +1098,11 @@ int V4L2Decoder::_dequeue_capture() {
 				epoch->frames++; // It still takes a display slot.
 			}
 		} else if (planes[0].bytesused > 0) {
+			if (planes[0].data_offset != 0 && !data_offset_logged) {
+				// The import assumes the picture starts at the buffer's start (iris: data_offset 0).
+				data_offset_logged = true;
+				_log(vformat("WARNING: CAPTURE buffers have data_offset %d; the import ignores it (picture will be shifted).", planes[0].data_offset));
+			}
 			wstats.frames_decoded++;
 			Epoch *epoch = _find_epoch(frame_seq);
 			Frame frame;
@@ -1438,8 +1465,10 @@ Error V4L2Decoder::open_source(const Ref<MediaSource> &p_source) {
 		_fail(vformat("%s has no video stream.", path));
 		return ERR_INVALID_DATA;
 	}
-	// Refuse what can't be shown before the device is opened: VP9 (firmware crashes), AV1, 10-bit (Q10C only), 4:2:2.
-	const String reason = MediaSource::get_hw_unsupported_reason(info, experimental_10bit);
+	// Refuse what can't be shown before the device is opened: VP9 (firmware crashes), AV1, 10-bit (unless P010 is offered),
+	// 4:2:2.
+	const bool ten_bit = MAX(info.bit_depth, (int)info.sps.bit_depth) > 8;
+	const String reason = MediaSource::get_hw_unsupported_reason(info, experimental_10bit || (ten_bit && is_p010_available(device_path)));
 	if (!reason.is_empty()) {
 		_fail(reason);
 		return ERR_UNAVAILABLE;
@@ -1478,6 +1507,7 @@ Error V4L2Decoder::_start_worker() {
 	output_size = Size2i(stream_sps.width, stream_sps.height);
 	output_count = output_in_driver = 0;
 	capture_count = capture_in_driver = capture_setups = 0;
+	data_offset_logged = false;
 	generation = 0;
 	serial = source.is_valid() ? source->get_serial() : 0;
 	requested_serial = serial;
@@ -1747,6 +1777,89 @@ void V4L2Decoder::set_capture_format(const String &p_fourcc) {
 	capture_format = p_fourcc;
 }
 
+void V4L2Decoder::set_capture_chroma_offset(int64_t p_offset) {
+	SETTING_GUARD();
+	capture_chroma_offset = MAX(p_offset, (int64_t)0);
+}
+
+// What a 10-bit stream's CAPTURE list says wins over the look at idle (which may list no 10-bit format at all), unless
+// HWVIDEO_P010 forces the answer. Next 10-bit files then go the right way (hardware or software) from the start.
+void V4L2Decoder::_note_p010_offered(bool p_offered, const String &p_formats) {
+	MutexLock lock(p010_mutex);
+	const int state = p_offered ? 1 : 0;
+	if (p010_state == state || p010_formats.begins_with("(HWVIDEO_P010=")) {
+		return;
+	}
+	p010_state = state;
+	p010_formats = p_formats + " (from a 10-bit stream)";
+	MediaSource::set_hw_10bit_available(p_offered);
+}
+
+bool V4L2Decoder::is_p010_available(const String &p_device_path) {
+	MutexLock lock(p010_mutex);
+	if (p010_state >= 0) {
+		return p010_state == 1;
+	}
+	const String forced = OS::get_singleton()->get_environment("HWVIDEO_P010");
+	if (forced == "1" || forced == "0") {
+		p010_state = forced == "1" ? 1 : 0;
+		p010_formats = "(HWVIDEO_P010=" + forced + ")";
+	} else {
+		// One look at idle, spaced from other opens like any open of the device.
+		uint64_t wait_usec = 0;
+		{
+			MutexLock close_lock(device_close_mutex);
+			const uint64_t now = OS::get_singleton()->get_ticks_usec();
+			if (device_close_usec != 0 && now < device_close_usec + DEVICE_REOPEN_USEC) {
+				wait_usec = device_close_usec + DEVICE_REOPEN_USEC - now;
+			}
+		}
+		if (wait_usec > 0) {
+			OS::get_singleton()->delay_usec(wait_usec);
+		}
+		const int probe_fd = ::open(p_device_path.utf8().get_data(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+		p010_state = 0;
+		if (probe_fd < 0) {
+			const int open_errno = errno;
+			p010_formats = vformat("(can't open %s: %s)", p_device_path, strerror(open_errno));
+			if (open_errno != ENOENT && open_errno != ENODEV && open_errno != EACCES) {
+				// Maybe transient (busy): don't cache, look again next time.
+				print_line(vformat("V4L2Decoder: can't look for P010 now %s; 10-bit goes to software this time.", p010_formats));
+				p010_formats = String();
+				p010_state = -1;
+				return false;
+			}
+		} else {
+			// The CAPTURE formats can depend on the OUTPUT (coded) format: say HEVC first.
+			struct v4l2_format format = {};
+			format.type = OUTPUT_TYPE;
+			format.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
+			format.fmt.pix_mp.width = 1920;
+			format.fmt.pix_mp.height = 1080;
+			format.fmt.pix_mp.num_planes = 1;
+			ioctl(probe_fd, VIDIOC_S_FMT, &format);
+			for (uint32_t i = 0; i < 32; i++) {
+				struct v4l2_fmtdesc description = {};
+				description.index = i;
+				description.type = CAPTURE_TYPE;
+				if (ioctl(probe_fd, VIDIOC_ENUM_FMT, &description) < 0) {
+					break;
+				}
+				p010_formats += (p010_formats.is_empty() ? "" : ", ") + _fourcc_to_string(description.pixelformat);
+				if (description.pixelformat == V4L2_PIX_FMT_P010) {
+					p010_state = 1;
+				}
+			}
+			::close(probe_fd);
+			MutexLock close_lock(device_close_mutex);
+			device_close_usec = OS::get_singleton()->get_ticks_usec();
+		}
+	}
+	print_line(vformat("V4L2Decoder: CAPTURE formats at idle (HEVC): %s; linear 10-bit (P010) %s.", p010_formats, p010_state == 1 ? "available" : "not available"));
+	MediaSource::set_hw_10bit_available(p010_state == 1);
+	return p010_state == 1;
+}
+
 void V4L2Decoder::set_output_buffer_count(int p_count) {
 	SETTING_GUARD();
 	output_buffer_count = CLAMP(p_count, 2, (int)MAX_OUTPUT_BUFFERS);
@@ -1818,6 +1931,10 @@ void V4L2Decoder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_device_path"), &V4L2Decoder::get_device_path);
 	ClassDB::bind_method(D_METHOD("set_capture_format", "fourcc"), &V4L2Decoder::set_capture_format);
 	ClassDB::bind_method(D_METHOD("get_capture_format"), &V4L2Decoder::get_capture_format);
+	ClassDB::bind_method(D_METHOD("set_capture_chroma_offset", "offset"), &V4L2Decoder::set_capture_chroma_offset);
+	ClassDB::bind_method(D_METHOD("get_capture_chroma_offset"), &V4L2Decoder::get_capture_chroma_offset);
+	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("is_p010_available", "device_path"), &V4L2Decoder::is_p010_available, DEFVAL("/dev/video-dec0"));
+	ClassDB::bind_static_method("V4L2Decoder", D_METHOD("get_idle_capture_formats"), &V4L2Decoder::get_idle_capture_formats);
 	ClassDB::bind_method(D_METHOD("set_output_buffer_count", "count"), &V4L2Decoder::set_output_buffer_count);
 	ClassDB::bind_method(D_METHOD("get_output_buffer_count"), &V4L2Decoder::get_output_buffer_count);
 	ClassDB::bind_method(D_METHOD("set_capture_buffer_count", "count"), &V4L2Decoder::set_capture_buffer_count);
@@ -1841,6 +1958,7 @@ void V4L2Decoder::_bind_methods() {
 
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "device_path"), "set_device_path", "get_device_path");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "capture_format"), "set_capture_format", "get_capture_format");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "capture_chroma_offset"), "set_capture_chroma_offset", "get_capture_chroma_offset");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "output_buffer_count"), "set_output_buffer_count", "get_output_buffer_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "capture_buffer_count"), "set_capture_buffer_count", "get_capture_buffer_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "output_buffer_size"), "set_output_buffer_size", "get_output_buffer_size");

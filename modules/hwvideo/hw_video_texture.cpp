@@ -43,6 +43,9 @@
 #ifndef V4L2_PIX_FMT_QC10C
 #define V4L2_PIX_FMT_QC10C v4l2_fourcc('Q', '1', '0', 'C')
 #endif
+#ifndef V4L2_PIX_FMT_P010
+#define V4L2_PIX_FMT_P010 v4l2_fourcc('P', '0', '1', '0')
+#endif
 #ifndef V4L2_PIX_FMT_QC08C
 #define V4L2_PIX_FMT_QC08C v4l2_fourcc('Q', '0', '8', 'C')
 #endif
@@ -157,12 +160,13 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 	_release_generation(to_free);
 
 	const bool q10c = layout.fourcc == V4L2_PIX_FMT_QC10C;
-	if (layout.fourcc != V4L2_PIX_FMT_NV12 && layout.fourcc != V4L2_PIX_FMT_QC08C && !q10c) {
+	const bool p010 = layout.fourcc == V4L2_PIX_FMT_P010;
+	if (layout.fourcc != V4L2_PIX_FMT_NV12 && layout.fourcc != V4L2_PIX_FMT_QC08C && !q10c && !p010) {
 		for (int fd : layout.fds) {
 			::close(fd);
 		}
 		failed_generation = p_generation;
-		last_error = "Only NV12, Q08C (UBWC NV12) and, experimentally, Q10C CAPTURE buffers can be imported.";
+		last_error = "Only NV12, Q08C (UBWC NV12), P010 and, experimentally, Q10C CAPTURE buffers can be imported.";
 		ERR_PRINT("HWVideoTexture: " + last_error);
 		RS::get_singleton()->call_on_render_thread(callable_mp_static(&HWVideoTexture::_render_thread_swap).bind(Ref<DmabufImage>(), Ref<DmabufImage>(), to_free));
 		return ERR_UNAVAILABLE;
@@ -180,7 +184,7 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 
 	// Q10C (experiment): each plane as a UBWC image of a 32-bit format, W/3 texels wide (three 10-bit samples per texel);
 	// the shader unpacks them (see Packing). Turnip has no TP10 format, but the A750 can read UBWC data as another format.
-	Packing new_packing = PACKING_NV12;
+	Packing new_packing = p010 ? PACKING_P010 : PACKING_NV12;
 	Size2i new_plane_sizes[DmabufImage::MAX_PLANES] = { layout.size, layout.size / 2 };
 	RD::DataFormat q10c_format = RD::DATA_FORMAT_A2B10G10R10_UNORM_PACK32;
 	bool q10c_mutable = false;
@@ -202,6 +206,8 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 			buffer.image.instantiate();
 			if (q10c) {
 				err = buffer.image->import_planes(layout.fds[i], q10c_format, (int64_t)modifier, new_plane_sizes, q10c_offsets, q10c_pitches, DmabufImage::MAX_PLANES, q10c_mutable);
+			} else if (p010) {
+				err = buffer.image->import_p010(layout.fds[i], layout.size.width, layout.size.height, (int64_t)modifier, offsets, pitches);
 			} else {
 				err = buffer.image->import_nv12(layout.fds[i], layout.size.width, layout.size.height, (int64_t)modifier, offsets, pitches);
 			}
@@ -221,6 +227,7 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 		failed_generation = p_generation;
 		last_error = vformat("Importing the decoder's CAPTURE buffers (generation %d) failed: %s.", p_generation, error_names[err]);
 		ERR_PRINT("HWVideoTexture: " + last_error);
+		ubwc_import_failed = layout.ubwc && !q10c && source.is_valid();
 	} else {
 		generation = p_generation;
 		have_generation = true;
@@ -229,7 +236,7 @@ Error HWVideoTexture::_import_generation(uint32_t p_generation) {
 		packing = new_packing;
 		plane_sizes[0] = new_plane_sizes[0];
 		plane_sizes[1] = new_plane_sizes[1];
-		const String format_name = q10c ? vformat("Q10C (UBWC TP10, planes as %s%s)", new_packing == PACKING_TP10_RGBA8 ? "RGBA8" : "RGB10A2", q10c_mutable ? ", mutable" : "") : (layout.ubwc ? String("Q08C (UBWC)") : String("NV12"));
+		const String format_name = q10c ? vformat("Q10C (UBWC TP10, planes as %s%s)", new_packing == PACKING_TP10_RGBA8 ? "RGBA8" : "RGB10A2", q10c_mutable ? ", mutable" : "") : (layout.ubwc ? String("Q08C (UBWC)") : String(p010 ? "P010" : "NV12"));
 		print_line(vformat("HWVideoTexture: imported %d decoder buffers (generation %d): %s %dx%d, pitch %d, %s at %d, visible %dx%d+%d+%d, %d Vulkan image(s) per buffer.", buffers.size(), p_generation,
 				format_name, layout.size.width, layout.size.height, layout.pitch, layout.ubwc ? "UV metadata" : "chroma", layout.chroma_offset,
 				visible_rect.size.x, visible_rect.size.y, visible_rect.position.x, visible_rect.position.y, buffers.is_empty() ? 0 : buffers[0].image->get_image_count()));
@@ -372,11 +379,32 @@ void HWVideoTexture::update(double p_delta, double p_master_clock) {
 		ready_frame.time = frame.time;
 		ready.push_back(ready_frame);
 	}
+	if (ubwc_import_failed) {
+		_fall_back_to_nv12();
+		return;
+	}
 
 	ReadyFrame show;
 	if (_select_due(decoder->get_state() == V4L2Decoder::STATE_ENDED, show)) {
 		_show(show, frames_drawn);
 	}
+}
+
+// Q08C (UBWC) buffers that don't import: reopen the decoder with linear NV12 and carry on from the same time. Once: the
+// decoder keeps NV12 from then on.
+void HWVideoTexture::_fall_back_to_nv12() {
+	ubwc_import_failed = false;
+	const Ref<MediaSource> resume_source = source;
+	const double resume_time = clock;
+	const bool was_playing = playing;
+	print_line(vformat("HWVideoTexture: Q08C (UBWC) import failed; reopening the decoder with NV12 at %.3f s.", resume_time));
+	close();
+	decoder->set_capture_format("NV12");
+	if (open_source(resume_source) != OK) {
+		return; // last_error says why.
+	}
+	resume_source->seek(resume_time);
+	playing = was_playing;
 }
 
 // Picks the frame to show now from `ready`: the newest that is due; the ones before it are late and dropped (or, while
@@ -615,7 +643,9 @@ Error HWVideoTexture::open_source(const Ref<MediaSource> &p_source) {
 
 	// What the hardware path can't show (VP9, 10-bit, 4:2:2, H.264 High 10) is decoded in software, up to about 1080p.
 	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
-	const String hw_reason = MediaSource::get_hw_unsupported_reason(info, decoder->is_experimental_10bit());
+	const bool ten_bit = MAX(info.bit_depth, (int)info.sps.bit_depth) > 8;
+	const bool allow_10bit = decoder->is_experimental_10bit() || (ten_bit && V4L2Decoder::is_p010_available(decoder->get_device_path()));
+	const String hw_reason = MediaSource::get_hw_unsupported_reason(info, allow_10bit);
 	if (!hw_reason.is_empty() && software_fallback) {
 		const String sw_reason = SoftwareVideoDecoder::get_unsupported_reason(info, software_max_pixels);
 		if (!sw_reason.is_empty()) {
@@ -820,6 +850,7 @@ void HWVideoTexture::_bind_methods() {
 	BIND_ENUM_CONSTANT(PACKING_NV12);
 	BIND_ENUM_CONSTANT(PACKING_TP10_RGBA8);
 	BIND_ENUM_CONSTANT(PACKING_TP10_RGB10A2);
+	BIND_ENUM_CONSTANT(PACKING_P010);
 	ClassDB::bind_method(D_METHOD("get_last_error"), &HWVideoTexture::get_last_error);
 	ClassDB::bind_method(D_METHOD("get_stats"), &HWVideoTexture::get_stats);
 

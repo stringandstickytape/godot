@@ -46,10 +46,23 @@
 				Returns the path, codec, frame rate, and the coded and display size and bit depth from the first SPS.
 			</description>
 		</method>
+		<method name="get_idle_capture_formats" qualifiers="static">
+			<return type="String" />
+			<description>
+				The CAPTURE formats found by [method is_p010_available], as a list of fourccs (or why there is none). Empty before it has looked.
+			</description>
+		</method>
 		<method name="is_open" qualifiers="const">
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] between a successful [method open] and [method close].
+			</description>
+		</method>
+		<method name="is_p010_available" qualifiers="static">
+			<return type="bool" />
+			<param index="0" name="device_path" type="String" default="&quot;/dev/video-dec0&quot;" />
+			<description>
+				Whether the decoder offers linear P010 CAPTURE buffers for 10-bit HEVC (a patched iris module; the stock 6.18 kernel offers only Q10C). The first call opens the device at idle, sets an HEVC OUTPUT format, lists the CAPTURE formats and closes it; later calls answer from the cache. A 10-bit stream's own list then corrects the cache. The environment variable [code]HWVIDEO_P010[/code] set to [code]1[/code] or [code]0[/code] forces the answer. When [code]true[/code], 10-bit HEVC goes to the hardware path as P010 (see [constant HWVideoTexture.PACKING_P010]) and [code]hw_decodable[/code] in [method MediaSource.get_video_info] says so; otherwise it is decoded in software up to about 1080p.
 			</description>
 		</method>
 		<method name="open">
@@ -99,11 +112,14 @@
 		</method>
 	</methods>
 	<members>
+		<member name="capture_chroma_offset" type="int" setter="set_capture_chroma_offset" getter="get_capture_chroma_offset" default="0">
+			When above 0: the byte offset of the chroma plane in NV12 and P010 CAPTURE buffers, instead of the computed one ([code]bytesperline[/code] times the height rounded up to 32 lines, or times the height if that doesn't fit in [code]sizeimage[/code]). For a driver whose layout differs; the decoder logs the P010 layout it uses.
+		</member>
 		<member name="capture_buffer_count" type="int" setter="set_capture_buffer_count" getter="get_capture_buffer_count" default="12">
 			Number of CAPTURE buffers to request. The driver may give more.
 		</member>
-		<member name="capture_format" type="String" setter="set_capture_format" getter="get_capture_format" default="&quot;NV12&quot;">
-			CAPTURE fourcc to ask for after SOURCE_CHANGE, or empty for the driver's choice. [HWVideoTexture] can import NV12 and [code]Q08C[/code] (Qualcomm UBWC-compressed NV12, imported with [code]DRM_FORMAT_MOD_QCOM_COMPRESSED[/code]; experimental).
+		<member name="capture_format" type="String" setter="set_capture_format" getter="get_capture_format" default="&quot;Q08C&quot;">
+			CAPTURE fourcc to ask for after SOURCE_CHANGE for 8-bit streams, or empty for the driver's choice. [HWVideoTexture] can import NV12 and [code]Q08C[/code] (Qualcomm UBWC-compressed NV12, imported with [code]DRM_FORMAT_MOD_QCOM_COMPRESSED[/code]). Q08C is the default: on the Frame it shows the same picture as NV12 with less memory traffic. If its import fails, [HWVideoTexture] reopens the decoder with NV12 once and carries on. If the driver doesn't offer the format, it picks another (logged). 10-bit streams ignore this (see [method is_p010_available]).
 		</member>
 		<member name="experimental_10bit" type="bool" setter="set_experimental_10bit" getter="is_experimental_10bit" default="false">
 			Decode 10-bit HEVC to [code]Q10C[/code] (the only correct 10-bit output of the Frame's 6.18 kernel) for [HWVideoTexture]'s experimental import (see [member HWVideoTexture.q10c_view]). Off: 10-bit streams are refused with a readable reason (see [code]hw_unsupported_reason[/code] in [method MediaSource.get_video_info]). For a 10-bit stream the decoder logs the CAPTURE formats the driver offers (a linear 10-bit format such as P010 would show there).

@@ -1351,6 +1351,14 @@ Error MediaSource::open(const String &p_path) {
 		video.sample_aspect_ratio = sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0;
 		const AVPixFmtDescriptor *pixel = av_pix_fmt_desc_get((AVPixelFormat)par->format);
 		video.pixel_format = pixel ? String::utf8(pixel->name) : String();
+		const char *primaries = par->color_primaries != AVCOL_PRI_UNSPECIFIED ? av_color_primaries_name(par->color_primaries) : nullptr;
+		const char *transfer = par->color_trc != AVCOL_TRC_UNSPECIFIED ? av_color_transfer_name(par->color_trc) : nullptr;
+		const char *matrix = par->color_space != AVCOL_SPC_UNSPECIFIED ? av_color_space_name(par->color_space) : nullptr;
+		const char *range = par->color_range != AVCOL_RANGE_UNSPECIFIED ? av_color_range_name(par->color_range) : nullptr;
+		video.color_primaries = primaries ? String::utf8(primaries) : String();
+		video.color_transfer = transfer ? String::utf8(transfer) : String();
+		video.color_matrix = matrix ? String::utf8(matrix) : String();
+		video.color_range = range ? String::utf8(range) : String();
 		video.bit_depth = pixel ? pixel->comp[0].depth : par->bits_per_raw_sample;
 		const char *profile = avcodec_profile_name(par->codec_id, par->profile);
 		video.profile = profile ? String::utf8(profile) : String();
@@ -1597,12 +1605,21 @@ Dictionary MediaSource::get_video_info() const {
 	d["bit_depth"] = video.bit_depth;
 	d["profile"] = video.profile;
 	d["pixel_format"] = video.pixel_format;
+	d["color_primaries"] = video.color_primaries;
+	d["color_transfer"] = video.color_transfer;
+	d["color_matrix"] = video.color_matrix;
+	d["color_range"] = video.color_range;
+	// What the shader needs: the matrix (BT.2020 when the stream says so, else BT.709, the usual for HD and up), the
+	// range, and whether the transfer is HDR (PQ or HLG: needs tone mapping).
+	d["matrix_bt2020"] = video.color_matrix.begins_with("bt2020");
+	d["full_range"] = video.color_range == "pc";
+	d["hdr"] = video.color_transfer == "smpte2084" || video.color_transfer == "arib-std-b67";
 	d["is_h264"] = video.codec == VIDEO_CODEC_H264;
 	d["is_hevc"] = video.codec == VIDEO_CODEC_HEVC;
 	d["is_vp9"] = video.codec == VIDEO_CODEC_VP9;
 	d["is_av1"] = video.codec == VIDEO_CODEC_AV1;
 	// What the Steam Frame decodes in hardware to a format we can import (spike 01): H.264 and HEVC, 8-bit, 4:2:0.
-	const String hw_reason = get_hw_unsupported_reason(video);
+	const String hw_reason = get_hw_unsupported_reason(video, hw_10bit_available.is_set());
 	d["hw_decodable"] = hw_reason.is_empty();
 	d["hw_unsupported_reason"] = hw_reason;
 	// HWVideoTexture.open_source() decodes the rest in software up to about 1080p (its software_max_pixels can change that).

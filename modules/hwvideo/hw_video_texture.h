@@ -74,6 +74,7 @@ public:
 		PACKING_NV12, // Y as R8 (luminance), interleaved CbCr as R8G8 at half size (NV12 and Q08C).
 		PACKING_TP10_RGBA8, // Q10C: each texel is a 32-bit word of three 10-bit samples, as R8G8B8A8 (bytes, little-endian).
 		PACKING_TP10_RGB10A2, // Q10C: the same words as A2B10G10R10: r, g, b are the three samples.
+		PACKING_P010, // Y as R16 (red), interleaved CbCr as R16G16 (red, green) at half size; 10 bits in the high bits.
 	};
 
 private:
@@ -118,6 +119,8 @@ private:
 	Rect2i visible_rect;
 	Size2i plane_sizes[DmabufImage::MAX_PLANES];
 	Packing packing = PACKING_NV12;
+	bool ubwc_import_failed = false; // Set by _import_generation(); update() then reopens with NV12 (once).
+	void _fall_back_to_nv12();
 	// Q10C import experiment: "rgb10a2", "rgb10a2_mutable", "rgba8" or "rgba8_mutable" (see q10c_view in the docs).
 	String q10c_view = "rgb10a2_mutable";
 

@@ -195,5 +195,8 @@
 		<constant name="PACKING_TP10_RGB10A2" value="2" enum="Packing">
 			Q10C: each texel is a 32-bit word of three 10-bit samples, as A2B10G10R10 (the samples are r, g and b).
 		</constant>
+		<constant name="PACKING_P010" value="3" enum="Packing">
+			P010 (10-bit, linear): Y as R16 in [code]r[/code] and interleaved CbCr as R16G16 at half size (Cb in [code]r[/code], Cr in [code]g[/code]), each sample's 10 bits in the high bits of 16. Multiply by [code]65535.0 / 65280.0[/code] to get the 8-bit scale (64-940 becomes 16-235). Used when the decoder offers P010 (see [method V4L2Decoder.is_p010_available]).
+		</constant>
 	</constants>
 </class>
