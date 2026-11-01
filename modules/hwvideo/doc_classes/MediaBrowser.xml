@@ -50,6 +50,26 @@
 				Returns the names of the host's shared folders, sorted: no printers, no IPC$, no hidden or administrative shares (names ending in [code]$[/code]). Uses the server service over DCE/RPC on IPC$. Some servers or policies don't allow listing shares; then the result is empty and [method get_last_error] says so, and the user has to type the share name.
 			</description>
 		</method>
+		<method name="close_read">
+			<return type="void" />
+			<description>
+				Ends the reading [method open_read] began.
+			</description>
+		</method>
+		<method name="open_read">
+			<return type="int" />
+			<param index="0" name="path" type="String" />
+			<description>
+				Opens a file of any size (local or [code]smb://[/code]) to be read in order with [method read_next], for copying it. Returns its size, or -1 with [method get_last_error] set. Blocking.
+			</description>
+		</method>
+		<method name="read_next">
+			<return type="PackedByteArray" />
+			<param index="0" name="max_bytes" type="int" />
+			<description>
+				The next piece of the file, up to [param max_bytes]. Empty at the end, or on an error: [method get_last_error] says which. Blocking.
+			</description>
+		</method>
 		<method name="parse_subtitle_name" qualifiers="static">
 			<return type="Dictionary" />
 			<param index="0" name="video_file" type="String" />

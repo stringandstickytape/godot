@@ -361,6 +361,78 @@ PackedByteArray MediaBrowser::read_file(const String &p_path) {
 	return err == OK ? bytes : PackedByteArray();
 }
 
+int64_t MediaBrowser::open_read(const String &p_path) {
+	close_read();
+	String error;
+	if (SmbUrl::is_smb(p_path)) {
+		SmbFile *file = memnew(SmbFile);
+		if (file->open(p_path, READ_RING_BYTES, READ_REQUESTS, error) != OK) {
+			memdelete(file);
+			MutexLock lock(mutex);
+			last_error = error;
+			return -1;
+		}
+		read_smb = file;
+		read_size = file->get_size();
+	} else {
+		const String global_path = ProjectSettings::get_singleton() ? ProjectSettings::get_singleton()->globalize_path(p_path) : p_path;
+		read_local = FileAccess::open(global_path, FileAccess::READ);
+		if (read_local.is_null()) {
+			MutexLock lock(mutex);
+			last_error = vformat("Can't open %s.", global_path);
+			return -1;
+		}
+		read_size = (int64_t)read_local->get_length();
+	}
+	read_done = 0;
+	MutexLock lock(mutex);
+	last_error = String();
+	return read_size;
+}
+
+PackedByteArray MediaBrowser::read_next(int p_max_bytes) {
+	PackedByteArray bytes;
+	const int want = (int)MIN((int64_t)CLAMP(p_max_bytes, 1, READ_NEXT_MAX), read_size - read_done);
+	if (want <= 0 || (read_smb == nullptr && read_local.is_null())) {
+		MutexLock lock(mutex);
+		last_error = read_size - read_done > 0 ? String("Nothing is open for reading.") : String();
+		return bytes;
+	}
+	bytes.resize(want);
+	int got = 0;
+	if (read_smb != nullptr) {
+		// A read answers with what the ring holds, at least a byte.
+		got = SmbFile::avio_read(read_smb, bytes.ptrw(), want);
+	} else {
+		got = (int)read_local->get_buffer(bytes.ptrw(), want);
+	}
+	if (got <= 0) {
+		const String why = read_smb != nullptr && read_smb->has_failed() ? read_smb->get_error() : vformat("Reading failed after %d of %d bytes.", read_done, read_size);
+		bytes.clear();
+		MutexLock lock(mutex);
+		last_error = why;
+		return bytes;
+	}
+	if (got < want) {
+		bytes.resize(got);
+	}
+	read_done += got;
+	MutexLock lock(mutex);
+	last_error = String();
+	return bytes;
+}
+
+void MediaBrowser::close_read() {
+	if (read_smb != nullptr) {
+		read_smb->close();
+		memdelete(read_smb);
+		read_smb = nullptr;
+	}
+	read_local.unref();
+	read_size = 0;
+	read_done = 0;
+}
+
 String MediaBrowser::get_last_error() const {
 	MutexLock lock(mutex);
 	return last_error;
@@ -382,6 +454,7 @@ void MediaBrowser::set_include_hidden(bool p_include) {
 }
 
 MediaBrowser::~MediaBrowser() {
+	close_read();
 	session.close();
 }
 
@@ -391,6 +464,9 @@ void MediaBrowser::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("list_dir", "path"), &MediaBrowser::list_dir);
 	ClassDB::bind_method(D_METHOD("find_subtitles", "video_path"), &MediaBrowser::find_subtitles);
 	ClassDB::bind_method(D_METHOD("read_file", "path"), &MediaBrowser::read_file);
+	ClassDB::bind_method(D_METHOD("open_read", "path"), &MediaBrowser::open_read);
+	ClassDB::bind_method(D_METHOD("read_next", "max_bytes"), &MediaBrowser::read_next);
+	ClassDB::bind_method(D_METHOD("close_read"), &MediaBrowser::close_read);
 	ClassDB::bind_static_method("MediaBrowser", D_METHOD("parse_subtitle_name", "video_file", "subtitle_file"), &MediaBrowser::parse_subtitle_name);
 	ClassDB::bind_method(D_METHOD("get_last_error"), &MediaBrowser::get_last_error);
 	ClassDB::bind_method(D_METHOD("disconnect_host"), &MediaBrowser::disconnect_host);

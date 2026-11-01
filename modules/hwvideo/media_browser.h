@@ -32,6 +32,7 @@
 
 #include "smb_client.h"
 
+#include "core/io/file_access.h"
 #include "core/object/ref_counted.h"
 #include "core/variant/typed_array.h"
 
@@ -46,6 +47,11 @@ class MediaBrowser : public RefCounted {
 	String last_error;
 	double timeout = 8.0;
 	bool include_hidden = false;
+	// The file of open_read().
+	SmbFile *read_smb = nullptr;
+	Ref<FileAccess> read_local;
+	int64_t read_size = 0;
+	int64_t read_done = 0;
 
 	bool _session_for(const String &p_host, const String &p_share);
 	Array _list_smb(const SmbUrl &p_url);
@@ -69,6 +75,16 @@ public:
 	// Empty, with get_last_error() set, if it can't be read or is over READ_FILE_MAX bytes.
 	PackedByteArray read_file(const String &p_path);
 	static constexpr int64_t READ_FILE_MAX = 64 << 20;
+	// A file of any size (local or smb://, with the credentials of set_smb_credentials()) read in order, in pieces, for
+	// copying it: blocking, one at a time per object, on one thread. open_read() gives its size, or -1 with
+	// get_last_error() set. read_next() gives up to p_max_bytes: empty at the end (get_last_error() empty) or on an error
+	// (get_last_error() says why). A lost connection is reopened as for a video (SmbFile).
+	int64_t open_read(const String &p_path);
+	PackedByteArray read_next(int p_max_bytes);
+	void close_read();
+	static constexpr uint64_t READ_RING_BYTES = 32 << 20;
+	static constexpr uint32_t READ_REQUESTS = 8;
+	static constexpr int READ_NEXT_MAX = 16 << 20;
 	// What a subtitle file's name says next to a video file (both names without folders): see find_subtitles().
 	static Dictionary parse_subtitle_name(const String &p_video_file, const String &p_subtitle_file);
 	String get_last_error() const;
