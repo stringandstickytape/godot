@@ -35,6 +35,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 }
 
 #include <poll.h>
@@ -67,19 +68,43 @@ static String _av_error(int p_error) {
 	return String::utf8(text);
 }
 
+// A size limit in words: "1920x1088", "3840x2176" when it is one of those, else the pixel count.
+static String _describe_pixels(int64_t p_pixels) {
+	static const int sizes[][2] = { { 1920, 1088 }, { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 }, { 3840, 2176 }, { 1280, 720 } };
+	for (const auto &size : sizes) {
+		if ((int64_t)size[0] * size[1] == p_pixels) {
+			return vformat("%dx%d", size[0], size[1]);
+		}
+	}
+	return vformat("%d pixels", p_pixels);
+}
+
+int64_t SoftwareVideoDecoder::get_max_pixels(const MediaSource::VideoInfo &p_info, int64_t p_max_pixels) {
+	if (p_info.codec != MediaSource::VIDEO_CODEC_AV1) {
+		return p_max_pixels;
+	}
+	const double fps = p_info.fps >= 1.0 && p_info.fps <= 240.0 ? p_info.fps : 30.0;
+	const int64_t av1 = MIN(AV1_MAX_PIXELS, (int64_t)(AV1_MAX_PIXEL_RATE / MAX(fps, 30.0)));
+	return MAX(p_max_pixels, av1);
+}
+
 String SoftwareVideoDecoder::get_unsupported_reason(const MediaSource::VideoInfo &p_info, int64_t p_max_pixels) {
 	if (!p_info.valid) {
 		return "There is no video stream.";
 	}
-	if (p_info.codec != MediaSource::VIDEO_CODEC_H264 && p_info.codec != MediaSource::VIDEO_CODEC_HEVC && p_info.codec != MediaSource::VIDEO_CODEC_VP9) {
-		return vformat("%s video can't be decoded in software here (H.264, HEVC and VP9 only).", p_info.codec_name.to_upper());
+	const String name = MediaSource::get_codec_display_name(p_info);
+	if (p_info.codec_id == AV_CODEC_ID_NONE) {
+		return vformat("The video codec%s isn't known to FFmpeg, so it can't be decoded.", p_info.codec_tag.is_empty() ? String() : " " + p_info.codec_tag);
 	}
-	if ((int64_t)p_info.width * p_info.height > p_max_pixels) {
-		return vformat("%dx%d is too large to decode in software on the Frame (up to %d pixels, about 1080p).", p_info.width, p_info.height, p_max_pixels);
+	if (!p_info.software_decoder) {
+		return vformat("%s video can't be decoded in software: this build has no decoder for it.", name);
 	}
-	const int bit_depth = MAX(p_info.bit_depth, (int)p_info.sps.bit_depth);
-	if (bit_depth > 10) {
-		return vformat("%d-bit video can't be decoded here (8 and 10 bits only).", bit_depth);
+	const int64_t max_pixels = get_max_pixels(p_info, p_max_pixels);
+	if ((int64_t)p_info.width * p_info.height > max_pixels) {
+		if (p_info.codec == MediaSource::VIDEO_CODEC_AV1) {
+			return vformat("%dx%d AV1 at %.0f fps is too much to decode in software on the Frame (up to %s at 30 fps, 2560x1440 at 60).", p_info.width, p_info.height, p_info.fps, _describe_pixels(AV1_MAX_PIXELS));
+		}
+		return vformat("%dx%d %s is too large to decode in software on the Frame (up to %s).", p_info.width, p_info.height, name, _describe_pixels(max_pixels));
 	}
 	return String();
 }
@@ -88,10 +113,11 @@ Error SoftwareVideoDecoder::open(const Ref<MediaSource> &p_source, int p_threads
 	close();
 	ERR_FAIL_COND_V(p_source.is_null() || !p_source->is_open(), ERR_INVALID_PARAMETER);
 	const MediaSource::VideoInfo &info = p_source->get_video_stream_info();
-	const AVCodecID codec_id = info.codec == MediaSource::VIDEO_CODEC_H264 ? AV_CODEC_ID_H264 : (info.codec == MediaSource::VIDEO_CODEC_HEVC ? AV_CODEC_ID_HEVC : AV_CODEC_ID_VP9);
-	const AVCodec *codec = avcodec_find_decoder(codec_id);
-	if (codec == nullptr) {
-		r_error = vformat("This build has no software %s decoder.", info.codec_name);
+	const AVCodecParameters *par = p_source->get_video_codec_parameters();
+	// AV1: dav1d (FFmpeg's own av1 decoder only drives hardware decoders).
+	const AVCodec *codec = info.codec == MediaSource::VIDEO_CODEC_AV1 ? avcodec_find_decoder_by_name("libdav1d") : avcodec_find_decoder((AVCodecID)info.codec_id);
+	if (codec == nullptr || par == nullptr) {
+		r_error = vformat("This build has no software %s decoder.", MediaSource::get_codec_display_name(info));
 		return ERR_UNAVAILABLE;
 	}
 	context = avcodec_alloc_context3(codec);
@@ -102,10 +128,23 @@ Error SoftwareVideoDecoder::open(const Ref<MediaSource> &p_source, int p_threads
 		r_error = "Out of memory for the software decoder.";
 		return ERR_OUT_OF_MEMORY;
 	}
-	// H.264 and HEVC arrive as Annex-B with the parameter sets in band (MediaSource converts them), so no extradata.
-	context->width = info.width;
-	context->height = info.height;
+	if (info.codec == MediaSource::VIDEO_CODEC_H264 || info.codec == MediaSource::VIDEO_CODEC_HEVC) {
+		// H.264 and HEVC arrive as Annex-B with the parameter sets in band (MediaSource converts them), so no extradata.
+		context->width = info.width;
+		context->height = info.height;
+	} else {
+		// The rest need what the container says: extradata (MPEG-4 VOL headers, WMV and VC-1 sequence headers, RealVideo,
+		// Theora and VP3 headers, Cinepak, ...), the codec tag (MS-MPEG4 versions, DivX quirks), the size, bits per sample.
+		const int r = avcodec_parameters_to_context(context, par);
+		if (r < 0) {
+			r_error = vformat("The %s codec parameters can't be used: %s.", info.codec_name, _av_error(r));
+			close();
+			return ERR_CANT_OPEN;
+		}
+	}
 	context->pkt_timebase = AVRational{ 1, 1000000 };
+	// Frame threads (each thread decodes a picture of its own: a few frames more latency, the CPU's cores used) where the
+	// decoder has them, else slice threads; dav1d takes the count for its own scheduler.
 	context->thread_count = CLAMP(p_threads, 1, 16);
 	context->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 	const int err = avcodec_open2(context, codec, nullptr);
@@ -114,6 +153,28 @@ Error SoftwareVideoDecoder::open(const Ref<MediaSource> &p_source, int p_threads
 		close();
 		return ERR_CANT_OPEN;
 	}
+	// The matrix and range the shader will use, from the video info as the app reads it (scripts/play/hdr_tone_map.gd):
+	// pictures that need converting are converted to these.
+	const String matrix = info.color_matrix.to_lower();
+	const bool hdr = info.color_transfer == "smpte2084" || info.color_transfer == "arib-std-b67";
+	const bool bt2020_primaries = info.color_primaries == "bt2020" || (info.color_primaries.is_empty() && hdr);
+	if (matrix.begins_with("bt2020")) {
+		target_matrix = SWS_CS_BT2020;
+	} else if (matrix == "bt470bg" || matrix == "smpte170m" || matrix == "bt601") {
+		target_matrix = SWS_CS_ITU601;
+	} else if (matrix.is_empty() || matrix == "unknown" || matrix == "unspecified") {
+		target_matrix = bt2020_primaries ? SWS_CS_BT2020 : (info.height > 0 && info.height <= 576 ? SWS_CS_ITU601 : SWS_CS_ITU709);
+	} else {
+		target_matrix = SWS_CS_ITU709;
+	}
+	target_full_range = info.color_range == "pc";
+	sws_format = -1;
+	errors_in_row = 0;
+	hide_until_key = false;
+	hidden_since_guess = 0;
+	last_format_id = -1;
+	last_format = String();
+	conversion = String();
 
 	source = p_source;
 	fps = info.fps >= 1.0 && info.fps <= 240.0 ? info.fps : 30.0;
@@ -129,14 +190,19 @@ Error SoftwareVideoDecoder::open(const Ref<MediaSource> &p_source, int p_threads
 		ended = failed = false;
 		error = String();
 		frames_decoded = decode_errors = packets_fed = 0;
+		frames_interlaced = frames_top_first = frames_converted = frames_guessed_time = frames_hidden = 0;
 		thread_cpu_seconds = convert_seconds = 0.0;
+		full_range = target_full_range;
 	}
-	codec_description = vformat("software %s (FFmpeg %s, %d threads)", info.codec_name, codec->name, context->thread_count);
+	const bool frame_threads = (codec->capabilities & AV_CODEC_CAP_FRAME_THREADS) && (context->active_thread_type & FF_THREAD_FRAME);
+	codec_description = vformat("software %s (FFmpeg %s, %d %s threads)", info.codec_name, codec->name, context->thread_count,
+			frame_threads ? "frame" : ((context->active_thread_type & FF_THREAD_SLICE) ? "slice" : "own"));
 	wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	source->set_video_wake_fd(wake_fd);
 	stop.clear();
 	thread.start(&SoftwareVideoDecoder::_thread_func, this);
-	print_line(vformat("SoftwareVideoDecoder: %s %dx%d %d-bit, %.3f fps: %s.", info.codec_name, info.width, info.height, MAX(info.bit_depth, (int)info.sps.bit_depth), fps, codec_description));
+	print_line(vformat("SoftwareVideoDecoder: %s %dx%d %s %d-bit, %.3f fps, SAR %.4f%s: %s.", MediaSource::get_codec_display_name(info), info.width, info.height, info.pixel_format,
+			MAX(info.bit_depth, (int)info.sps.bit_depth), fps, info.sample_aspect_ratio, info.field_order.is_empty() ? String() : ", fields " + info.field_order, codec_description));
 	return OK;
 }
 
@@ -166,6 +232,11 @@ void SoftwareVideoDecoder::close() {
 	if (packet != nullptr) {
 		av_packet_free(&packet);
 	}
+	if (sws != nullptr) {
+		sws_freeContext(sws);
+		sws = nullptr;
+	}
+	sws_format = -1;
 	MutexLock lock(mutex);
 	ready.clear();
 	for (Slot &slot : slots) {
@@ -221,17 +292,25 @@ void SoftwareVideoDecoder::_run() {
 		while (!stop.is_set() && _free_slot_available()) {
 			const int got = avcodec_receive_frame(context, frame);
 			if (got == 0) {
+				errors_in_row = 0;
 				_output_frame();
 				av_frame_unref(frame);
 				continue;
 			}
 			if (got == AVERROR(EAGAIN)) {
 				need_input = true;
+				errors_in_row = 0;
 			} else if (got == AVERROR_EOF) {
 				MutexLock lock(mutex);
 				ended = true;
+			} else if (++errors_in_row < ERRORS_IN_ROW_MAX) {
+				// A damaged picture (old files often have some; frame threads report it here): the decoder conceals it and
+				// goes on with the next.
+				MutexLock lock(mutex);
+				decode_errors++;
+				continue;
 			} else {
-				_fail(vformat("Decoding failed: %s.", _av_error(got)));
+				_fail(vformat("Decoding failed %d times in a row: %s.", errors_in_row, _av_error(got)));
 				stop.set();
 			}
 			break;
@@ -277,6 +356,7 @@ void SoftwareVideoDecoder::_run() {
 			avcodec_flush_buffers(context);
 			feed_serial = held.serial;
 			flushed = false;
+			hide_until_key = false;
 			skip_until = skip_nonref ? source->get_seek_target() - 2.0 / MAX(fps, 1.0) : -1.0;
 			MutexLock lock(mutex);
 			serial = feed_serial;
@@ -298,12 +378,21 @@ void SoftwareVideoDecoder::_run() {
 			}
 			send = packet;
 		}
+		if (held.keyframe_guessed) {
+			// Maybe not a keyframe after all (MediaSource couldn't tell): what is decoded from it is hidden until a picture
+			// is one.
+			hide_until_key = true;
+			hidden_since_guess = 0;
+		}
 		const AVDiscard discard = held.pts < skip_until ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
 		if (context->skip_frame != discard) {
 			context->skip_frame = discard;
 		}
-		send->pts = (int64_t)llround(held.pts * 1e6);
-		send->dts = (int64_t)llround(held.dts * 1e6);
+		// Only the timestamps the container gave: where it gave a DTS but no PTS (AVI, some MPEG-PS frames), the decoder
+		// works out the presentation time from the DTS (best_effort_timestamp), which is right after B-frames reorder;
+		// MediaSource's guess (the DTS itself) would be in decode order. With neither (raw streams), the guess it is.
+		send->pts = held.pts_valid || !held.dts_valid ? (int64_t)llround(held.pts * 1e6) : AV_NOPTS_VALUE;
+		send->dts = held.dts_valid ? (int64_t)llround(held.dts * 1e6) : AV_NOPTS_VALUE;
 		const int sent = avcodec_send_packet(context, send);
 		if (rewritten) {
 			av_packet_unref(packet);
@@ -324,20 +413,95 @@ void SoftwareVideoDecoder::_run() {
 	}
 }
 
+// Any other picture format to NV12 at the stream's matrix and range, through swscale (decode thread). False on failure.
+bool SoftwareVideoDecoder::_convert(Slot &r_slot, int p_width, int p_height) {
+	const AVPixelFormat format = (AVPixelFormat)frame->format;
+	const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(format);
+	const bool rgb = desc != nullptr && (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL)) != 0;
+	const bool source_full = rgb || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUVJ444P ||
+			format == AV_PIX_FMT_YUVJ440P || format == AV_PIX_FMT_YUVJ411P || frame->color_range == AVCOL_RANGE_JPEG;
+	if (sws == nullptr || sws_format != (int)format || sws_size != Size2i(p_width, p_height) || sws_source_full != source_full) {
+		if (sws != nullptr) {
+			sws_freeContext(sws);
+			sws = nullptr;
+		}
+		sws_format = -1;
+		const char *name = av_get_pix_fmt_name(format);
+		if (!sws_isSupportedInput(format)) {
+			_fail(vformat("The decoder gives %s pictures, which can't be converted for display.", name ? name : "unknown"));
+			return false;
+		}
+		// Same size in and out: only chroma is resampled (and, for RGB and palette pictures, converted with the matrix).
+		sws = sws_getContext(p_width, p_height, format, p_width, p_height, AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+		if (sws == nullptr) {
+			_fail(vformat("Converting %s pictures (%dx%d) for display isn't possible.", name ? name : "unknown", p_width, p_height));
+			return false;
+		}
+		const int *table = sws_getCoefficients(target_matrix);
+		sws_setColorspaceDetails(sws, table, source_full ? 1 : 0, table, target_full_range ? 1 : 0, 0, 1 << 16, 1 << 16);
+		sws_format = (int)format;
+		sws_size = Size2i(p_width, p_height);
+		sws_source_full = source_full;
+		static const char *matrices[] = { "", "BT.709", "", "", "", "BT.601", "BT.601", "SMPTE 240M", "", "BT.2020" };
+		const String conversion_text = vformat("swscale %s%s to NV12 (%s, %s range)", name ? name : "?", source_full && !rgb ? " full range" : "",
+				target_matrix >= 0 && target_matrix < 10 ? String(matrices[target_matrix]) : String("?"), target_full_range ? "full" : "limited");
+		print_line("SoftwareVideoDecoder: " + conversion_text + ".");
+		MutexLock lock(mutex);
+		conversion = conversion_text;
+	}
+	uint8_t *dst[4] = { r_slot.y.ptrw(), r_slot.uv.ptrw(), nullptr, nullptr };
+	const int dst_stride[4] = { p_width, p_width, 0, 0 };
+	const int rows = sws_scale(sws, frame->data, frame->linesize, 0, p_height, dst, dst_stride);
+	if (rows <= 0) {
+		_fail("Converting a picture for display failed.");
+		return false;
+	}
+	return true;
+}
+
 // Converts the decoded frame to 8-bit NV12 in a free slot and queues it.
 bool SoftwareVideoDecoder::_output_frame() {
 	const double t_start = _now();
 	const int format = frame->format;
-	const bool ten_bit = format == AV_PIX_FMT_YUV420P10LE;
-	if (format != AV_PIX_FMT_YUV420P && format != AV_PIX_FMT_YUVJ420P && !ten_bit) {
-		const char *name = av_get_pix_fmt_name((AVPixelFormat)format);
-		_fail(vformat("The decoder gives %s pictures; only 4:2:0 at 8 or 10 bits can be shown.", name ? name : "unknown"));
-		stop.set();
-		return false;
-	}
+	// Odd sizes lose their last column or row (NV12's chroma is a 2x2 block); FFmpeg's frames are already cropped.
 	const int width = frame->width & ~1;
 	const int height = frame->height & ~1;
-	const bool range = format == AV_PIX_FMT_YUVJ420P || frame->color_range == AVCOL_RANGE_JPEG;
+	if (width <= 0 || height <= 0 || format < 0) {
+		return false; // A picture with nothing in it (a skipped frame of some old codecs).
+	}
+	if (hide_until_key) {
+		const bool key = (frame->flags & AV_FRAME_FLAG_KEY) || frame->pict_type == AV_PICTURE_TYPE_I;
+		if (!key && hidden_since_guess < (uint32_t)MAX(fps * 3.0, 1.0)) {
+			hidden_since_guess++;
+			MutexLock lock(mutex);
+			frames_hidden++;
+			return false;
+		}
+		hide_until_key = false; // A keyframe, or 3 s without one: show what there is.
+	}
+	const bool frame_full = format == AV_PIX_FMT_YUVJ420P || frame->color_range == AVCOL_RANGE_JPEG;
+	// 4:2:0 at 8 bits (most of everything) is copied, 10-bit 4:2:0 rounded; both only when the range is the one the
+	// shader uses. The rest goes through swscale.
+	const bool copy_8bit = (format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P) && frame_full == target_full_range;
+	const bool ten_bit = format == AV_PIX_FMT_YUV420P10LE && frame_full == target_full_range;
+	if (frame->flags & AV_FRAME_FLAG_INTERLACED) {
+		MutexLock lock(mutex);
+		frames_interlaced++;
+		if (frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) {
+			frames_top_first++;
+		}
+	}
+	if (format != last_format_id) {
+		// A new picture format (the first frame, or a change mid-stream): what it is and how it is shown (stats).
+		last_format_id = format;
+		const char *name = av_get_pix_fmt_name((AVPixelFormat)format);
+		MutexLock lock(mutex);
+		last_format = name ? String(name) : String("?");
+		if (copy_8bit || ten_bit) {
+			conversion = vformat("%s %s", last_format, copy_8bit ? "copied" : "rounded to 8 bits");
+		}
+	}
+	const bool range = target_full_range;
 
 	uint32_t index = SLOT_COUNT;
 	{
@@ -370,10 +534,22 @@ bool SoftwareVideoDecoder::_output_frame() {
 		slot.uv.resize(uv_size);
 	}
 	slot.size = Size2i(width, height);
+	if (!copy_8bit && !ten_bit) {
+		if (!_convert(slot, width, height)) {
+			MutexLock lock(mutex);
+			slot.free = true;
+			stop.set();
+			return false;
+		}
+		MutexLock lock(mutex);
+		frames_converted++;
+	}
 	uint8_t *y_out = slot.y.ptrw();
 	uint8_t *uv_out = slot.uv.ptrw();
 	const int chroma_width = width / 2;
-	if (ten_bit) {
+	if (!copy_8bit && !ten_bit) {
+		// Converted above.
+	} else if (ten_bit) {
 		for (int row = 0; row < height; row++) {
 			const uint16_t *in = (const uint16_t *)(frame->data[0] + (int64_t)row * frame->linesize[0]);
 			uint8_t *out = y_out + (int64_t)row * width;
@@ -408,6 +584,9 @@ bool SoftwareVideoDecoder::_output_frame() {
 	double time = 0.0;
 	const int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
 	MutexLock lock(mutex);
+	if (pts == AV_NOPTS_VALUE) {
+		frames_guessed_time++;
+	}
 	time = pts != AV_NOPTS_VALUE ? pts * 1e-6 : last_time + 1.0 / fps;
 	last_time = time;
 	Frame out;
@@ -492,6 +671,14 @@ Dictionary SoftwareVideoDecoder::get_stats() const {
 	d["software_convert_seconds"] = convert_seconds;
 	d["process_cpu_seconds"] = _process_cpu_now();
 	d["software_threads"] = context ? context->thread_count : 0;
+	d["software_pixel_format"] = last_format; // As decoded.
+	d["software_conversion"] = conversion; // "yuv420p copied", "swscale pal8 to NV12 (BT.601, limited range)", ...
+	d["software_frames_converted"] = frames_converted;
+	d["software_frames_interlaced"] = frames_interlaced;
+	// The decoder's own view of interlacing (the pictures it flagged), in FFmpeg's field order names; "" before a frame.
+	d["software_field_order"] = frames_decoded == 0 ? String() : (frames_interlaced * 2 < frames_decoded ? String("progressive") : (frames_top_first * 2 >= frames_interlaced ? String("tt") : String("bb")));
+	d["software_frames_guessed_time"] = frames_guessed_time;
+	d["software_frames_hidden"] = frames_hidden;
 	d["frames_waiting"] = ready.size();
 	uint32_t in_use = 0;
 	for (const Slot &slot : slots) {

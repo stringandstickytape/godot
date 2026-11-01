@@ -248,7 +248,11 @@ bool is_subtitle_extension(const String &p_extension) {
 }
 
 bool is_video_extension(const String &p_extension) {
-	static const char *const EXTENSIONS[] = { "mkv", "mp4", "m4v", "mov", "avi", "ts", "m2ts", "mts", "webm", "wmv", "mpg", "mpeg" };
+	// The app's list (scripts/video/video_source_factory.gd VIDEO_EXTENSIONS).
+	static const char *const EXTENSIONS[] = { "mkv", "mk3d", "mp4", "m4v", "mov", "qt", "avi", "divx", "xvid", "ts", "m2ts", "mts", "m2t", "tp", "trp",
+		"webm", "wmv", "asf", "mpg", "mpeg", "mpe", "m1v", "m2v", "mpv", "vob", "evo", "vro", "rm", "rmvb", "rv", "flv", "f4v", "ogv", "ogm", "3gp",
+		"3g2", "mxf", "nut", "dv", "dif", "wtv", "dvr-ms", "nsv", "ivf", "y4m", "mjpg", "mjpeg", "amv", "bik", "smk", "nuv", "h264", "264", "avc",
+		"h265", "265", "hevc", "obu", "h263", "vc1" };
 	const String extension = p_extension.to_lower();
 	for (const char *candidate : EXTENSIONS) {
 		if (extension == candidate) {

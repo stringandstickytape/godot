@@ -233,6 +233,18 @@ bool MediaSource::_is_text_subtitle(int p_codec_id) {
 		case AV_CODEC_ID_MOV_TEXT:
 		case AV_CODEC_ID_WEBVTT:
 		case AV_CODEC_ID_TEXT:
+		// The older text formats (in MKV, MP4, NUT or as files next to old AVIs); FFmpeg decodes them all to ASS events.
+		case AV_CODEC_ID_MICRODVD:
+		case AV_CODEC_ID_SUBVIEWER:
+		case AV_CODEC_ID_SUBVIEWER1:
+		case AV_CODEC_ID_SAMI:
+		case AV_CODEC_ID_REALTEXT:
+		case AV_CODEC_ID_MPL2:
+		case AV_CODEC_ID_PJS:
+		case AV_CODEC_ID_JACOSUB:
+		case AV_CODEC_ID_VPLAYER:
+		case AV_CODEC_ID_STL:
+		case AV_CODEC_ID_EIA_608:
 			return true;
 		default:
 			return false;
@@ -1204,6 +1216,8 @@ void MediaSource::_deliver_video(AVPacket *p_packet) {
 	VideoPacket out;
 	out.pts = p_packet->pts != AV_NOPTS_VALUE ? _media_time(p_packet->pts, index) : (p_packet->dts != AV_NOPTS_VALUE ? _media_time(p_packet->dts, index) : next_video_pts);
 	out.dts = p_packet->dts != AV_NOPTS_VALUE ? _media_time(p_packet->dts, index) : out.pts;
+	out.pts_valid = p_packet->pts != AV_NOPTS_VALUE;
+	out.dts_valid = p_packet->dts != AV_NOPTS_VALUE;
 	const double frame_duration = p_packet->duration > 0 ? p_packet->duration * av_q2d(time_base) : (video.fps > 0.0 ? 1.0 / video.fps : 0.0);
 	next_video_pts = MAX(out.pts, out.dts) + frame_duration;
 	out.keyframe = (p_packet->flags & AV_PKT_FLAG_KEY) != 0;
@@ -1213,11 +1227,25 @@ void MediaSource::_deliver_video(AVPacket *p_packet) {
 		return;
 	}
 	if (need_keyframe) {
+		if (!out.keyframe && keyframes_unreliable && demux_trick <= 0.0) {
+			// This file's keyframe flags are lost after seeks: the demuxer has put us on an index keyframe.
+			out.keyframe = true;
+			out.keyframe_guessed = true;
+			dstats.keyframes_guessed++;
+		}
 		if (!out.keyframe) {
 			dstats.video_skipped++;
+			if (++skipped_since_seek >= KEYFRAME_GIVE_UP && !_is_annexb_codec() && demux_trick <= 0.0 && video.codec != VIDEO_CODEC_VP9) {
+				// Software codecs only (the hardware decoder must start at a real IDR picture).
+				keyframes_unreliable = true;
+				pending_reseek = seek_wanted >= 0.0 ? seek_wanted : seek_position;
+				print_line(vformat("MediaSource: no keyframe in %d %s packets after a seek: this file's keyframe flags are unreliable; from now on the first packet after a seek is taken as one.",
+						skipped_since_seek, video.codec_name));
+			}
 			_packet_put(p_packet);
 			return;
 		}
+		skipped_since_seek = 0;
 		if (seek_wanted >= 0.0 && out.pts > seek_wanted + 0.001 && seek_position > 0.0 && seek_retries < SEEK_RETRIES_MAX) {
 			// Containers without a keyframe index (MPEG-TS) are seeked by timestamp: reading starts at the target, and the
 			// first keyframe is after it. Go back further (2, 4, 8... s) until the keyframe is at or before the target.
@@ -1464,9 +1492,9 @@ void MediaSource::_seek_file(double p_position) {
 	seek_position = p_position;
 	const int stream = video.stream_index >= 0 ? video.stream_index : current_audio_stream;
 	int r;
-	if (p_position <= 0.0 && format_name == "mpegts") {
-		// MPEG-TS has no index: a timestamp seek to the start can land just after the first keyframe's start (its PES is
-		// large), and the first keyframe found is then the next one. The start of the file is byte 0.
+	if (p_position <= 0.0 && (format_name == "mpegts" || format_name == "mpeg" || format_name == "mpegvideo")) {
+		// MPEG-TS and MPEG-PS (VOB) have no index: a timestamp seek to the start can land just after the first keyframe's
+		// start (its PES is large), and the first keyframe found is then the next one. The start of the file is byte 0.
 		r = av_seek_frame(format, -1, 0, AVSEEK_FLAG_BYTE);
 	} else if (stream >= 0) {
 		// The keyframe at or before the target (max_ts = target).
@@ -1479,6 +1507,21 @@ void MediaSource::_seek_file(double p_position) {
 	} else {
 		const int64_t ts = (int64_t)Math::round((p_position + start_time) * AV_TIME_BASE);
 		r = avformat_seek_file(format, -1, INT64_MIN, ts, ts, 0);
+	}
+	if (r < 0 && format->pb && !(format->iformat->flags & AVFMT_NO_BYTE_SEEK)) {
+		// No index and no timestamp search (FLV without its keyframe table, some AVIs without idx1, raw streams): seek by
+		// bytes at the average bitrate. The keyframe found may be after the target; the retries below go further back.
+		const int64_t size = avio_size(format->pb);
+		const int64_t first = MAX(data_offset, (int64_t)0);
+		if (p_position <= 0.0 || duration <= 0.0 || size <= 0) {
+			r = av_seek_frame(format, -1, first, AVSEEK_FLAG_BYTE);
+		} else {
+			const int64_t pos = first + (int64_t)((double)(size - first) * CLAMP(p_position / duration, 0.0, 1.0));
+			r = av_seek_frame(format, -1, pos, AVSEEK_FLAG_BYTE);
+		}
+		if (r >= 0) {
+			print_verbose(vformat("MediaSource: %s has no index: seeking to %.3f s by bytes.", format_name, p_position));
+		}
 	}
 	if (r < 0) {
 		MutexLock lock(mutex);
@@ -1502,6 +1545,7 @@ void MediaSource::_seek_file(double p_position) {
 	scratch_offset = 0;
 	need_keyframe = true;
 	need_parameter_sets = true;
+	skipped_since_seek = 0;
 	eof_reached = false;
 	eof_drained = false;
 	read_errors_in_row = 0;
@@ -1729,6 +1773,7 @@ Error MediaSource::open(const String &p_path) {
 		return ERR_FILE_CANT_OPEN;
 	}
 	format = context;
+	data_offset = format->pb ? avio_tell(format->pb) : 0; // Where the header ends: byte seeks to the start go here.
 	r = avformat_find_stream_info(format, nullptr);
 	if (r < 0) {
 		_set_error(vformat("Can't read the streams of %s: %s.", global_path, _av_error(r)));
@@ -1819,6 +1864,20 @@ Error MediaSource::open(const String &p_path) {
 		video.valid = true;
 		video.stream_index = best_video;
 		video.codec_name = String::utf8(avcodec_get_name(par->codec_id));
+		video.codec_id = (int)par->codec_id;
+		const AVCodecDescriptor *descriptor = avcodec_descriptor_get(par->codec_id);
+		video.codec_long_name = descriptor && descriptor->long_name ? String::utf8(descriptor->long_name) : video.codec_name;
+		video.codec_tag = String();
+		for (int i = 0; i < 4 && par->codec_tag != 0; i++) {
+			const char c = (char)((par->codec_tag >> (8 * i)) & 0xff);
+			if (c < 0x20 || c > 0x7e) {
+				video.codec_tag = String();
+				break;
+			}
+			video.codec_tag += String::chr(c);
+		}
+		video.codec_tag = video.codec_tag.strip_edges();
+		video.software_decoder = (par->codec_id == AV_CODEC_ID_AV1 ? avcodec_find_decoder_by_name("libdav1d") : avcodec_find_decoder(par->codec_id)) != nullptr;
 		switch (par->codec_id) {
 			case AV_CODEC_ID_H264:
 				video.codec = VIDEO_CODEC_H264;
@@ -1840,7 +1899,10 @@ Error MediaSource::open(const String &p_path) {
 		video.height = par->height;
 		_read_stream_metadata(stream);
 		_read_hdr_side_data(stream);
-		const AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
+		AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0 ? stream->avg_frame_rate : stream->r_frame_rate;
+		if (av_q2d(rate) > 240.0 && stream->r_frame_rate.num > 0 && stream->r_frame_rate.den > 0) {
+			rate = stream->r_frame_rate; // An average from a guessed duration (raw DV): the base rate is right.
+		}
 		video.fps = rate.num > 0 && rate.den > 0 ? av_q2d(rate) : 0.0;
 		const AVRational sar = av_guess_sample_aspect_ratio(format, format->streams[best_video], nullptr);
 		video.sample_aspect_ratio = sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0;
@@ -1894,8 +1956,31 @@ Error MediaSource::open(const String &p_path) {
 					_close_internal();
 					return ERR_CANT_CREATE;
 				}
+				video_filter_name = hevc ? "hevc_mp4toannexb" : "h264_mp4toannexb";
+			}
+		} else if (par->codec_id == AV_CODEC_ID_MPEG4) {
+			// DivX 5 and some Xvid AVIs store a B-frame inside the P-frame before it ("packed B-frames", a VfW workaround),
+			// which the decoder can't take with frame threads. The filter splits them into one frame per packet (it passes
+			// other streams through untouched).
+			const AVBitStreamFilter *filter = av_bsf_get_by_name("mpeg4_unpack_bframes");
+			r = filter ? av_bsf_alloc(filter, &bsf) : AVERROR_BSF_NOT_FOUND;
+			if (r >= 0) {
+				r = avcodec_parameters_copy(bsf->par_in, par);
+			}
+			if (r >= 0) {
+				bsf->time_base_in = stream->time_base;
+				r = av_bsf_init(bsf);
+			}
+			if (r < 0) {
+				av_bsf_free(&bsf); // Without it, packed B-frames show out of order: still better than nothing.
+				print_line(vformat("MediaSource: no mpeg4_unpack_bframes filter (%s); packed B-frames are decoded as they are.", _av_error(r)));
+			} else {
+				video_filter_name = "mpeg4_unpack_bframes";
 			}
 		}
+		// MPEG-1/2 (VOB, MPEG-PS, TS) and VC-1 interlacing comes from the parser of the first packets; a container flag
+		// (Matroska FieldOrder, MOV fiel) also gives it. Others, when the decoder flags interlaced pictures, are seen in the
+		// software decoder's stats ("software_field_order").
 	}
 	video_queue_target = _video_queue_target();
 	{
@@ -1937,6 +2022,8 @@ Error MediaSource::open(const String &p_path) {
 	demux_serial = 0;
 	need_keyframe = true;
 	need_parameter_sets = true;
+	skipped_since_seek = 0;
+	keyframes_unreliable = false;
 	seek_wanted = -1.0;
 	seek_position = 0.0;
 	seek_retries = 0;
@@ -2074,6 +2161,7 @@ void MediaSource::_close_internal() {
 	current_secondary_track = -1;
 	current_secondary_stream = -1;
 	av_bsf_free(&bsf);
+	video_filter_name = String();
 	av_packet_free(&read_packet);
 	av_frame_free(&audio_frame);
 	{
@@ -2124,6 +2212,22 @@ void MediaSource::close() {
 	external_cursor = 0;
 }
 
+const AVCodecParameters *MediaSource::get_video_codec_parameters() const {
+	if (format == nullptr || video.stream_index < 0) {
+		return nullptr;
+	}
+	return bsf != nullptr ? bsf->par_out : format->streams[video.stream_index]->codecpar;
+}
+
+// "MPEG-4 part 2 (XVID)", "Windows Media Video 9", "RealVideo 4.0": what a message names the codec by.
+String MediaSource::get_codec_display_name(const VideoInfo &p_info) {
+	String name = p_info.codec_long_name.is_empty() ? p_info.codec_name.to_upper() : p_info.codec_long_name;
+	if (!p_info.codec_tag.is_empty() && p_info.codec_tag.length() == 4 && !name.containsn(p_info.codec_tag)) {
+		name += " (" + p_info.codec_tag + ")";
+	}
+	return name;
+}
+
 String MediaSource::get_hw_unsupported_reason(const VideoInfo &p_info, bool p_allow_10bit) {
 	if (!p_info.valid) {
 		return "There is no video stream.";
@@ -2143,7 +2247,7 @@ String MediaSource::get_hw_unsupported_reason(const VideoInfo &p_info, bool p_al
 		case VIDEO_CODEC_AV1:
 			return "AV1 video can't be decoded in hardware: this SteamOS kernel doesn't expose the AV1 decoder.";
 		default:
-			return vformat("%s video can't be decoded in hardware (the Frame decodes H.264, HEVC and VP9).", p_info.codec_name.to_upper());
+			return vformat("%s video can't be decoded in hardware (the Frame decodes H.264, HEVC and VP9).", get_codec_display_name(p_info));
 	}
 	const int bit_depth = MAX(p_info.bit_depth, (int)p_info.sps.bit_depth);
 	if (bit_depth > 8 && (!p_allow_10bit || (p_info.codec == VIDEO_CODEC_VP9 && hw_vp9_p010_refused.is_set()))) {
@@ -2167,6 +2271,9 @@ Dictionary MediaSource::get_video_info() const {
 	d["stream_index"] = video.stream_index;
 	d["codec"] = video.codec == VIDEO_CODEC_OTHER ? video.codec_name : String(codec_names[video.codec]);
 	d["codec_name"] = video.codec_name;
+	d["codec_long_name"] = video.codec_long_name;
+	d["codec_tag"] = video.codec_tag;
+	d["codec_display_name"] = get_codec_display_name(video);
 	d["width"] = video.width;
 	d["height"] = video.height;
 	d["fps"] = video.fps;
@@ -2230,7 +2337,10 @@ Dictionary MediaSource::get_video_info() const {
 	d["software_decodable"] = !hw_reason.is_empty() && sw_reason.is_empty();
 	d["playable"] = hw_reason.is_empty() || sw_reason.is_empty();
 	d["unplayable_reason"] = hw_reason.is_empty() || sw_reason.is_empty() ? String() : hw_reason + " " + sw_reason;
-	d["annexb_filter"] = bsf != nullptr;
+	d["software_unsupported_reason"] = sw_reason;
+	d["software_max_pixels"] = SoftwareVideoDecoder::get_max_pixels(video, SoftwareVideoDecoder::DEFAULT_MAX_PIXELS);
+	d["annexb_filter"] = bsf != nullptr && _is_annexb_codec();
+	d["video_filter"] = video_filter_name;
 	if (video.sps.valid) {
 		d["coded_width"] = video.sps.width;
 		d["coded_height"] = video.sps.height;
@@ -2579,6 +2689,7 @@ Dictionary MediaSource::get_stats() const {
 	d["video_parameter_sets_added"] = stats.video_parameter_sets_added;
 	d["video_queue"] = video_count;
 	d["video_queue_bytes"] = video_queued_bytes;
+	d["keyframes_guessed"] = stats.keyframes_guessed;
 	d["audio_packets"] = stats.audio_packets;
 	d["audio_frames_out"] = stats.audio_frames_out;
 	d["audio_decode_errors"] = stats.audio_decode_errors;

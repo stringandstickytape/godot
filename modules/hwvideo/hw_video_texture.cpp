@@ -847,7 +847,8 @@ void HWVideoTexture::_show_software(const ReadyFrame &p_frame, uint64_t p_frames
 			format.format = formats[p];
 			format.width = sizes[p].width;
 			format.height = sizes[p].height;
-			format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+			// CAN_COPY_FROM: tests read the planes back (RenderingDevice.texture_get_data() on get_plane_rd_rid()).
+			format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 			software_rd[p] = rd->texture_create(format, RD::TextureView());
 			ERR_FAIL_COND_MSG(software_rd[p].is_null(), "HWVideoTexture: couldn't create the software path's textures.");
 			software_rs[p] = RS::get_singleton()->texture_rd_create(software_rd[p]);

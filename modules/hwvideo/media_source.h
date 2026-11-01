@@ -47,6 +47,7 @@
 
 struct AVBSFContext;
 struct AVCodecContext;
+struct AVCodecParameters;
 struct AVFormatContext;
 struct AVFrame;
 struct AVPacket;
@@ -60,8 +61,10 @@ class NetStream;
 class AudioStreamMedia;
 class AudioTempo;
 
-// A media file (Matroska/WebM, MP4/MOV, MPEG-TS, AVI) opened with FFmpeg's libavformat, read on a worker thread.
-// Video is only demuxed: access units go, in Annex-B for H.264/HEVC, through a bounded queue to a consumer (V4L2Decoder).
+// A media file (any container FFmpeg reads: Matroska/WebM, MP4/MOV, MPEG-TS, MPEG-PS/VOB, AVI, ASF, RealMedia, FLV, Ogg,
+// MXF, ...) opened with FFmpeg's libavformat, read on a worker thread.
+// Video is only demuxed: access units go, in Annex-B for H.264/HEVC (MPEG-4 part 2 with packed B-frames unpacked),
+// through a bounded queue to a consumer (V4L2Decoder, or SoftwareVideoDecoder for everything else).
 // Audio of the selected track is decoded and resampled to the AudioServer mix rate (stereo float), into a ring buffer
 // that AudioStreamMedia plays; its playback position is the A/V master clock.
 //
@@ -91,7 +94,11 @@ public:
 	struct VideoInfo {
 		bool valid = false;
 		VideoCodec codec = VIDEO_CODEC_NONE;
-		String codec_name;
+		String codec_name; // FFmpeg's short name ("mpeg4", "msmpeg4v3", "wmv3", ...).
+		String codec_long_name; // FFmpeg's description ("MPEG-4 part 2", ...); codec_name if it has none.
+		String codec_tag; // The container's FourCC when printable ("XVID", "DX50", "DIV3", ...); empty if none.
+		int codec_id = 0; // AVCodecID.
+		bool software_decoder = false; // This build has a software decoder for it (FFmpeg's, or dav1d for AV1).
 		int stream_index = -1;
 		int width = 0; // From the container / codec parameters (display size).
 		int height = 0;
@@ -142,8 +149,17 @@ public:
 		uint32_t size = 0;
 		double pts = 0.0; // Media seconds.
 		double dts = 0.0; // Decode order; equal to pts when the container has no DTS.
+		// What the container gave. Old containers often give no PTS (AVI: a frame counter as DTS only; MPEG-PS: a PTS on
+		// some frames), and pts is then a guess (the DTS, or the last time plus a frame): a software decoder should
+		// reorder from the DTS (FFmpeg's best_effort_timestamp) instead.
+		bool pts_valid = false;
+		bool dts_valid = false;
 		uint32_t serial = 0;
 		bool keyframe = false;
+		// The first packet after a seek in a file whose keyframe flags can't be trusted (software codecs only): taken as
+		// the random access point it most likely is (the demuxer seeked to an index keyframe). A decoder should hide its
+		// pictures until one is a keyframe.
+		bool keyframe_guessed = false;
 		uint32_t sps_width = 0; // Coded size of an SPS in this access unit (0: none).
 		uint32_t sps_height = 0;
 		// H.264/HEVC keyframes (and the first access unit after a jump): the type of the first picture NAL unit
@@ -231,6 +247,7 @@ private:
 		uint64_t video_skipped = 0; // Before the first keyframe after open/seek, and in trick play all but keyframes.
 		uint64_t trick_steps = 0; // Trick play: jumps through the index to the next keyframe due.
 		uint64_t video_parameter_sets_added = 0;
+		uint64_t keyframes_guessed = 0; // Seeks in a file with unreliable keyframe flags (keyframes_unreliable).
 		uint64_t audio_packets = 0;
 		uint64_t audio_frames_out = 0; // Resampled frames written to the ring.
 		uint64_t audio_decode_errors = 0;
@@ -531,6 +548,14 @@ private:
 	void _close_network();
 	double _media_time(int64_t p_ts, int p_stream) const;
 	bool _is_annexb_codec() const { return video.codec == VIDEO_CODEC_H264 || video.codec == VIDEO_CODEC_HEVC; }
+	String video_filter_name; // The bitstream filter in bsf: "h264_mp4toannexb", "mpeg4_unpack_bframes", ... or "".
+	int64_t data_offset = 0; // The file position after the container header (byte seeks to the start).
+	// Some AVIs lose their keyframe flags after a seek in FFmpeg's demuxer (an index in milliseconds, frames counted
+	// differently): after KEYFRAME_GIVE_UP packets without one, a software codec's file is seeked again and the first
+	// packet taken as the keyframe, from then on.
+	static constexpr uint32_t KEYFRAME_GIVE_UP = 300;
+	uint32_t skipped_since_seek = 0; // Demux thread.
+	bool keyframes_unreliable = false; // Demux thread.
 
 	uint32_t _video_queue_target() const;
 	AVPacket *_packet_get();
@@ -697,10 +722,16 @@ public:
 
 	// C++ consumer API (V4L2Decoder).
 	const VideoInfo &get_video_stream_info() const { return video; }
+	// The video stream's codec parameters (extradata, size, codec tag, ...) as the packets arrive: after the bitstream
+	// filter, if there is one. For a software decoder of codecs that need them (MPEG-4 VOL headers, WMV/VC-1 sequence
+	// headers, RealVideo, ...). Null if there is no video. Valid while the source is open.
+	const AVCodecParameters *get_video_codec_parameters() const;
 	// Why the Frame can't decode and show this video in hardware, as a sentence for the user; empty if it can.
 	// p_allow_10bit: the decoder offers P010, or V4L2Decoder.experimental_10bit (Q10C capture) is on. VP9 (profiles 0
 	// and 2) is decodable: the one-session rule and the hw_vp9 switch are HWVideoTexture's, not reasons here.
 	static String get_hw_unsupported_reason(const VideoInfo &p_info, bool p_allow_10bit = false);
+	// The codec's name for messages: FFmpeg's description, with the container's FourCC ("MPEG-4 part 2 (XVID)").
+	static String get_codec_display_name(const VideoInfo &p_info);
 	// Whether the hardware path can show 10-bit (the decoder offers P010). V4L2Decoder sets it once it has looked;
 	// get_video_info()'s hw_decodable uses it.
 	static void set_hw_10bit_available(bool p_available) { hw_10bit_available.set_to(p_available); }
