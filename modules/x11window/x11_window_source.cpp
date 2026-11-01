@@ -1034,7 +1034,7 @@ Error X11WindowSource::_fetch_dmabuf(bool &r_ready) {
 		_evict_buffers();
 		CachedBuffer buffer;
 		buffer.image = image;
-		buffer.texture = RS::get_singleton()->texture_rd_create(image->get_texture());
+		buffer.texture = RS::get_singleton()->texture_rd_create(image->get_base_texture());
 		buffer.inode = st.st_ino;
 		buffer.fd = fds[0];
 		buffer.size = buffer_size;

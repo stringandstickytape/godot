@@ -84,6 +84,9 @@ public:
 
 	bool is_imported() const { return vk_image != VK_NULL_HANDLE; }
 	RID get_texture() const { return view_texture; }
+	// What RS::texture_rd_create() can wrap: it refuses shared textures, so for an XRGB buffer the view above can not go
+	// through it. The picture only needs RGB (the X byte is undefined, so callers mustn't read alpha).
+	RID get_base_texture() const { return base_texture; }
 	Size2i get_size() const { return size; }
 	uint64_t get_drm_modifier() const { return drm_modifier; }
 
