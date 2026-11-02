@@ -160,6 +160,7 @@ private:
 		uint32_t serial = 0;
 		uint64_t base_index = 0;
 		uint64_t frames = 0;
+		double newest_time = -1.0; // Source mode: the time of the latest picture out, -1 before the first.
 	};
 
 	struct RecentAU {

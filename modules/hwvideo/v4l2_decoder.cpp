@@ -848,6 +848,9 @@ int V4L2Decoder::_queue_source_packet(uint32_t p_index) {
 // Feeds access units while the input is no more than lead_time ahead of the clock. Until the epoch's first frame is out the
 // feed is unpaced (SOURCE_CHANGE and B-frame reordering need a few access units), but at most all OUTPUT buffers but one
 // are in the driver: during a resolution change the driver keeps what it has, and _rate_reset() needs a free buffer.
+// Source mode: unpaced too while the pictures out are behind the clock. The decoder gives a picture out only when it has
+// the next few access units, and at a low frame rate those are seconds past lead_time; while a seek settles the clock
+// waits for that picture, so nothing would ever move (a 1 fps H.264 file stayed black).
 int V4L2Decoder::_queue_input() {
 	int queued = 0;
 	while (!input_done && !pending_reconfig && !exit_requested.is_set()) {
@@ -862,7 +865,8 @@ int V4L2Decoder::_queue_input() {
 			// the frame rate), and never later than its own PTS. Not by DTS: Matroska has none (FFmpeg sets it to the PTS,
 			// which jumps around with B-frames).
 			const double due = MIN(epoch_start_pts + (double)media_index / fps, held.pts);
-			if (epochs[epochs.size() - 1].frames > 0 && due > worker_clock + lead_time && !(vp9 && vp9_held_split)) {
+			const Epoch &epoch = epochs[epochs.size() - 1];
+			if (epoch.frames > 0 && epoch.newest_time >= worker_clock && due > worker_clock + lead_time && !(vp9 && vp9_held_split)) {
 				break;
 			}
 			const int index = _free_output_buffer();
@@ -1409,6 +1413,7 @@ int V4L2Decoder::_dequeue_capture() {
 				if (source.is_valid() && queue_seq[slot] == frame_seq) {
 					// The driver copies the OUTPUT timestamp to the picture decoded from it, so this is that access unit's PTS.
 					frame.time = queue_pts[slot];
+					epoch->newest_time = MAX(epoch->newest_time, frame.time);
 				} else {
 					frame.time = (double)(epoch->base_index + epoch->frames) / fps;
 				}
