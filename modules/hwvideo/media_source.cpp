@@ -1672,7 +1672,10 @@ void MediaSource::_thread_loop() {
 		if (!work) {
 			dstats.thread_cpu_seconds = thread_cpu_seconds();
 			stats = dstats;
+			// No video queued and none read until audio plays: the audio queues are full, or the file's end is reached behind them.
+			audio_blocks_video = video.stream_index >= 0 && video_count == 0 && (scratch_frames > 0 || audio_fifo_count > 0);
 			condition.wait(lock);
+			audio_blocks_video = false;
 		}
 		demux_idle.clear();
 		audio_space_wanted.set(0);
@@ -2585,6 +2588,7 @@ int MediaSource::seek(double p_seconds) {
 	seek_pending = true;
 	seek_target = target;
 	demux_eof = false;
+	audio_blocks_video = false;
 	seek_count++;
 	if (state == STATE_ENDED) {
 		state = STATE_READING;
@@ -2648,6 +2652,11 @@ double MediaSource::get_position() const {
 bool MediaSource::is_eof() const {
 	MutexLock lock(mutex);
 	return demux_eof;
+}
+
+bool MediaSource::is_audio_blocking_video() const {
+	MutexLock lock(mutex);
+	return audio_blocks_video;
 }
 
 MediaSource::State MediaSource::get_state() const {
@@ -2981,6 +2990,7 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("trick_play", "speed", "from"), &MediaSource::trick_play);
 	ClassDB::bind_method(D_METHOD("get_trick_play_speed"), &MediaSource::get_trick_play_speed);
 	ClassDB::bind_method(D_METHOD("get_serial"), &MediaSource::get_serial);
+	ClassDB::bind_method(D_METHOD("is_audio_blocking_video"), &MediaSource::is_audio_blocking_video);
 	ClassDB::bind_method(D_METHOD("get_seek_target"), &MediaSource::get_seek_target);
 	ClassDB::bind_method(D_METHOD("get_duration"), &MediaSource::get_duration);
 	ClassDB::bind_method(D_METHOD("get_start_time"), &MediaSource::get_start_time);

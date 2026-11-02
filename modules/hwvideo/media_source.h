@@ -369,6 +369,7 @@ private:
 	uint64_t video_queued_bytes = 0;
 	LocalVector<AVPacket *> packet_pool;
 	bool demux_eof = false;
+	bool audio_blocks_video = false;
 	double last_video_pts = -1.0;
 	uint32_t video_queue_target = VIDEO_QUEUE_MIN;
 	Stats stats; // Published copy of dstats.
@@ -691,6 +692,9 @@ public:
 	double get_start_time() const { return start_time; }
 	double get_position() const;
 	bool is_eof() const;
+	// The demux thread waits for audio to play, with no video queued: what waits for a video frame while holding audio back
+	// has to let the audio go.
+	bool is_audio_blocking_video() const;
 	State get_state() const;
 	String get_last_error() const;
 

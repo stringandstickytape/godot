@@ -287,6 +287,12 @@
 				Selects a subtitle track (-1: none). This doesn't seek: events whose packets were read before (up to the queue length ahead of the playback position) aren't delivered. An event that started before a seek target isn't delivered after the seek either, unless its packet lies after the keyframe the seek lands on.
 			</description>
 		</method>
+		<method name="is_audio_blocking_video" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] while reading has stopped because the audio queues are full (or the end of the file is reached behind them) and no video is queued: no more video comes until the audio plays.
+			</description>
+		</method>
 		<method name="is_eof" qualifiers="const">
 			<return type="bool" />
 			<description>

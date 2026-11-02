@@ -777,12 +777,16 @@ bool HWVideoTexture::_select_due(bool p_input_ended, ReadyFrame &r_show) {
 		due = (int)k;
 	}
 	if (settling) {
+		// Audio waits for this frame, and no more video is read until audio plays (a video track that has ended, or one far
+		// sparser than the audio queues are long): stop waiting.
+		const bool starved = source.is_valid() && source->is_audio_blocking_video();
 		if (due < 0) {
 			if (!later) {
+				settling = !starved;
 				return false;
 			}
 			due = 0; // The first frame is after the target (a stream starting at 0.083 s, a seek into a gap): show it.
-		} else if (!later && ready[due].time < clock - 1e-3 && !p_input_ended) {
+		} else if (!later && ready[due].time < clock - 1e-3 && !p_input_ended && !starved) {
 			// Not known yet whether this is the frame for the target: keep it, skip the ones before it.
 			_discard_ready((uint32_t)due, true);
 			return false;
