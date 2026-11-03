@@ -31,6 +31,7 @@
 #include "register_types.h"
 
 #include "audio_stream_media.h"
+#include "binaural_renderer.h"
 #include "dmabuf_image.h"
 #include "hw_video_texture.h"
 #include "media_browser.h"
@@ -51,6 +52,8 @@ void initialize_hwvideo_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(AudioStreamMedia);
 	GDREGISTER_CLASS(AudioStreamPlaybackMedia);
 	GDREGISTER_CLASS(V4L2Decoder);
+	GDREGISTER_CLASS(BinauralRenderer);
+	GDREGISTER_INTERNAL_CLASS(BinauralHrtfData);
 	GDREGISTER_CLASS(HWVideoTexture);
 	GDREGISTER_ABSTRACT_CLASS(HWVideoPlaneTexture);
 }

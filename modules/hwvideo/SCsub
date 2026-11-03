@@ -43,4 +43,29 @@ if libsmb2_lib is None:
 env_hwvideo.Append(CCFLAGS=["-isystem", os.path.join(libsmb2_prefix, "include")])
 env.Append(LIBS=[File(libsmb2_lib)])
 
+# libmysofa (BSD-3-Clause, thirdparty/libmysofa): reads SOFA HRTF files for BinauralRenderer. Only the reader, the
+# checks, the coordinate conversion and the resampler; zlib is the engine's own.
+env_mysofa = env_hwvideo.Clone()
+env_mysofa.disable_warnings()
+mysofa_dir = "#thirdparty/libmysofa/src/"
+env_mysofa.Prepend(CPPPATH=[mysofa_dir + "hrtf", "#thirdparty/zlib"])
+mysofa_sources = [
+    mysofa_dir + f
+    for f in [
+        "hrtf/reader.c",
+        "hrtf/check.c",
+        "hrtf/spherical.c",
+        "hrtf/tools.c",
+        "hrtf/resample.c",
+        "hdf/superblock.c",
+        "hdf/dataobject.c",
+        "hdf/btree.c",
+        "hdf/fractalhead.c",
+        "hdf/gunzip.c",
+        "hdf/gcol.c",
+        "resampler/speex_resampler.c",
+    ]
+]
+env_mysofa.add_source_files(env.modules_sources, mysofa_sources)
+
 env_hwvideo.add_source_files(env.modules_sources, "*.cpp")

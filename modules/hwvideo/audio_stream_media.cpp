@@ -61,7 +61,7 @@ void AudioStreamMedia::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_media_source"), &AudioStreamMedia::get_media_source);
 	ClassDB::bind_method(D_METHOD("set_channel", "channel"), &AudioStreamMedia::set_channel);
 	ClassDB::bind_method(D_METHOD("get_channel"), &AudioStreamMedia::get_channel);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "channel", PROPERTY_HINT_RANGE, "-1,7,1"), "set_channel", "get_channel");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "channel", PROPERTY_HINT_RANGE, "-1,15,1"), "set_channel", "get_channel");
 }
 
 /* AudioStreamPlaybackMedia */

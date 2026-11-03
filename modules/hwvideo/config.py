@@ -11,6 +11,7 @@ def get_doc_classes():
     return [
         "AudioStreamMedia",
         "AudioStreamPlaybackMedia",
+        "BinauralRenderer",
         "DmabufImage",
         "HWVideoPlaneTexture",
         "HWVideoTexture",

@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="BinauralRenderer" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Binaural rendering of audio channels or an ambisonic sound field as virtual speakers, through an HRTF.
+	</brief_description>
+	<description>
+		Every source (a channel at a position in the world) is heard through the head-related transfer function of its direction from the listener's head: a fractional delay line per ear (the interaural delay) and a 128-tap FIR with the bilinearly interpolated, delay-free impulse response of a 48 x 14 grid of directions. The listener's pose is followed every 64 frames, the old and new filters crossfaded, so head turns make no clicks. No block processing: no latency.
+		Ambisonics (AmbiX: ACN, SN3D; orders 1 to 3) are decoded to world-fixed virtual speakers with max-rE weights and rendered the same way. A room adds first-order reflections off the walls of a box (image sources) and a late reverb (a feedback delay network sized to the room). Then an output EQ and a gain.
+		The setters can be called from any thread; [method process] (the audio thread, through [method MediaSource.set_spatial_renderer]) takes their state at its next call. [method render] runs it from a script, for tests.
+		HRTFs: a pack (the compact grid this class writes with [method save_hrtf]) or a SOFA file (AES69 SimpleFreeFieldHRIR, read with libmysofa, resampled to 48 kHz, diffuse-field equalised).
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="ambisonic_encode" qualifiers="static">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="direction" type="Vector3" />
+			<param index="1" name="order" type="int" />
+			<description>
+				Returns the AmbiX (ACN, SN3D) gains of a plane wave from [param direction] (Godot axes), for tests.
+			</description>
+		</method>
+		<method name="get_hrtf_info" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns [code]loaded[/code], [code]name[/code], [code]credit[/code], [code]source[/code], [code]measured[/code] (directions in the SOFA file it came from) and [code]grid[/code].
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns why the last [method load_hrtf] failed.
+			</description>
+		</method>
+		<method name="get_sample_rate" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the output rate set with [method set_sample_rate].
+			</description>
+		</method>
+		<method name="get_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns [code]frames[/code], [code]calls[/code], [code]usec[/code] (CPU time spent), [code]load[/code] (CPU time per second of audio: the share of one core), [code]max_usec[/code], [code]max_frames[/code], [code]sources[/code] and [code]latency_frames[/code] (0).
+			</description>
+		</method>
+		<method name="get_tuning" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns [code]itd_scale[/code], [code]pinna_warp[/code] and [code]concha_db[/code].
+			</description>
+		</method>
+		<method name="is_ready" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] once an HRTF is loaded.
+			</description>
+		</method>
+		<method name="load_hrtf">
+			<return type="int" enum="Error" />
+			<param index="0" name="path" type="String" />
+			<description>
+				Loads a pack, or a [code].sofa[/code] file. On failure [method get_last_error] says why.
+			</description>
+		</method>
+		<method name="lookup_hrir" qualifiers="const">
+			<return type="Dictionary" />
+			<param index="0" name="azimuth" type="float" />
+			<param index="1" name="elevation" type="float" />
+			<description>
+				Returns the interpolated responses ([code]left[/code], [code]right[/code]) and delays ([code]delay_left[/code], [code]delay_right[/code], samples) for a direction: azimuth in degrees from the front, positive to the right; elevation positive up. For tests.
+			</description>
+		</method>
+		<method name="render">
+			<return type="PackedFloat32Array" />
+			<param index="0" name="input" type="PackedFloat32Array" />
+			<param index="1" name="channels" type="int" />
+			<description>
+				Renders [param input] (interleaved, [param channels] per frame) to interleaved stereo, in blocks of 512 frames, as the audio thread would.
+			</description>
+		</method>
+		<method name="reset">
+			<return type="void" />
+			<description>
+				Clears the delay lines and the room's echoes at the next block (a seek).
+			</description>
+		</method>
+		<method name="reset_stats">
+			<return type="void" />
+			<description>
+				Starts [method get_stats] again.
+			</description>
+		</method>
+		<method name="save_hrtf">
+			<return type="int" enum="Error" />
+			<param index="0" name="path" type="String" />
+			<param index="1" name="name" type="String" default="&quot;&quot;" />
+			<param index="2" name="credit" type="String" default="&quot;&quot;" />
+			<description>
+				Writes the loaded HRTF as a pack, with [param name] and [param credit] if given.
+			</description>
+		</method>
+		<method name="set_ambisonics">
+			<return type="void" />
+			<param index="0" name="order" type="int" />
+			<param index="1" name="first_input" type="int" />
+			<param index="2" name="frame" type="Basis" default="Basis(1, 0, 0, 0, 1, 0, 0, 0, 1)" />
+			<param index="3" name="gain" type="float" default="1.0" />
+			<description>
+				Decodes an ambisonic sound field of [param order] (0: none) from the inputs starting at [param first_input], its front turned by [param frame] in the world (the 360 picture's front).
+			</description>
+		</method>
+		<method name="set_eq">
+			<return type="void" />
+			<param index="0" name="bands" type="Array" />
+			<description>
+				The output EQ: up to 8 Dictionaries [code]{type: "peak", "low_shelf" or "high_shelf", freq, gain_db, q}[/code].
+			</description>
+		</method>
+		<method name="set_gain">
+			<return type="void" />
+			<param index="0" name="gain" type="float" />
+			<description>
+				The output gain.
+			</description>
+		</method>
+		<method name="set_listener">
+			<return type="void" />
+			<param index="0" name="pose" type="Transform3D" />
+			<description>
+				The head's pose in the world (the XR camera's global transform). Blocks in between are interpolated.
+			</description>
+		</method>
+		<method name="set_room">
+			<return type="void" />
+			<param index="0" name="room" type="Dictionary" />
+			<description>
+				[code]min[/code], [code]max[/code] (the walls' box in the world), [code]reflect[/code] (0-1, or six: left, right, floor, ceiling, front, back), [code]rt60[/code] (seconds), [code]wet[/code] (0-2), [code]late[/code] (the reverb's level at wet 1, default 0.5), [code]enabled[/code].
+			</description>
+		</method>
+		<method name="set_sample_rate">
+			<return type="void" />
+			<param index="0" name="rate" type="float" />
+			<description>
+				The output's sample rate; the HRTF is resampled to it. [method MediaSource.set_spatial_renderer] sets it.
+			</description>
+		</method>
+		<method name="set_sources">
+			<return type="void" />
+			<param index="0" name="sources" type="Array" />
+			<description>
+				Up to 48 Dictionaries: [code]input[/code] (the channel), [code]kind[/code] ("point", "lfe": both ears without direction, "head_left" / "head_right": head-locked), [code]position[/code] (world; with [code]at_infinity[/code] a direction), [code]gain[/code], [code]reflections[/code].
+			</description>
+		</method>
+		<method name="set_tuning">
+			<return type="void" />
+			<param index="0" name="itd_scale" type="float" />
+			<param index="1" name="pinna_warp" type="float" />
+			<param index="2" name="concha_db" type="float" />
+			<description>
+				Fits the HRTF to a listener: the interaural delay times [param itd_scale] (0.5-1.5, head size), the responses' spectral features moved up by [param pinna_warp] (0.8-1.25, the pinna notches), and a peak of [param concha_db] at 4.5 kHz (the concha's resonance).
+			</description>
+		</method>
+		<method name="virtual_speakers" qualifiers="static">
+			<return type="PackedVector3Array" />
+			<param index="0" name="order" type="int" />
+			<description>
+				Returns the directions of the ambisonic decode's virtual speakers for [param order] (8, 12 or 26).
+			</description>
+		</method>
+	</methods>
+	<constants>
+		<constant name="KIND_POINT" value="0" enum="Kind">
+		</constant>
+		<constant name="KIND_LFE" value="1" enum="Kind">
+		</constant>
+		<constant name="KIND_HEAD_LEFT" value="2" enum="Kind">
+		</constant>
+		<constant name="KIND_HEAD_RIGHT" value="3" enum="Kind">
+		</constant>
+	</constants>
+</class>

@@ -53,13 +53,32 @@
 			<return type="AudioStreamMedia" />
 			<param index="0" name="channel" type="int" />
 			<description>
-				Returns a new [AudioStreamMedia] that plays one channel of the audio as mono, for an [AudioStreamPlayer3D] placed where that speaker would be. Needs [member discrete_channels]. [param channel]: 0 FL, 1 FR, 2 FC, 3 LFE, 4 BL, 5 BR, 6 SL, 7 SR (FFmpeg's 7.1 order); [method get_audio_channels] says which the track has. A 5.1 track has either the back pair (FFmpeg's "5.1") or the side pair ("5.1(side)", as on most Blu-rays); other layouts' channels are mixed into the nearest of the eight. Night mode's gain and the dialogue boost (on FC) apply to the channels as to the stereo mix. Silent while [member playback_speed] isn't 1.
+				Returns a new [AudioStreamMedia] that plays one channel of the audio as mono. Needs [member discrete_channels]. [param channel]: 0-15, the audio's own channel order ([method get_audio_channels]). Night mode's gain and the dialogue boost (on FC) apply to the channels as to the stereo mix. Silent while [member playback_speed] isn't 1.
 			</description>
 		</method>
 		<method name="get_audio_channels" qualifiers="const">
 			<return type="Array" />
 			<description>
-				Returns the eight channel slots of [method get_audio_channel_stream], one Dictionary each: [code]index[/code], [code]name[/code] ("FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"), [code]label[/code] ("front left", ...) and [code]present[/code] (the playing track has it; all false until its first audio is decoded).
+				Returns the channels kept with [member discrete_channels], in the audio's own order, one Dictionary each: [code]index[/code], [code]name[/code] (FFmpeg's: "FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR", "FLC", "FRC", "BC", "TFL", "TFR", "TBL", "TBR", "TC", ...; ambisonic channels "ACN0", "ACN1", ...; an unnamed one "CH[i]n[/i]"), [code]label[/code] ("front left", ...) and [code]present[/code] (always [code]true[/code]). Empty until the track's first audio is decoded.
+			</description>
+		</method>
+		<method name="get_audio_layout" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				Returns the layout of the channels kept with [member discrete_channels]: [code]channels[/code] (how many), [code]names[/code] (as [method get_audio_channels]), [code]ambisonic_order[/code] (-1, or the order of an ambisonic track: AmbiX, from an MP4 SA3D box or Opus channel mapping 2, even when the decoder labels its frames otherwise), [code]ambisonic_channels[/code] (the ambisonic channels come first, in ACN order; any after them are a head-locked stereo pair) and [code]remapped[/code] (the track had more than 16 channels and is mixed to 7.1.4).
+			</description>
+		</method>
+		<method name="get_spatial_renderer" qualifiers="const">
+			<return type="BinauralRenderer" />
+			<description>
+				Returns the renderer set with [method set_spatial_renderer], or [code]null[/code].
+			</description>
+		</method>
+		<method name="set_spatial_renderer">
+			<return type="void" />
+			<param index="0" name="renderer" type="BinauralRenderer" />
+			<description>
+				Spatial audio: with [member discrete_channels], at [member playback_speed] 1 and once [param renderer] has an HRTF, the stereo stream ([method get_audio_stream], [method read_audio_frames]) is [param renderer]'s binaural mix of the channels instead of the downmix. The mix is made as the audio is taken, block by block, with the listener's newest pose: no latency is added and the audio clock is unchanged. A seek resets the renderer's echoes. Sets the renderer's sample rate to the output rate. [code]null[/code]: the downmix again.
 			</description>
 		</method>
 		<method name="get_audio_stream">
@@ -433,7 +452,7 @@
 			Dialogue boost in dB (0 to 12): the centre channel, where films put the dialogue, is that much louder in the downmix to stereo. Only for audio with a centre channel next to front left and right (5.1, 7.1, 3.0, ...; see [code]dialogue_boost_applies[/code] in [method get_stats]); stereo and mono stay as they are. A limiter keeps the peaks below -1 dBFS while it is above 0. Can be changed at any time; it is heard after the audio queue ([member audio_queue_seconds]), at once after a seek.
 		</member>
 		<member name="discrete_channels" type="bool" setter="set_discrete_channels" getter="is_discrete_channels" default="false">
-			If [code]true[/code], the audio is also kept as 7.1 float channels (FL FR FC LFE BL BR SL SR), each playable through [method get_audio_channel_stream]. The resampler then makes 7.1 and the stereo mix is the downmix of those channels (the same mix as without). It costs a second ring of 8 channels (about 5.6 MB at 44.1 kHz) and, on x86, about 0.1 % of a core. Set before [method open].
+			If [code]true[/code], the audio is also kept as float channels in its own layout and order (up to 16: mono to 7.1.4 and 9.1.6, third-order ambisonics; more are mixed to 7.1.4), each playable through [method get_audio_channel_stream] and the input of [method set_spatial_renderer]. The stereo mix is then made from those channels with FFmpeg's downmix matrix (the same mix as without). It costs a second ring of 16 channels (about 11 MB at 44.1 kHz). Set before [method open].
 		</member>
 		<member name="downmix_normalize" type="bool" setter="set_downmix_normalize" getter="is_downmix_normalize" default="false">
 			If [code]true[/code], the downmix to stereo is scaled so no sum can exceed full scale (about 7.7 dB quieter for 5.1). Set before [method open].

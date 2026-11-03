@@ -32,6 +32,7 @@
 
 #include "annexb_splitter.h"
 #include "audio_dynamics.h"
+#include "binaural_renderer.h"
 #include "subtitle_style.h"
 
 #include "core/io/image.h"
@@ -46,6 +47,7 @@
 #include "core/variant/variant.h"
 
 struct AVBSFContext;
+struct AVChannelLayout;
 struct AVCodecContext;
 struct AVCodecParameters;
 struct AVFormatContext;
@@ -263,7 +265,14 @@ private:
 		float audio_gain_db = 0.0f; // Night mode: leveller and compressor gain of the last block.
 		float audio_limiter_db = 0.0f; // Limiter reduction in the last buffer (0 or negative).
 		float audio_typical_level_db = 0.0f; // Night mode: the typical level the compressor works from.
-		uint32_t audio_channel_mask = 0; // Which of the DISCRETE_CHANNELS slots the audio has (bit n: slot n).
+		uint32_t audio_channel_mask = 0; // Which of the 7.1 slots (FL FR FC LFE BL BR SL SR) the audio has (bit n: slot n).
+		// discrete_channels: the channels kept, in the audio's own order (FFmpeg AVChannel ids; ambisonic ones as
+		// AV_CHAN_AMBISONIC_BASE + ACN).
+		int audio_channel_count = 0;
+		int audio_channel_ids[16] = {};
+		int ambisonic_order = -1; // The audio is ambisonic (AmbiX: ACN order, SN3D) of this order; -1: not.
+		int ambisonic_channels = 0; // The ambisonic channels come first; any after them are head-locked stereo.
+		bool audio_layout_remapped = false; // More than DISCRETE_CHANNELS channels: mixed to 7.1.4.
 	};
 
 	static constexpr uint32_t VIDEO_QUEUE_MAX = 512;
@@ -282,7 +291,9 @@ private:
 	static constexpr uint32_t SUBTITLE_QUEUE_MAX = 512;
 	static constexpr int SEEK_RETRIES_MAX = 6;
 	static constexpr uint32_t BITRATE_SECONDS = 128; // Seconds of video bytes kept (behind and ahead of the read position).
-	static constexpr int DISCRETE_CHANNELS = 8; // 7.1 in FFmpeg's order: FL FR FC LFE BL BR SL SR.
+	// discrete_channels: the audio's own channels, in its own order, up to this many (7.1.4, 9.1.6, third-order
+	// ambisonics); more are mixed to 7.1.4. The rings keep this many floats per frame whatever the layout.
+	static constexpr int DISCRETE_CHANNELS = 16;
 
 	struct BitrateSecond {
 		int64_t second = INT64_MIN; // Media second (floor of the PTS).
@@ -423,6 +434,12 @@ private:
 	uint64_t step_end = 0;
 	uint32_t step_serial = UINT32_MAX;
 	uint32_t reader_step[1 + DISCRETE_CHANNELS] = {};
+	int ring_layout_channels = 0; // Channels of the layout last written to channel_ring.
+	// Spatial audio (audio_mutex): with discrete channels at speed 1, the stereo stream is the renderer's binaural mix of
+	// the channels instead of the downmix. spatial_scratch and spatial_serial: the mixing thread only.
+	Ref<BinauralRenderer> spatial;
+	LocalVector<float> spatial_scratch;
+	uint32_t spatial_serial = UINT32_MAX;
 
 	// Demux thread only (and open(), before the thread starts).
 	Stats dstats;
@@ -479,7 +496,11 @@ private:
 	uint32_t audio_fifo_count = 0;
 	uint64_t audio_fifo_bytes = 0;
 	LocalVector<float> scratch; // Interleaved stereo.
-	LocalVector<float> channel_scratch; // discrete_channels: the same frames as 7.1, DISCRETE_CHANNELS per frame.
+	LocalVector<float> channel_scratch; // discrete_channels: the same frames, DISCRETE_CHANNELS floats per frame.
+	float downmix_matrix[2][DISCRETE_CHANNELS] = {}; // discrete_channels: the stereo mix of the channels.
+	int downmix_centre = -1; // The front centre channel (dialogue boost), -1: none.
+	int discrete_permutation[DISCRETE_CHANNELS] = {}; // Ambisonics in another order: channel i goes to slot n.
+	bool discrete_permute = false;
 	LocalVector<float> gain_trace; // discrete_channels: the gain night mode gave each stereo frame, for the channels.
 	uint32_t scratch_frames = 0;
 	uint32_t scratch_offset = 0;
@@ -580,6 +601,7 @@ private:
 	uint32_t _mix_tempo_locked(AudioFrame *p_buffer, uint32_t p_frames);
 	void _write_ring_locked(const float *p_samples, const float *p_channels, uint32_t p_frames, double p_time);
 	void _downmix_discrete(float *p_channels, float *r_stereo, uint32_t p_frames);
+	void _configure_discrete(const AVChannelLayout *p_layout, const AVChannelLayout *p_names, bool p_remapped);
 	uint32_t _take_frames_locked(int p_reader, uint32_t p_frames, uint64_t &r_from, bool &r_first);
 	void _mix(int p_reader, AudioFrame *p_buffer, int p_frames);
 
@@ -787,8 +809,16 @@ public:
 	void set_discrete_channels(bool p_enabled);
 	bool is_discrete_channels() const { return discrete_channels; }
 	Ref<AudioStreamMedia> get_audio_channel_stream(int p_channel);
+	// [{index, name, label, present}]: the channels kept, in order (names as FFmpeg's: FL, FR, FC, LFE, BL, BR, SL, SR,
+	// FLC, FRC, BC, TFL, TFR, TBL, TBR, TSL, TSR, TC, TFC, TBC, WL, WR, LFE2, ...; ambisonic ones ACN0, ACN1, ...).
 	Array get_audio_channels() const;
-	// AudioStreamPlaybackMedia of a channel stream: p_channel 0-7, as mono (left = right).
+	// {channels, ambisonic_order, ambisonic_channels, remapped, names}.
+	Dictionary get_audio_layout() const;
+	// Spatial audio: with discrete_channels, the stereo stream plays p_renderer's binaural mix of the channels (at speed
+	// 1, once it has an HRTF); null: the downmix again.
+	void set_spatial_renderer(const Ref<BinauralRenderer> &p_renderer);
+	Ref<BinauralRenderer> get_spatial_renderer() const;
+	// AudioStreamPlaybackMedia of a channel stream: p_channel 0-15, as mono (left = right).
 	void mix_audio_channel(AudioFrame *p_buffer, int p_frames, int p_channel);
 
 	// Letterbox detection (set before open()): black bars found in a few keyframes; get_letterbox() says where the picture is.

@@ -534,10 +534,27 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 		av_channel_layout_copy(&in_layout, &p_frame->ch_layout);
 	}
 	AVChannelLayout out_layout = {};
+	// discrete_channels: what the channels are. The stream's own layout tells ambisonics (an SA3D box, Opus channel
+	// mapping 2) even when the decoder gives its frames a plain layout of the same size (AAC).
+	AVChannelLayout names_layout = {};
+	bool remapped = false;
 	if (discrete_channels) {
-		// Other layouts' channels land on these slots (exact matches 1:1; wide and back centre channels are mixed in).
-		const AVChannelLayout layout_7_1 = AV_CHANNEL_LAYOUT_7POINT1;
-		av_channel_layout_copy(&out_layout, &layout_7_1);
+		if (channels > DISCRETE_CHANNELS) {
+			// More than the rings hold (22.2 and the like): mixed to 7.1.4.
+			const AVChannelLayout layout_7_1_4 = AV_CHANNEL_LAYOUT_7POINT1POINT4_BACK;
+			av_channel_layout_copy(&out_layout, &layout_7_1_4);
+			remapped = true;
+		} else {
+			av_channel_layout_copy(&out_layout, &in_layout);
+		}
+		av_channel_layout_copy(&names_layout, &out_layout);
+		if (!remapped && current_audio_stream >= 0 && format) {
+			const AVChannelLayout &stream_layout = format->streams[current_audio_stream]->codecpar->ch_layout;
+			if (stream_layout.nb_channels == channels && av_channel_layout_ambisonic_order(&stream_layout) >= 0) {
+				av_channel_layout_uninit(&names_layout);
+				av_channel_layout_copy(&names_layout, &stream_layout);
+			}
+		}
 	} else {
 		av_channel_layout_default(&out_layout, 2);
 	}
@@ -558,16 +575,20 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	av_channel_layout_describe(&in_layout, in_name, sizeof(in_name));
 	dstats.dialogue_boost_applies = av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_CENTER) >= 0 &&
 			av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_LEFT) >= 0 && av_channel_layout_index_from_channel(&in_layout, AV_CHAN_FRONT_RIGHT) >= 0;
-	static const AVChannel slots[DISCRETE_CHANNELS] = { AV_CHAN_FRONT_LEFT, AV_CHAN_FRONT_RIGHT, AV_CHAN_FRONT_CENTER, AV_CHAN_LOW_FREQUENCY,
+	static const AVChannel slots[8] = { AV_CHAN_FRONT_LEFT, AV_CHAN_FRONT_RIGHT, AV_CHAN_FRONT_CENTER, AV_CHAN_LOW_FREQUENCY,
 		AV_CHAN_BACK_LEFT, AV_CHAN_BACK_RIGHT, AV_CHAN_SIDE_LEFT, AV_CHAN_SIDE_RIGHT };
 	dstats.audio_channel_mask = 0;
-	for (int i = 0; i < DISCRETE_CHANNELS; i++) {
+	for (int i = 0; i < 8; i++) {
 		if (av_channel_layout_index_from_channel(&in_layout, slots[i]) >= 0) {
 			dstats.audio_channel_mask |= 1u << i;
 		}
 	}
+	if (discrete_channels && r >= 0) {
+		_configure_discrete(&out_layout, &names_layout, remapped);
+	}
 	av_channel_layout_uninit(&in_layout);
 	av_channel_layout_uninit(&out_layout);
+	av_channel_layout_uninit(&names_layout);
 	if (r < 0) {
 		swr_free(&swr);
 		MutexLock lock(mutex);
@@ -581,7 +602,7 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	swr_in_mask = mask;
 	swr_center_level = center_level;
 	const String description = vformat("MediaSource: audio %s, %s, %d Hz -> %s float, %d Hz%s.", av_get_sample_fmt_name((AVSampleFormat)p_frame->format), in_name, p_frame->sample_rate,
-			discrete_channels ? "7.1 and stereo" : "stereo", output_rate, downmix_normalize ? " (normalised downmix)" : "");
+			discrete_channels ? vformat("%d channels and stereo", dstats.audio_channel_count) : String("stereo"), output_rate, downmix_normalize ? " (normalised downmix)" : "");
 	if (description != swr_description) {
 		swr_description = description;
 		print_line(description);
@@ -589,32 +610,118 @@ bool MediaSource::_configure_swr(const AVFrame *p_frame) {
 	return true;
 }
 
-// discrete_channels: the stereo mix of 7.1 frames, as swr makes it without discrete channels (ITU-R BS.775: centre and
-// surrounds at -3 dB, LFE dropped; mono spread at -3 dB). The dialogue boost raises the centre channel itself, so the
-// channel streams get it too.
-void MediaSource::_downmix_discrete(float *p_channels, float *r_stereo, uint32_t p_frames) {
-	const uint32_t mask = dstats.audio_channel_mask;
-	const float s = (float)SQRT_HALF;
-	if (dstats.dialogue_boost_applies && dsp_dialogue_boost > 0.0f) {
-		const float boost = (float)Math::db_to_linear((double)dsp_dialogue_boost);
-		for (uint32_t f = 0; f < p_frames; f++) {
-			p_channels[(uint64_t)f * DISCRETE_CHANNELS + 2] *= boost;
+// Demux thread, discrete_channels: what the kept channels are (the layout swr makes, named after p_names), and the
+// stereo mix of them, as swr makes it without discrete channels (ITU-R BS.775: centre and surrounds at -3 dB, LFE
+// dropped; mono spread at -3 dB; rematrix_maxval 1 with downmix_normalize). Ambisonics: two virtual microphones
+// between cardioid and figure-eight, pointing left and right, and the head-locked pair straight to its side.
+void MediaSource::_configure_discrete(const AVChannelLayout *p_layout, const AVChannelLayout *p_names, bool p_remapped) {
+	const int count = MIN(p_layout->nb_channels, DISCRETE_CHANNELS);
+	dstats.audio_channel_count = count;
+	dstats.audio_layout_remapped = p_remapped;
+	const int order = av_channel_layout_ambisonic_order(p_names);
+	dstats.ambisonic_order = order >= 0 ? MIN(order, 15) : -1;
+	dstats.ambisonic_channels = 0;
+	discrete_permute = false;
+	downmix_centre = -1;
+	for (int c = 0; c < DISCRETE_CHANNELS; c++) {
+		downmix_matrix[0][c] = downmix_matrix[1][c] = 0.0f;
+		discrete_permutation[c] = c;
+		dstats.audio_channel_ids[c] = c < count ? (int)av_channel_layout_channel_from_index(p_names, c) : (int)AV_CHAN_NONE;
+	}
+	if (order >= 0) {
+		// The ambisonic channels first, in ACN order; the head-locked pair after them, left then right.
+		int ambi = 0;
+		for (int c = 0; c < count; c++) {
+			const int id = dstats.audio_channel_ids[c];
+			if (id >= AV_CHAN_AMBISONIC_BASE && id <= AV_CHAN_AMBISONIC_END) {
+				ambi++;
+			}
+		}
+		dstats.ambisonic_channels = ambi;
+		int next_head = ambi;
+		int ids[DISCRETE_CHANNELS];
+		for (int c = 0; c < count; c++) {
+			const int id = dstats.audio_channel_ids[c];
+			int slot = c;
+			if (id >= AV_CHAN_AMBISONIC_BASE && id <= AV_CHAN_AMBISONIC_END && id - AV_CHAN_AMBISONIC_BASE < ambi) {
+				slot = id - AV_CHAN_AMBISONIC_BASE;
+			} else {
+				slot = MIN(next_head++, count - 1);
+			}
+			discrete_permutation[c] = slot;
+			ids[slot] = id;
+			discrete_permute = discrete_permute || slot != c;
+		}
+		for (int c = 0; c < count; c++) {
+			dstats.audio_channel_ids[c] = ids[c];
+		}
+		const float side = 0.8f;
+		if (ambi >= 4) {
+			downmix_matrix[0][0] = downmix_matrix[1][0] = (float)SQRT_HALF; // W
+			downmix_matrix[0][1] = (float)SQRT_HALF * side; // Y: positive to the left.
+			downmix_matrix[1][1] = -(float)SQRT_HALF * side;
+		} else if (ambi >= 1) {
+			downmix_matrix[0][0] = downmix_matrix[1][0] = (float)SQRT_HALF;
+		}
+		for (int c = ambi; c < count; c++) {
+			downmix_matrix[(c - ambi) & 1][c] = 1.0f;
+		}
+		return;
+	}
+	for (int c = 0; c < count; c++) {
+		if (dstats.audio_channel_ids[c] == AV_CHAN_FRONT_CENTER) {
+			downmix_centre = c;
 		}
 	}
-	float scale = 1.0f;
-	if (downmix_normalize) {
-		// As swr's rematrix_maxval 1: the largest sum of one output's coefficients is 1.
-		const float row = ((mask & 1) ? 1.0f : 0.0f) + ((mask & 4) ? s : 0.0f) + ((mask & 16) ? s : 0.0f) + ((mask & 64) ? s : 0.0f);
-		scale = row > 1.0f ? 1.0f / row : 1.0f;
+	AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+	double matrix[2 * DISCRETE_CHANNELS] = {};
+	const int r = swr_build_matrix2(p_layout, &stereo, SQRT_HALF, SQRT_HALF, 0.0, downmix_normalize ? 1.0 : (double)INT_MAX, 1.0, matrix, DISCRETE_CHANNELS, AV_MATRIX_ENCODING_NONE, nullptr);
+	if (r >= 0) {
+		for (int c = 0; c < count; c++) {
+			downmix_matrix[0][c] = (float)matrix[c];
+			downmix_matrix[1][c] = (float)matrix[DISCRETE_CHANNELS + c];
+		}
+	} else {
+		// A layout swr can't mix (unknown channels): the first two, or the one, at -3 dB each side.
+		for (int c = 0; c < MIN(count, 2); c++) {
+			downmix_matrix[0][c] = count == 1 ? (float)SQRT_HALF : (c == 0 ? 1.0f : 0.0f);
+			downmix_matrix[1][c] = count == 1 ? (float)SQRT_HALF : (c == 1 ? 1.0f : 0.0f);
+		}
 	}
-	const float front = scale;
-	const float centre = s * scale;
-	const float surround = s * scale;
+}
+
+// discrete_channels: the stereo mix of the frames (downmix_matrix). The dialogue boost raises the centre channel
+// itself, so the channel streams and the spatial mix get it too.
+void MediaSource::_downmix_discrete(float *p_channels, float *r_stereo, uint32_t p_frames) {
+	const int count = dstats.audio_channel_count;
+	if (discrete_permute) {
+		float frame[DISCRETE_CHANNELS];
+		for (uint32_t f = 0; f < p_frames; f++) {
+			float *c = p_channels + (uint64_t)f * DISCRETE_CHANNELS;
+			for (int i = 0; i < count; i++) {
+				frame[discrete_permutation[i]] = c[i];
+			}
+			memcpy(c, frame, sizeof(float) * count);
+		}
+	}
+	if (downmix_centre >= 0 && dstats.dialogue_boost_applies && dsp_dialogue_boost > 0.0f) {
+		const float boost = (float)Math::db_to_linear((double)dsp_dialogue_boost);
+		for (uint32_t f = 0; f < p_frames; f++) {
+			p_channels[(uint64_t)f * DISCRETE_CHANNELS + downmix_centre] *= boost;
+		}
+	}
+	const float *ml = downmix_matrix[0];
+	const float *mr = downmix_matrix[1];
 	for (uint32_t f = 0; f < p_frames; f++) {
-		const float *c = p_channels + (uint64_t)f * DISCRETE_CHANNELS; // FL FR FC LFE BL BR SL SR
-		const float middle = centre * c[2];
-		r_stereo[f * 2] = front * c[0] + middle + surround * (c[4] + c[6]);
-		r_stereo[f * 2 + 1] = front * c[1] + middle + surround * (c[5] + c[7]);
+		const float *c = p_channels + (uint64_t)f * DISCRETE_CHANNELS;
+		float l = 0.0f;
+		float r = 0.0f;
+		for (int i = 0; i < count; i++) {
+			l += ml[i] * c[i];
+			r += mr[i] * c[i];
+		}
+		r_stereo[f * 2] = l;
+		r_stereo[f * 2 + 1] = r;
 	}
 }
 
@@ -666,6 +773,21 @@ void MediaSource::_resample_frame(const AVFrame *p_frame) {
 		return;
 	}
 	if (channels) {
+		// swr packs the layout's channels; the frames are spread out to DISCRETE_CHANNELS floats each (from the last, in
+		// place), the rest of each frame zero.
+		const int count = dstats.audio_channel_count;
+		if (count < DISCRETE_CHANNELS) {
+			for (int f = converted - 1; f >= 0; f--) {
+				const float *from = channels + (uint64_t)f * count;
+				float *to = channels + (uint64_t)f * DISCRETE_CHANNELS;
+				for (int c = count - 1; c >= 0; c--) {
+					to[c] = from[c];
+				}
+				for (int c = count; c < DISCRETE_CHANNELS; c++) {
+					to[c] = 0.0f;
+				}
+			}
+		}
 		_downmix_discrete(channels, stereo, (uint32_t)converted);
 	}
 	if (dynamics.is_active()) {
@@ -740,6 +862,9 @@ void MediaSource::_write_ring_locked(const float *p_samples, const float *p_chan
 		marker_count++;
 	}
 	const bool channels = !channel_ring.is_empty();
+	if (channels && p_channels) {
+		ring_layout_channels = dstats.audio_channel_count;
+	}
 	uint32_t done = 0;
 	while (done < p_frames) {
 		const uint64_t at = (ring_write + done) % ring_capacity;
@@ -866,6 +991,9 @@ void MediaSource::_mix(int p_reader, AudioFrame *p_buffer, int p_frames) {
 	}
 	uint32_t got = 0;
 	bool wake = false;
+	Ref<BinauralRenderer> spatial_now; // Set when the stereo stream is the binaural mix this time.
+	int spatial_channels = 0;
+	bool spatial_reset = false;
 	{
 		MutexLock audio_lock(audio_mutex);
 		bool counts = true; // The reader that starts a mix step counts frames, underruns and moves the clock.
@@ -893,7 +1021,24 @@ void MediaSource::_mix(int p_reader, AudioFrame *p_buffer, int p_frames) {
 				}
 				uint64_t from = 0;
 				got = _take_frames_locked(p_reader, (uint32_t)p_frames, from, counts);
-				if (p_reader == 0) {
+				if (p_reader == 0 && spatial.is_valid() && !channel_ring.is_empty() && ring_layout_channels > 0 && spatial->is_ready()) {
+					// The channels of these frames, for the binaural mix (made after the lock is let go).
+					if (spatial_scratch.size() < (uint64_t)got * DISCRETE_CHANNELS) {
+						spatial_scratch.resize((uint64_t)got * DISCRETE_CHANNELS);
+					}
+					uint32_t done = 0;
+					while (done < got) {
+						const uint64_t at = (from + done) % ring_capacity;
+						const uint32_t run = (uint32_t)MIN((uint64_t)(got - done), ring_capacity - at);
+						memcpy((void *)(spatial_scratch.ptr() + (uint64_t)done * DISCRETE_CHANNELS), (const void *)(channel_ring.ptr() + at * DISCRETE_CHANNELS),
+								(size_t)run * DISCRETE_CHANNELS * sizeof(float));
+						done += run;
+					}
+					spatial_now = spatial;
+					spatial_channels = ring_layout_channels;
+					spatial_reset = spatial_serial != audio_serial;
+					spatial_serial = audio_serial;
+				} else if (p_reader == 0) {
 					uint32_t done = 0;
 					while (done < got) {
 						const uint64_t at = (from + done) % ring_capacity;
@@ -958,6 +1103,14 @@ void MediaSource::_mix(int p_reader, AudioFrame *p_buffer, int p_frames) {
 		const uint64_t fill = ring_write - ring_read;
 		const uint32_t wanted = audio_space_wanted.get();
 		wake = (wanted > 0 && ring_capacity - fill >= wanted) || (double)fill < audio_target_seconds * 0.75 * output_rate;
+	}
+	if (spatial_now.is_valid()) {
+		if (spatial_reset) {
+			spatial_now->reset(); // A seek or a new file: no tails of the old sound.
+		}
+		if (got > 0) {
+			spatial_now->process(spatial_scratch.ptr(), DISCRETE_CHANNELS, spatial_channels, (int)got, p_buffer);
+		}
 	}
 	if (got < (uint32_t)p_frames) {
 		memset((void *)(p_buffer + got), 0, (size_t)(p_frames - got) * sizeof(AudioFrame));
@@ -2871,7 +3024,7 @@ void MediaSource::set_discrete_channels(bool p_enabled) {
 
 Ref<AudioStreamMedia> MediaSource::get_audio_channel_stream(int p_channel) {
 	Ref<AudioStreamMedia> stream;
-	ERR_FAIL_INDEX_V_MSG(p_channel, DISCRETE_CHANNELS, stream, "MediaSource: channels are 0-7 (FL FR FC LFE BL BR SL SR).");
+	ERR_FAIL_INDEX_V_MSG(p_channel, DISCRETE_CHANNELS, stream, "MediaSource: channels are 0-15 (get_audio_channels()).");
 	if (!discrete_channels) {
 		WARN_PRINT("MediaSource: get_audio_channel_stream() without discrete_channels: the stream is silent.");
 	}
@@ -2882,23 +3035,72 @@ Ref<AudioStreamMedia> MediaSource::get_audio_channel_stream(int p_channel) {
 }
 
 Array MediaSource::get_audio_channels() const {
-	static const char *names[DISCRETE_CHANNELS] = { "FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR" };
-	static const char *labels[DISCRETE_CHANNELS] = { "front left", "front right", "front centre", "low frequency", "back left", "back right", "side left", "side right" };
-	uint32_t mask;
+	int count = 0;
+	int ids[DISCRETE_CHANNELS];
 	{
 		MutexLock lock(mutex);
-		mask = stats.audio_channel_mask;
+		count = stats.audio_channel_count;
+		memcpy(ids, stats.audio_channel_ids, sizeof(ids));
 	}
 	Array channels;
-	for (int i = 0; i < DISCRETE_CHANNELS; i++) {
+	for (int i = 0; i < count; i++) {
+		const AVChannel id = (AVChannel)ids[i];
+		char name[32] = {};
+		char label[64] = {};
+		if (id >= AV_CHAN_AMBISONIC_BASE && id <= AV_CHAN_AMBISONIC_END) {
+			snprintf(name, sizeof(name), "ACN%d", (int)(id - AV_CHAN_AMBISONIC_BASE));
+		} else if (id == AV_CHAN_NONE || id == AV_CHAN_UNKNOWN || id == AV_CHAN_UNUSED) {
+			snprintf(name, sizeof(name), "CH%d", i);
+		} else {
+			av_channel_name(name, sizeof(name), id);
+		}
+		if (id == AV_CHAN_NONE) {
+			snprintf(label, sizeof(label), "channel %d", i + 1);
+		} else {
+			av_channel_description(label, sizeof(label), id);
+		}
 		Dictionary d;
 		d["index"] = i;
-		d["name"] = names[i];
-		d["label"] = labels[i];
-		d["present"] = (mask & (1u << i)) != 0;
+		d["name"] = String(name);
+		d["label"] = String(label);
+		d["present"] = true;
 		channels.push_back(d);
 	}
 	return channels;
+}
+
+Dictionary MediaSource::get_audio_layout() const {
+	Dictionary d;
+	{
+		MutexLock lock(mutex);
+		d["channels"] = stats.audio_channel_count;
+		d["ambisonic_order"] = stats.ambisonic_order;
+		d["ambisonic_channels"] = stats.ambisonic_channels;
+		d["remapped"] = stats.audio_layout_remapped;
+	}
+	PackedStringArray names;
+	const Array channels = get_audio_channels();
+	for (int i = 0; i < channels.size(); i++) {
+		names.push_back(((Dictionary)channels[i])["name"]);
+	}
+	d["names"] = names;
+	return d;
+}
+
+void MediaSource::set_spatial_renderer(const Ref<BinauralRenderer> &p_renderer) {
+	if (p_renderer.is_valid()) {
+		// The ring is at the mix rate (output_rate once open); the renderer's HRTF follows it.
+		const int rate = ring_capacity > 0 ? output_rate : (AudioServer::get_singleton() ? (int)AudioServer::get_singleton()->get_mix_rate() : 48000);
+		p_renderer->set_sample_rate((float)rate);
+	}
+	MutexLock audio_lock(audio_mutex);
+	spatial = p_renderer;
+	spatial_serial = UINT32_MAX;
+}
+
+Ref<BinauralRenderer> MediaSource::get_spatial_renderer() const {
+	MutexLock audio_lock(audio_mutex);
+	return spatial;
 }
 
 void MediaSource::set_night_mode(bool p_enabled) {
@@ -3043,6 +3245,9 @@ void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_discrete_channels"), &MediaSource::is_discrete_channels);
 	ClassDB::bind_method(D_METHOD("get_audio_channel_stream", "channel"), &MediaSource::get_audio_channel_stream);
 	ClassDB::bind_method(D_METHOD("get_audio_channels"), &MediaSource::get_audio_channels);
+	ClassDB::bind_method(D_METHOD("get_audio_layout"), &MediaSource::get_audio_layout);
+	ClassDB::bind_method(D_METHOD("set_spatial_renderer", "renderer"), &MediaSource::set_spatial_renderer);
+	ClassDB::bind_method(D_METHOD("get_spatial_renderer"), &MediaSource::get_spatial_renderer);
 	ClassDB::bind_method(D_METHOD("set_night_mode", "enabled"), &MediaSource::set_night_mode);
 	ClassDB::bind_method(D_METHOD("is_night_mode"), &MediaSource::is_night_mode);
 	ClassDB::bind_method(D_METHOD("set_night_mode_strength", "strength"), &MediaSource::set_night_mode_strength);
