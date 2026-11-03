@@ -568,6 +568,22 @@ Patches:
 - `0003-remove-bmp-ppm-support.patch` ([GH-104347](https://github.com/godotengine/godot/pull/104347))
 
 
+## libmysofa
+
+- Upstream: https://github.com/hoene/libmysofa
+- Version: 1.3.5 (648eed03472e6720a1ea45d1a1f86c4efb569ff9, 2026)
+- License: BSD-3-Clause
+
+Files extracted from upstream source (for the hwvideo module's BinauralRenderer, which reads SOFA HRTF files):
+
+- `LICENSE`
+- `src/hdf/` (all)
+- `src/hrtf/{reader.c,check.c,spherical.c,tools.c,tools.h,resample.c,mysofa.h,portable_endian.h}`
+- `src/resampler/` (all)
+
+Added: `src/hrtf/config.h` and `src/hrtf/mysofa_export.h`, which CMake generates upstream.
+
+
 ## libktx
 
 - Upstream: https://github.com/KhronosGroup/KTX-Software
