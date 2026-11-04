@@ -36,12 +36,15 @@
 
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
+#include "core/io/file_access.h"
 #include "core/math/geometry_2d.h"
 #include "core/math/geometry_3d.h"
 #include "core/os/os.h"
 #include "core/string/print_string.h"
+#ifdef TOOLS_ENABLED
 #include "editor/file_system/editor_paths.h"
 #include "editor/settings/editor_settings.h"
+#endif
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_device_binds.h"
 #include "servers/rendering/rendering_server.h"
@@ -948,17 +951,28 @@ Ref<Image> LightmapperRD::_read_pfm(const String &p_name, bool p_shadowmask) {
 	return img;
 }
 
+// Fork: the lightmapper is also built into export templates, so a game can bake at run time.
+// There, OIDN's temporary files go to the OS cache folder instead of the editor's.
+static String _oidn_temp_dir() {
+#ifdef TOOLS_ENABLED
+	if (EditorPaths::get_singleton()) {
+		return EditorPaths::get_singleton()->get_cache_dir();
+	}
+#endif
+	return OS::get_singleton()->get_cache_path();
+}
+
 LightmapperRD::BakeError LightmapperRD::_denoise_oidn(RenderingDevice *p_rd, RID p_source_light_tex, RID p_source_normal_tex, RID p_dest_light_tex, const Size2i &p_atlas_size, int p_atlas_slices, bool p_bake_sh, bool p_shadowmask, const String &p_exe) {
 	Ref<DirAccess> da = DirAccess::create(DirAccess::ACCESS_FILESYSTEM);
 
 	for (int i = 0; i < p_atlas_slices; i++) {
-		String fname_norm_in = EditorPaths::get_singleton()->get_cache_dir().path_join(vformat("temp_norm_%d.pfm", i));
+		String fname_norm_in = _oidn_temp_dir().path_join(vformat("temp_norm_%d.pfm", i));
 		_store_pfm(p_rd, p_source_normal_tex, i, p_atlas_size, fname_norm_in, false);
 
 		for (int j = 0; j < (p_bake_sh ? 4 : 1); j++) {
 			int index = i * (p_bake_sh ? 4 : 1) + j;
-			String fname_light_in = EditorPaths::get_singleton()->get_cache_dir().path_join(vformat("temp_light_%d.pfm", index));
-			String fname_out = EditorPaths::get_singleton()->get_cache_dir().path_join(vformat("temp_denoised_%d.pfm", index));
+			String fname_light_in = _oidn_temp_dir().path_join(vformat("temp_light_%d.pfm", index));
+			String fname_out = _oidn_temp_dir().path_join(vformat("temp_denoised_%d.pfm", index));
 
 			_store_pfm(p_rd, p_source_light_tex, index, p_atlas_size, fname_light_in, p_shadowmask);
 
@@ -1103,7 +1117,13 @@ LightmapperRD::BakeError LightmapperRD::_denoise(RenderingDevice *p_rd, Ref<RDSh
 
 LightmapperRD::BakeError LightmapperRD::bake(BakeQuality p_quality, bool p_use_denoiser, float p_denoiser_strength, int p_denoiser_range, int p_bounces, float p_bounce_indirect_energy, float p_bias, int p_max_texture_size, bool p_bake_sh, bool p_bake_shadowmask, bool p_texture_for_bounces, GenerateProbes p_generate_probes, const Ref<Image> &p_environment_panorama, const Basis &p_environment_transform, BakeStepFunc p_step_function, void *p_bake_userdata, float p_exposure_normalization, float p_supersampling_factor) {
 	int denoiser = GLOBAL_GET("rendering/lightmapping/denoising/denoiser");
-	String oidn_path = EDITOR_GET("filesystem/tools/oidn/oidn_denoise_path");
+#ifdef TOOLS_ENABLED
+	String oidn_path = EditorSettings::get_singleton() ? String(EDITOR_GET("filesystem/tools/oidn/oidn_denoise_path")) : String();
+#else
+	// Fork: an export template has no editor settings, so no OIDN path; JNLM (built in) is used instead.
+	String oidn_path;
+	denoiser = 0;
+#endif
 
 	if (p_use_denoiser && denoiser == 1) {
 		// OIDN (external).

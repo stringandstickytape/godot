@@ -260,6 +260,11 @@ private:
 
 	static bool _lightmap_bake_step_function(float p_completion, const String &p_text, void *ud, bool p_refresh);
 
+	// Fork: bake() from scripts. The step callback emits bake_progress and returns true to stop the bake.
+	bool bake_abort_requested = false;
+	static bool _script_bake_step(float p_completion, const String &p_text, void *ud, bool p_refresh);
+	BakeError _bake_from_script(Node *p_from_node, const String &p_image_data_path);
+
 	struct GenProbesOctree {
 		Vector3i offset;
 		uint32_t size = 0;
@@ -354,6 +359,7 @@ public:
 	AABB get_aabb() const override;
 
 	BakeError bake(Node *p_from_node, String p_image_data_path = "", Lightmapper::BakeStepFunc p_bake_step = nullptr, void *p_bake_userdata = nullptr);
+	void abort_bake();
 
 	virtual PackedStringArray get_configuration_warnings() const override;
 

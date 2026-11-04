@@ -1,5 +1,6 @@
 def can_build(env, platform):
-    return env.editor_build
+    # Fork: also in export templates, so ArrayMesh.lightmap_unwrap() works at run time.
+    return True
 
 
 def configure(env):

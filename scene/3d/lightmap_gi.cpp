@@ -486,7 +486,8 @@ void LightmapGI::_find_meshes_and_lights(Node *p_at_node, Vector<MeshesFound> &m
 
 	for (int i = 0; i < p_at_node->get_child_count(); i++) {
 		Node *child = p_at_node->get_child(i);
-		if (!child->get_owner()) {
+		// Fork: only the editor skips nodes without an owner (its helpers); a game builds rooms in code, unowned.
+		if (!child->get_owner() && Engine::get_singleton()->is_editor_hint()) {
 			continue; //maybe a helper
 		}
 
@@ -746,6 +747,25 @@ int32_t LightmapGI::_compute_bsp_tree(const LocalVector<Vector3> &p_points, cons
 	return node_index;
 }
 
+bool LightmapGI::_script_bake_step(float p_completion, const String &p_text, void *ud, bool p_refresh) {
+	// Fork: bake() runs on the calling thread and blocks it, so the signal is emitted on that thread.
+	// The completion is not monotonic (the lightmapper's own steps map to 0.2-0.8 after the probe steps).
+	LightmapGI *self = (LightmapGI *)ud;
+	self->emit_signal(SNAME("bake_progress"), CLAMP(p_completion, 0.0f, 1.0f), p_text);
+	return self->bake_abort_requested;
+}
+
+LightmapGI::BakeError LightmapGI::_bake_from_script(Node *p_from_node, const String &p_image_data_path) {
+	bake_abort_requested = false;
+	BakeError err = bake(p_from_node, p_image_data_path, _script_bake_step, this);
+	bake_abort_requested = false;
+	return err;
+}
+
+void LightmapGI::abort_bake() {
+	bake_abort_requested = true;
+}
+
 bool LightmapGI::_lightmap_bake_step_function(float p_completion, const String &p_text, void *ud, bool p_refresh) {
 	BakeStepUD *bsud = (BakeStepUD *)ud;
 	bool ret = false;
@@ -837,6 +857,28 @@ LightmapGI::BakeError LightmapGI::_save_and_reimport_atlas_textures(const Ref<Li
 
 	for (int i = 0; i < images.size(); i++) {
 		images.set(i, p_is_shadowmask ? p_lightmapper->get_shadowmask_texture(i) : p_lightmapper->get_bake_texture(i));
+	}
+
+	if (!Engine::get_singleton()->is_editor_hint()) {
+		// Fork: outside the editor there is no importer, so EXR/PNG files plus .import would not load back.
+		// Keep the slices in one Texture2DArray instead. bake() then saves it inside the LightmapGIData
+		// resource (a built-in sub-resource), which ResourceLoader can load in an export template.
+		Vector<Ref<Image>> slices;
+		slices.resize(images.size());
+		for (int i = 0; i < images.size(); i++) {
+			ERR_FAIL_COND_V(images[i].is_null(), LightmapGI::BAKE_ERROR_CANT_CREATE_IMAGE);
+			Ref<Image> slice = images[i]->duplicate();
+			if (supersampling_enabled) {
+				slice->resize(slice->get_width() / supersampling_factor, slice->get_height() / supersampling_factor, Image::INTERPOLATE_TRILINEAR);
+			}
+			slices.set(i, slice);
+		}
+		Ref<Texture2DArray> texture;
+		texture.instantiate();
+		ERR_FAIL_COND_V(texture->create_from_images(slices) != OK, LightmapGI::BAKE_ERROR_CANT_CREATE_IMAGE);
+		r_textures.resize(1);
+		r_textures[0] = texture;
+		return LightmapGI::BAKE_ERROR_OK;
 	}
 
 	const int slice_count = images.size();
@@ -1424,7 +1466,7 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 	// Add everything to lightmapper
 	if (environment_mode != ENVIRONMENT_MODE_DISABLED) {
 		if (p_bake_step) {
-			p_bake_step(4.1, RTR("Preparing Environment"), p_bake_userdata, true);
+			p_bake_step(0.41, RTR("Preparing Environment"), p_bake_userdata, true);
 		}
 
 		environment_transform = get_global_transform().basis;
@@ -2119,7 +2161,10 @@ void LightmapGI::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_camera_attributes", "camera_attributes"), &LightmapGI::set_camera_attributes);
 	ClassDB::bind_method(D_METHOD("get_camera_attributes"), &LightmapGI::get_camera_attributes);
 
-	//	ClassDB::bind_method(D_METHOD("bake", "from_node"), &LightmapGI::bake, DEFVAL(Variant()));
+	// Fork: bake at run time. from_node null bakes from the parent; an empty path uses light_data's path.
+	ClassDB::bind_method(D_METHOD("bake", "from_node", "image_data_path"), &LightmapGI::_bake_from_script, DEFVAL(Variant()), DEFVAL(String()));
+	ClassDB::bind_method(D_METHOD("abort_bake"), &LightmapGI::abort_bake);
+	ADD_SIGNAL(MethodInfo("bake_progress", PropertyInfo(Variant::FLOAT, "progress"), PropertyInfo(Variant::STRING, "text")));
 
 	ADD_GROUP("Tweaks", "");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "quality", PROPERTY_HINT_ENUM, "Low,Medium,High,Ultra"), "set_bake_quality", "get_bake_quality");
