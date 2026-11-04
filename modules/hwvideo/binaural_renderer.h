@@ -58,7 +58,9 @@
 // head. Then the output EQ (the output profile's bands and the concha gain) and the gain.
 //
 // Thread use: the setters (any thread) leave the new state for process(), which takes it at its next call (the audio
-// thread). The listener pose is interpolated across each process() call from the last pose to the newest.
+// thread). The listener pose arrives once a game frame, out of step with the audio callbacks, which come in bursts.
+// process() carries the head on at its last turning speed between poses (up to POSE_AHEAD) and follows that through
+// a one-pole stage (POSE_TAU), every SUB frames, so the head's path is smooth whatever the timing.
 class BinauralRenderer : public RefCounted {
 	GDCLASS(BinauralRenderer, RefCounted);
 
@@ -82,6 +84,8 @@ public:
 	static constexpr float BASE_DELAY = 2.0f; // Samples, so the cubic delay never reads ahead.
 	static constexpr int HIST = 132; // Input history kept: MAX_RUNTIME_DELAY + BASE_DELAY + the cubic's reach.
 	static constexpr float MAX_RUNTIME_DELAY = 124.0f; // Samples (the HRTF's delays, scaled to the rate and the ITD tuning).
+	static constexpr float POSE_TAU = 0.01f; // Seconds: the pose smoothing.
+	static constexpr float POSE_AHEAD = 0.05f; // Seconds the head is carried on past its last pose, at most.
 
 private:
 	struct SourceConfig {
@@ -150,6 +154,8 @@ private:
 	Config pending;
 	uint32_t pending_serial = 1;
 	Transform3D pending_pose;
+	uint64_t pending_pose_usec = 0;
+	uint64_t pending_pose_serial = 0;
 	Ref<BinauralHrtfData> base_hrtf; // As loaded.
 	float warp = 1.0f;
 	float rate_wanted = (float)BinauralHrtfData::RATE; // set_sample_rate().
@@ -163,7 +169,14 @@ private:
 	// process() only.
 	Config config;
 	uint32_t config_serial = 0;
-	Transform3D pose;
+	Transform3D pose; // What is rendered.
+	Transform3D last_pose; // The newest pose given, its time, and the head's motion from the one before.
+	uint64_t last_pose_usec = 0;
+	uint64_t pose_serial = 0;
+	Vector3 turn_axis;
+	float turn_rate = 0.0f; // Radians per second.
+	Vector3 move_rate; // Metres per second.
+	float since_pose = 0.0f; // Seconds of audio rendered since the newest pose.
 	bool have_pose = false;
 	LocalVector<SourceState *> states;
 	LocalVector<float> decode; // [virtual speaker][ambisonic channel]
@@ -201,6 +214,7 @@ private:
 	void _reset_state();
 	void _render_sub(const float *p_in, int p_stride, int p_channels, int p_frames, const Transform3D &p_pose, float *r_l, float *r_r);
 	void _reflections(SourceState &p_state, const Transform3D &p_pose, int p_frames);
+	static Transform3D _toward(const Transform3D &p_from, const Transform3D &p_to, float p_weight);
 	void _reverb(int p_frames);
 
 	static void _biquad_set(Biquad &r_b, int p_type, float p_freq, float p_gain_db, float p_q, float p_rate);

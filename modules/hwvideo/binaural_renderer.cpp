@@ -279,6 +279,8 @@ void BinauralRenderer::set_ambisonics(int p_order, int p_first_input, const Basi
 void BinauralRenderer::set_listener(const Transform3D &p_pose) {
 	MutexLock lock(mutex);
 	pending_pose = Transform3D(p_pose.basis.orthonormalized(), p_pose.origin);
+	pending_pose_usec = OS::get_singleton()->get_ticks_usec();
+	pending_pose_serial++;
 }
 
 void BinauralRenderer::set_room(const Dictionary &p_room) {
@@ -395,6 +397,7 @@ void BinauralRenderer::reset() {
 }
 
 void BinauralRenderer::_reset_state() {
+	have_pose = false;
 	for (SourceState *s : states) {
 		SourceConfig c = s->config;
 		LocalVector<float> refl;
@@ -793,12 +796,18 @@ void BinauralRenderer::_render_sub(const float *p_in, int p_stride, int p_channe
 	}
 }
 
+Transform3D BinauralRenderer::_toward(const Transform3D &p_from, const Transform3D &p_to, float p_weight) {
+	return p_from.is_equal_approx(p_to) ? p_to : p_from.interpolate_with(p_to, p_weight);
+}
+
 void BinauralRenderer::process(const float *p_in, int p_stride, int p_channels, int p_frames, AudioFrame *r_out) {
 	if (p_frames <= 0) {
 		return;
 	}
 	const uint64_t start = OS::get_singleton()->get_ticks_usec();
 	Transform3D target;
+	uint64_t target_usec = 0;
+	uint64_t target_serial = 0;
 	bool changed = false;
 	bool reset_now = false;
 	{
@@ -809,6 +818,8 @@ void BinauralRenderer::process(const float *p_in, int p_stride, int p_channels, 
 			changed = true;
 		}
 		target = pending_pose;
+		target_usec = pending_pose_usec;
+		target_serial = pending_pose_serial;
 		reset_now = reset_requested;
 		reset_requested = false;
 	}
@@ -824,22 +835,56 @@ void BinauralRenderer::process(const float *p_in, int p_stride, int p_channels, 
 	}
 	if (!have_pose) {
 		pose = target;
+		last_pose = target;
+		last_pose_usec = target_usec;
+		pose_serial = target_serial;
+		turn_rate = 0.0f;
+		move_rate = Vector3();
+		since_pose = 0.0f;
 		have_pose = true;
+	} else if (target_serial != pose_serial) {
+		// A new pose: the head's motion since the one before.
+		const float dt = (target_usec - last_pose_usec) * 1e-6f;
+		turn_rate = 0.0f;
+		move_rate = Vector3();
+		if (dt > 0.002f && dt < 0.1f) {
+			Quaternion q = (target.basis.get_rotation_quaternion() * last_pose.basis.get_rotation_quaternion().inverse()).normalized();
+			if (q.w < 0.0f) {
+				q = -q;
+			}
+			const float angle = q.get_angle();
+			if (angle > 1e-5f) {
+				turn_axis = q.get_axis().normalized();
+				turn_rate = angle / dt;
+			}
+			move_rate = (target.origin - last_pose.origin) / dt;
+		}
+		last_pose = target;
+		last_pose_usec = target_usec;
+		pose_serial = target_serial;
+		since_pose = 0.0f;
 	}
-	const Transform3D from = pose;
 	float l[SUB];
 	float r[SUB];
 	for (int done = 0; done < p_frames;) {
 		const int n = MIN(SUB, p_frames - done);
-		const float t = (float)(done + n) / p_frames;
-		const Transform3D at = from.is_equal_approx(target) ? target : from.interpolate_with(target, t);
-		_render_sub(p_in + (uint64_t)done * p_stride, p_stride, p_channels, n, at, l, r);
+		// Poses come once a game frame, and the audio callbacks in bursts: one can get no new pose or several. Followed
+		// directly, the interaural delay would move in jerks, heard as a pulsing pitch when the head turns. So the head
+		// is carried on at its last speed between poses, and a one-pole stage takes out the steps when a pose comes.
+		since_pose += (float)n / config.rate;
+		const float ahead = MIN(since_pose, POSE_AHEAD);
+		Transform3D predicted = last_pose;
+		if (turn_rate > 0.0f) {
+			predicted.basis = Basis(Quaternion(turn_axis, turn_rate * ahead)) * last_pose.basis;
+		}
+		predicted.origin += move_rate * ahead;
+		pose = _toward(pose, predicted, 1.0f - Math::exp(-(float)n / (config.rate * POSE_TAU)));
+		_render_sub(p_in + (uint64_t)done * p_stride, p_stride, p_channels, n, pose, l, r);
 		for (int i = 0; i < n; i++) {
 			r_out[done + i] = AudioFrame(l[i], r[i]);
 		}
 		done += n;
 	}
-	pose = target;
 	const uint64_t spent = OS::get_singleton()->get_ticks_usec() - start;
 	MutexLock lock(mutex);
 	stats_frames += p_frames;

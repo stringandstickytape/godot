@@ -39,7 +39,8 @@
 
 namespace {
 
-constexpr int PACK_VERSION = 1;
+// 3: smoothed across azimuth (densify()). 2: minimum-phase. 1: aligned. Older ones load, made what 3 is.
+constexpr int PACK_VERSION = 3;
 constexpr int FADE = 16; // Half-Hann fade at the end of each aligned response.
 constexpr int EQ_FFT = 512;
 constexpr int EQ_TAPS = 65; // Linear-phase diffuse-field equaliser, delay (EQ_TAPS - 1) / 2.
@@ -76,6 +77,70 @@ void fft(std::complex<double> *p_data, int p_size, bool p_inverse) {
 	}
 }
 
+constexpr int MIN_PHASE_FFT = 1024;
+
+// The minimum-phase response (TAPS long, PRE samples in, faded at the end) of the natural-log magnitude spectrum in
+// p_buf (p_size bins, symmetric), by the folded real cepstrum. Returns its energy.
+double from_log_magnitude(std::complex<double> *p_buf, int p_size, float *r_ir) {
+	constexpr int TAPS = BinauralHrtfData::TAPS;
+	constexpr int PRE = BinauralHrtfData::PRE;
+	const int N = p_size;
+	fft(p_buf, N, true);
+	for (int n = 0; n < N; n++) {
+		const double v = p_buf[n].real();
+		p_buf[n] = (n == 0 || n == N / 2) ? v : (n < N / 2 ? 2.0 * v : 0.0);
+	}
+	fft(p_buf, N, false);
+	for (int k = 0; k < N; k++) {
+		p_buf[k] = std::exp(p_buf[k]);
+	}
+	fft(p_buf, N, true);
+	double energy = 0.0;
+	for (int n = 0; n < TAPS; n++) {
+		float v = n < PRE ? 0.0f : (float)p_buf[n - PRE].real();
+		if (n >= TAPS - FADE) {
+			v *= 0.5f + 0.5f * Math::cos(Math::PI * (n - (TAPS - FADE) + 1) / (FADE + 1));
+		}
+		r_ir[n] = v;
+		energy += (double)v * v;
+	}
+	return energy;
+}
+
+// p_ir (TAPS long) made minimum-phase, its magnitude and energy kept, PRE samples in (real cepstrum, folded). Aligned
+// responses that differ by part of a sample or in phase cancel when blended: halfway between grid points the treble
+// dipped by up to 7 dB, heard as pulses when the head turns. Minimum-phase ones blend without that.
+void minimum_phase(float *p_ir, std::complex<double> *p_buf) {
+	constexpr int N = MIN_PHASE_FFT;
+	constexpr int TAPS = BinauralHrtfData::TAPS;
+	constexpr int PRE = BinauralHrtfData::PRE;
+	double before = 0.0;
+	for (int n = 0; n < TAPS; n++) {
+		before += (double)p_ir[n] * p_ir[n];
+		p_buf[n] = p_ir[n];
+	}
+	if (before <= 1e-20) {
+		return;
+	}
+	for (int n = TAPS; n < N; n++) {
+		p_buf[n] = 0.0;
+	}
+	fft(p_buf, N, false);
+	double peak = 0.0;
+	for (int k = 0; k < N; k++) {
+		peak = MAX(peak, std::abs(p_buf[k]));
+	}
+	const double floor = peak * 1e-5; // -100 dB
+	for (int k = 0; k < N; k++) {
+		p_buf[k] = std::log(MAX(std::abs(p_buf[k]), floor));
+	}
+	const double after = from_log_magnitude(p_buf, N, p_ir);
+	const float k = after > 1e-20 ? (float)Math::sqrt(before / after) : 1.0f;
+	for (int n = 0; n < TAPS; n++) {
+		p_ir[n] *= k;
+	}
+}
+
 // Catmull-Rom between p[1] and p[2].
 inline float cubic(const float *p, float t) {
 	return p[1] + 0.5f * t * (p[2] - p[0] + t * (2.0f * p[0] - 5.0f * p[1] + 4.0f * p[2] - p[3] + t * (3.0f * (p[1] - p[2]) + p[3] - p[0])));
@@ -104,6 +169,113 @@ Vector3 BinauralHrtfData::grid_direction(int p_el, int p_az) {
 	const float el = Math::deg_to_rad(EL_MIN + EL_STEP * p_el);
 	const float az = Math::deg_to_rad(AZ_STEP * p_az);
 	return Vector3(Math::sin(az) * Math::cos(el), Math::sin(el), -Math::cos(az) * Math::cos(el));
+}
+
+void BinauralHrtfData::densify(const LocalVector<float> &p_ir, const LocalVector<float> &p_delay, bool p_smooth) {
+	constexpr int N = DENSE_FFT;
+	constexpr int H = N / 2 + 1;
+	constexpr int F = AZ / PACK_AZ;
+	// The natural-log magnitude of each pack response.
+	LocalVector<double> mag;
+	mag.resize((uint64_t)PACK_POINTS * 2 * H);
+	LocalVector<std::complex<double>> buf;
+	buf.resize(N);
+	for (int i = 0; i < PACK_POINTS * 2; i++) {
+		const float *x = p_ir.ptr() + (uint64_t)i * TAPS;
+		for (int n = 0; n < N; n++) {
+			buf[n] = n < TAPS ? x[n] : 0.0f;
+		}
+		fft(buf.ptr(), N, false);
+		double peak = 0.0;
+		for (int k = 0; k < H; k++) {
+			peak = MAX(peak, std::abs(buf[k]));
+		}
+		const double floor = MAX(peak * 1e-5, 1e-12);
+		for (int k = 0; k < H; k++) {
+			mag[(uint64_t)i * H + k] = std::log(MAX(std::abs(buf[k]), floor));
+		}
+	}
+	if (p_smooth) {
+		// Across azimuth, in each elevation and ear: (-1, 4, 10, 4, -1) / 16 takes out a zigzag from one grid point to
+		// the next (measured sets have 1-2 dB of it) and keeps 94 % of a feature 45 degrees wide, 75 % at 30.
+		static const double kernel[5] = { -1.0 / 16.0, 4.0 / 16.0, 10.0 / 16.0, 4.0 / 16.0, -1.0 / 16.0 };
+		LocalVector<double> row;
+		row.resize((uint64_t)PACK_AZ * H);
+		for (int e = 0; e < EL; e++) {
+			for (int r = 0; r < 2; r++) {
+				for (int a = 0; a < PACK_AZ; a++) {
+					for (int k = 0; k < H; k++) {
+						double v = 0.0;
+						for (int j = -2; j <= 2; j++) {
+							const int q = e * PACK_AZ + (a + j + PACK_AZ) % PACK_AZ;
+							v += kernel[j + 2] * mag[((uint64_t)q * 2 + r) * H + k];
+						}
+						row[(uint64_t)a * H + k] = v;
+					}
+				}
+				for (int a = 0; a < PACK_AZ; a++) {
+					memcpy(mag.ptr() + ((uint64_t)(e * PACK_AZ + a) * 2 + r) * H, row.ptr() + (uint64_t)a * H, sizeof(double) * H);
+				}
+			}
+		}
+	}
+	ir.resize((uint64_t)POINTS * 2 * TAPS);
+	delay.resize(POINTS * 2);
+	for (int e = 0; e < EL; e++) {
+		for (int a = 0; a < AZ; a++) {
+			const int a0 = a / F;
+			const double t = (double)(a % F) / F;
+			const int p = index(e, a);
+			int q[4];
+			for (int j = 0; j < 4; j++) {
+				q[j] = e * PACK_AZ + (a0 - 1 + j + PACK_AZ) % PACK_AZ;
+			}
+			for (int r = 0; r < 2; r++) {
+				float *out = ir.ptr() + ((uint64_t)p * 2 + r) * TAPS;
+				delay[p * 2 + r] = (float)((1.0 - t) * p_delay[q[1] * 2 + r] + t * p_delay[q[2] * 2 + r]);
+				// Catmull-Rom between the two neighbours: no corner at the grid points.
+				const double *m[4];
+				for (int j = 0; j < 4; j++) {
+					m[j] = mag.ptr() + ((uint64_t)q[j] * 2 + r) * H;
+				}
+				for (int k = 0; k < H; k++) {
+					const double p0 = m[0][k], p1 = m[1][k], p2 = m[2][k], p3 = m[3][k];
+					buf[k] = p1 + 0.5 * t * (p2 - p0 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)));
+				}
+				for (int k = H; k < N; k++) {
+					buf[k] = buf[N - k];
+				}
+				from_log_magnitude(buf.ptr(), N, out);
+			}
+		}
+	}
+}
+
+void BinauralHrtfData::model_delays() {
+	// Fit k, the delay difference per unit of asin(x) + x, to the measured one (each grid point weighted by its area).
+	double num = 0.0;
+	double den = 0.0;
+	for (int e = 0; e < EL; e++) {
+		const double w = Math::cos(Math::deg_to_rad(EL_MIN + EL_STEP * e)) + 0.02;
+		for (int a = 0; a < AZ; a++) {
+			const float x = CLAMP(grid_direction(e, a).x, -1.0f, 1.0f);
+			const double g = Math::asin(x) + x;
+			const int p = index(e, a);
+			num += w * (delay[p * 2] - delay[p * 2 + 1]) * g;
+			den += w * g * g;
+		}
+	}
+	const float most = Math::PI / 2.0f + 1.0f;
+	const float k = den > 0.0 ? CLAMP((float)(num / den), 0.0f, MAX_DELAY / most) : 0.0f;
+	for (int e = 0; e < EL; e++) {
+		for (int a = 0; a < AZ; a++) {
+			const float x = CLAMP(grid_direction(e, a).x, -1.0f, 1.0f);
+			const float g = Math::asin(x) + x;
+			const int p = index(e, a);
+			delay[p * 2] = 0.5f * k * (most + g);
+			delay[p * 2 + 1] = 0.5f * k * (most - g);
+		}
+	}
 }
 
 void BinauralHrtfData::lookup(float p_azimuth, float p_elevation, float *r_left, float *r_right, float &r_delay_left, float &r_delay_right) const {
@@ -155,8 +327,9 @@ Error BinauralHrtfData::load_pack(const String &p_path, String &r_error) {
 	}
 	uint8_t magic[4] = {};
 	f->get_buffer(magic, 4);
-	if (memcmp(magic, "FHRT", 4) != 0 || f->get_32() != PACK_VERSION) {
-		r_error = "not an HRTF pack (version 1)";
+	const uint32_t version = memcmp(magic, "FHRT", 4) == 0 ? f->get_32() : 0;
+	if (version < 1 || version > PACK_VERSION) {
+		r_error = vformat("not an HRTF pack (version 1 to %d)", PACK_VERSION);
 		return ERR_FILE_UNRECOGNIZED;
 	}
 	const uint32_t pack_rate = f->get_32();
@@ -167,7 +340,7 @@ Error BinauralHrtfData::load_pack(const String &p_path, String &r_error) {
 	const float el_step = f->get_float();
 	const float az_step = f->get_float();
 	const float scale = f->get_float();
-	if (pack_rate != RATE || taps != TAPS || az != AZ || el != EL || el_min != EL_MIN || el_step != EL_STEP || az_step != AZ_STEP) {
+	if (pack_rate != RATE || taps != TAPS || az != PACK_AZ || el != EL || el_min != EL_MIN || el_step != EL_STEP || az_step != PACK_AZ_STEP) {
 		r_error = vformat("a pack for another grid (%d Hz, %d taps, %d x %d)", pack_rate, taps, az, el);
 		return ERR_FILE_UNRECOGNIZED;
 	}
@@ -188,23 +361,34 @@ Error BinauralHrtfData::load_pack(const String &p_path, String &r_error) {
 	text.resize(credit_len);
 	f->get_buffer(text.ptrw(), credit_len);
 	credit = String::utf8((const char *)text.ptr(), credit_len);
-	delay.resize(POINTS * 2);
-	for (uint32_t i = 0; i < delay.size(); i++) {
-		delay[i] = f->get_float();
+	LocalVector<float> pack_delay;
+	pack_delay.resize(PACK_POINTS * 2);
+	for (uint32_t i = 0; i < pack_delay.size(); i++) {
+		pack_delay[i] = f->get_float();
 	}
-	ir.resize(POINTS * 2 * TAPS);
+	LocalVector<float> pack_ir;
+	pack_ir.resize(PACK_POINTS * 2 * TAPS);
 	Vector<uint8_t> raw;
-	raw.resize(ir.size() * 2);
+	raw.resize(pack_ir.size() * 2);
 	if (f->get_buffer(raw.ptrw(), raw.size()) != (uint64_t)raw.size()) {
 		ir.clear();
 		r_error = "truncated pack";
 		return ERR_FILE_CORRUPT;
 	}
 	const uint8_t *p = raw.ptr();
-	for (uint32_t i = 0; i < ir.size(); i++) {
+	for (uint32_t i = 0; i < pack_ir.size(); i++) {
 		const int16_t v = (int16_t)(p[i * 2] | (p[i * 2 + 1] << 8));
-		ir[i] = v * scale / 32767.0f;
+		pack_ir[i] = v * scale / 32767.0f;
 	}
+	if (version < 2) {
+		LocalVector<std::complex<double>> buf;
+		buf.resize(MIN_PHASE_FFT);
+		for (int i = 0; i < PACK_POINTS * 2; i++) {
+			minimum_phase(pack_ir.ptr() + (uint64_t)i * TAPS, buf.ptr());
+		}
+	}
+	densify(pack_ir, pack_delay, version < 3);
+	model_delays();
 	source = p_path;
 	measured = 0;
 	warp = 1.0f;
@@ -227,11 +411,11 @@ Error BinauralHrtfData::save_pack(const String &p_path) const {
 	f->store_32(PACK_VERSION);
 	f->store_32(RATE);
 	f->store_32(TAPS);
-	f->store_32(AZ);
+	f->store_32(PACK_AZ);
 	f->store_32(EL);
 	f->store_float(EL_MIN);
 	f->store_float(EL_STEP);
-	f->store_float(AZ_STEP);
+	f->store_float(PACK_AZ_STEP);
 	f->store_float(scale);
 	const CharString n = name.utf8();
 	f->store_32(n.length());
@@ -239,16 +423,28 @@ Error BinauralHrtfData::save_pack(const String &p_path) const {
 	const CharString c = credit.utf8();
 	f->store_32(c.length());
 	f->store_buffer((const uint8_t *)c.get_data(), c.length());
-	for (uint32_t i = 0; i < delay.size(); i++) {
-		f->store_float(delay[i]);
+	// The pack grid: every (AZ / PACK_AZ)th azimuth; load_pack() makes the ones between again.
+	constexpr int F = AZ / PACK_AZ;
+	for (int e = 0; e < EL; e++) {
+		for (int a = 0; a < PACK_AZ; a++) {
+			const int q = index(e, a * F);
+			f->store_float(delay[q * 2]);
+			f->store_float(delay[q * 2 + 1]);
+		}
 	}
 	Vector<uint8_t> raw;
-	raw.resize(ir.size() * 2);
+	raw.resize(PACK_POINTS * 2 * TAPS * 2);
 	uint8_t *p = raw.ptrw();
-	for (uint32_t i = 0; i < ir.size(); i++) {
-		const int16_t v = (int16_t)CLAMP(Math::round(ir[i] / scale * 32767.0f), -32767.0f, 32767.0f);
-		p[i * 2] = (uint8_t)(v & 0xff);
-		p[i * 2 + 1] = (uint8_t)((uint16_t)v >> 8);
+	int i = 0;
+	for (int e = 0; e < EL; e++) {
+		for (int a = 0; a < PACK_AZ; a++) {
+			const float *x = ir.ptr() + (uint64_t)index(e, a * F) * 2 * TAPS;
+			for (int n = 0; n < TAPS * 2; n++, i++) {
+				const int16_t v = (int16_t)CLAMP(Math::round(x[n] / scale * 32767.0f), -32767.0f, 32767.0f);
+				p[i * 2] = (uint8_t)(v & 0xff);
+				p[i * 2 + 1] = (uint8_t)((uint16_t)v >> 8);
+			}
+		}
 	}
 	f->store_buffer(raw.ptr(), raw.size());
 	return OK;
@@ -356,7 +552,7 @@ Error BinauralHrtfData::load_sofa(const String &p_path, String &r_error) {
 	}
 
 	// Equalise, find each onset (the first sample within 14 dB of the peak, one sample back), keep TAPS from PRE
-	// before it.
+	// before it, made minimum-phase.
 	const int length = N + EQ_TAPS - 1;
 	LocalVector<float> aligned;
 	aligned.resize((uint64_t)M * 2 * TAPS);
@@ -364,6 +560,7 @@ Error BinauralHrtfData::load_sofa(const String &p_path, String &r_error) {
 	onset.resize(M * 2);
 	LocalVector<float> work;
 	work.resize(length);
+	buf.resize(MAX(EQ_FFT, MIN_PHASE_FFT));
 	for (int m = 0; m < M; m++) {
 		for (int r = 0; r < 2; r++) {
 			const float *x = data + ((uint64_t)m * 2 + r) * N;
@@ -397,6 +594,7 @@ Error BinauralHrtfData::load_sofa(const String &p_path, String &r_error) {
 				}
 				out[n] = v;
 			}
+			minimum_phase(out, buf.ptr());
 		}
 	}
 	const String title = attribute(h, "Title");
@@ -409,11 +607,13 @@ Error BinauralHrtfData::load_sofa(const String &p_path, String &r_error) {
 
 	// The grid: the nearest measured direction if within a degree, else inverse-square-distance weights of the three
 	// nearest.
-	ir.resize(POINTS * 2 * TAPS);
-	delay.resize(POINTS * 2);
+	LocalVector<float> pack_ir;
+	pack_ir.resize(PACK_POINTS * 2 * TAPS);
+	LocalVector<float> pack_delay;
+	pack_delay.resize(PACK_POINTS * 2);
 	for (int e = 0; e < EL; e++) {
-		for (int a = 0; a < AZ; a++) {
-			const Vector3 g = grid_direction(e, a);
+		for (int a = 0; a < PACK_AZ; a++) {
+			const Vector3 g = grid_direction(e, a * (AZ / PACK_AZ));
 			int best[3] = { -1, -1, -1 };
 			float best_dot[3] = { -2.0f, -2.0f, -2.0f };
 			for (int m = 0; m < M; m++) {
@@ -448,9 +648,9 @@ Error BinauralHrtfData::load_sofa(const String &p_path, String &r_error) {
 					w /= sum;
 				}
 			}
-			const int p = index(e, a);
+			const int p = e * PACK_AZ + a;
 			for (int r = 0; r < 2; r++) {
-				float *out = ir.ptr() + ((uint64_t)p * 2 + r) * TAPS;
+				float *out = pack_ir.ptr() + ((uint64_t)p * 2 + r) * TAPS;
 				float d = 0.0f;
 				for (int n = 0; n < TAPS; n++) {
 					out[n] = 0.0f;
@@ -465,17 +665,19 @@ Error BinauralHrtfData::load_sofa(const String &p_path, String &r_error) {
 					}
 					d += weights[k] * onset[best[k] * 2 + r];
 				}
-				delay[p * 2 + r] = d;
+				pack_delay[p * 2 + r] = d;
 			}
 		}
 	}
 	float smallest = 1e9f;
-	for (float d : delay) {
+	for (float d : pack_delay) {
 		smallest = MIN(smallest, d);
 	}
-	for (float &d : delay) {
+	for (float &d : pack_delay) {
 		d = CLAMP(d - smallest, 0.0f, MAX_DELAY);
 	}
+	densify(pack_ir, pack_delay, true);
+	model_delays();
 	// Unit energy over the sphere (each grid point weighted by the area it stands for), both ears together.
 	double energy = 0.0;
 	double area = 0.0;

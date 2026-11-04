@@ -35,18 +35,20 @@
 #include "core/templates/local_vector.h"
 
 // A head-related transfer function set on a regular grid of directions, as BinauralRenderer uses it: for each grid
-// direction and ear an aligned impulse response (TAPS samples at 48 kHz, the onset PRE samples in) and the delay that
-// was taken out of it (samples, the smallest of the set 0). Interpolation between grid points is bilinear on both;
-// separating the delay from the response keeps the blend free of comb filtering.
+// direction and ear a minimum-phase impulse response (TAPS samples at 48 kHz, starting PRE samples in) and the delay
+// that was taken out of it (samples, the smallest of the set 0). Interpolation between grid points is bilinear on both;
+// minimum-phase responses without their delay blend free of comb filtering.
 //
 // Directions: azimuth in degrees from the front, positive to the right (clockwise seen from above); elevation in
 // degrees, positive up. Grid: AZ azimuths AZ_STEP apart from 0, EL elevations EL_STEP apart from EL_MIN to 90.
+//
+// Packs and SOFA files are put on a grid four times coarser in azimuth (PACK_AZ), and densify() fills in the rest.
 //
 // Sources: a pack (the compact file below, what the app bundles) or a SOFA file (AES69, SimpleFreeFieldHRIR, read
 // with libmysofa), which is resampled to 48 kHz if needed, diffuse-field equalised, aligned and put on the grid
 // (inverse-distance weights of the three nearest measured directions).
 //
-// Pack: little-endian. "FHRT", u32 version (1), u32 rate, u32 taps, u32 az, u32 el, f32 el_min, f32 el_step,
+// Pack: little-endian. "FHRT", u32 version (3: smoothed, minimum-phase; 2 is not smoothed, 1 not minimum-phase), u32 rate, u32 taps, u32 az, u32 el, f32 el_min, f32 el_step,
 // f32 az_step, f32 scale, u32 + UTF-8 name, u32 + UTF-8 credit, f32 delays [el][az][2], s16 taps [el][az][2][taps]
 // (value x scale / 32767).
 class BinauralHrtfData : public RefCounted {
@@ -55,14 +57,18 @@ class BinauralHrtfData : public RefCounted {
 public:
 	static constexpr int RATE = 48000;
 	static constexpr int TAPS = 128;
-	static constexpr int AZ = 48;
+	static constexpr int AZ = 192;
 	static constexpr int EL = 14;
-	static constexpr float AZ_STEP = 7.5f;
+	static constexpr float AZ_STEP = 1.875f;
+	static constexpr int PACK_AZ = 48; // A pack's grid: every fourth azimuth.
+	static constexpr float PACK_AZ_STEP = 7.5f;
+	static constexpr int DENSE_FFT = 512;
 	static constexpr float EL_MIN = -40.0f;
 	static constexpr float EL_STEP = 10.0f;
 	static constexpr int PRE = 4; // Samples kept before the onset.
 	static constexpr float MAX_DELAY = 56.0f; // Samples; the interaural delay is at most about 40.
 	static constexpr int POINTS = AZ * EL;
+	static constexpr int PACK_POINTS = PACK_AZ * EL;
 
 	String name;
 	String credit; // Who made it and under what licence, as the pack or the SOFA file says.
@@ -83,6 +89,16 @@ public:
 	Error load_pack(const String &p_path, String &r_error);
 	Error load_sofa(const String &p_path, String &r_error);
 	Error save_pack(const String &p_path) const;
+	// The delays made a spherical head's (Woodworth: (r / c)(asin(x) + x) between the ears, x the direction's offset to
+	// the right), its size fitted to the measured delays. Onsets found sample by sample in measurements jump by a
+	// sample or two from one grid point to the next (5 samples apart straight ahead): blended, the delays' slope
+	// changed at every grid point, heard as a pulsing pitch when the head turns. Both loaders call it.
+	void model_delays();
+	// ir and delay on the grid from the pack grid's (PACK_AZ azimuths), all minimum-phase from log magnitudes: first
+	// smoothed across azimuth (p_smooth; a version 3 pack already is), then the azimuths between by Catmull-Rom. The
+	// measured sets' treble zigzags by 1-2 dB from one grid point to the next, and linear blends have a corner at
+	// each: either pulsed in brightness when the head turned.
+	void densify(const LocalVector<float> &p_ir, const LocalVector<float> &p_delay, bool p_smooth);
 	// A copy with the pinna warp: each response stretched in time by 1 / p_warp, so its spectral features (the pinna
 	// notches above all) move up by p_warp (0.8-1.25), each ear's energy kept; and resampled to p_rate (the output's
 	// mix rate, when it isn't RATE: the delays scaled, the responses read at RATE / p_rate steps).
