@@ -727,6 +727,11 @@ bool OpenXRCompositionLayerExtension::CompositionLayer::update_and_acquire_swapc
 		// If this swap chain, or the previous one, were static, then we can't reuse it.
 		if (swapchain_size == subviewport.viewport_size && !p_static_image && !subviewport.static_image && protected_content == subviewport.swapchain_protected_content) {
 			// We're all good! Just acquire it.
+			// An image still held from a frame that was not submitted (the session synchronized but not visible:
+			// end_frame submits no layers and releases nothing) is drawn into again, not acquired again.
+			if (subviewport.swapchain_info.is_image_acquired()) {
+				return true;
+			}
 			// We can ignore should_render here, return will be false.
 			bool should_render = true;
 			return subviewport.swapchain_info.acquire(should_render);

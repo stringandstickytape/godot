@@ -758,7 +758,11 @@ void OpenXRCompositionLayer::_notification(int p_what) {
 			set_notify_local_transform(enable_local_transform_notification);
 			set_notify_transform(!enable_local_transform_notification);
 
-			update_transform();
+			// Parented comes before entering the tree: a layer added to a node that is not an XROrigin3D or XRCamera3D
+			// has no global transform yet ("!is_inside_tree()" from get_global_transform), and ENTER_TREE updates it.
+			if (is_inside_tree()) {
+				update_transform();
+			}
 		} break;
 		case NOTIFICATION_EXIT_TREE: {
 			// This will clean up existing resources.
