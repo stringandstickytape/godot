@@ -42,8 +42,9 @@ env_astcenc.Prepend(CPPPATH=[thirdparty_dir])
 env_thirdparty = env_astcenc.Clone()
 env_thirdparty.disable_warnings()
 
-# Build the encoder only for editor builds
-astc_encoder = env.editor_build
+# The encoder in every build, the export templates too: the player compresses imported textures on the headset
+# (VR video player, user materials at 2K).
+astc_encoder = True
 
 if not astc_encoder:
     env_thirdparty.Append(CPPDEFINES=[("ASTCENC_DECOMPRESS_ONLY")])
