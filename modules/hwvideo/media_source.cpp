@@ -2351,6 +2351,7 @@ void MediaSource::_close_internal() {
 		marker_count = 0;
 		audio_eof = true;
 	}
+	_close_stream();
 }
 
 void MediaSource::close() {
@@ -2369,6 +2370,9 @@ void MediaSource::close() {
 }
 
 const AVCodecParameters *MediaSource::get_video_codec_parameters() const {
+	if (pushed) {
+		return pushed_parameters;
+	}
 	if (format == nullptr || video.stream_index < 0) {
 		return nullptr;
 	}
@@ -2718,7 +2722,7 @@ String MediaSource::get_subtitle_header() const {
 }
 
 bool MediaSource::is_live() const {
-	return net_stream != nullptr && net_stream->is_live();
+	return pushed || (net_stream != nullptr && net_stream->is_live());
 }
 
 bool MediaSource::is_seekable() const {
@@ -2727,6 +2731,9 @@ bool MediaSource::is_seekable() const {
 
 int MediaSource::seek(double p_seconds) {
 	ERR_FAIL_COND_V_MSG(!is_open(), -1, "MediaSource: not open.");
+	if (pushed) {
+		return _seek_stream(p_seconds);
+	}
 	if (!is_seekable()) {
 		WARN_PRINT_ONCE("MediaSource: a live stream (or a server without Range support) can't seek.");
 		MutexLock lock(mutex);
@@ -2922,6 +2929,9 @@ Dictionary MediaSource::get_stats() const {
 		d["audio_finished"] = audio_eof && ring_write == ring_read;
 	}
 	// mutex is still held (since the counters above).
+	if (pushed) {
+		_stream_stats_locked(d);
+	}
 	d["night_mode"] = night_mode;
 	d["night_mode_decoder_drc"] = stats.decoder_drc;
 	d["dialogue_boost_applies"] = stats.dialogue_boost_applies;
@@ -3175,6 +3185,7 @@ MediaSource::~MediaSource() {
 
 void MediaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open", "path"), &MediaSource::open);
+	_bind_stream_methods();
 	ClassDB::bind_method(D_METHOD("close"), &MediaSource::close);
 	ClassDB::bind_method(D_METHOD("is_open"), &MediaSource::is_open);
 	ClassDB::bind_method(D_METHOD("get_path"), &MediaSource::get_path);

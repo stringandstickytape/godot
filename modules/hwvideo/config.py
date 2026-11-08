@@ -9,6 +9,7 @@ def configure(env):
 
 def get_doc_classes():
     return [
+        "AudioPacketDecoder",
         "AudioStreamMedia",
         "AudioStreamPlaybackMedia",
         "BinauralRenderer",

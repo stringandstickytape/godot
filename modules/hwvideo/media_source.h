@@ -566,6 +566,19 @@ private:
 	void _count_video_bytes_locked(double p_pts, uint32_t p_bytes);
 	static Dictionary _subtitle_track_to_dictionary(const SubtitleTrack &p_track, int p_index, bool p_external);
 
+	// Pushed packets (open_stream(), media_source_stream.cpp): no file and no demux thread. The app hands over each access
+	// unit as it arrives (a PC window's stream), and the consumers read them from the same video queue as a film's.
+	static constexpr uint32_t STREAM_QUEUE_MAX = 120; // Access units queued before the consumer counts as behind.
+	bool pushed = false;
+	AVCodecParameters *pushed_parameters = nullptr; // What SoftwareVideoDecoder asks of a stream (the codec, the size).
+	bool pushed_need_keyframe = true; // Under mutex: access units are dropped until a keyframe (after a drop or a seek).
+	bool pushed_keyframe_wanted = false; // Under mutex: something was dropped; the sender should start again from a keyframe.
+	uint64_t pushed_packets = 0; // Under mutex.
+	uint64_t pushed_dropped = 0;
+	void _close_stream();
+	int _seek_stream(double p_seconds);
+	void _stream_stats_locked(Dictionary &r_stats) const;
+
 	void _set_error(const String &p_message);
 	void _close_network();
 	double _media_time(int64_t p_ts, int p_stream) const;
@@ -626,11 +639,28 @@ private:
 
 protected:
 	static void _bind_methods();
+	static void _bind_stream_methods();
 
 public:
 	Error open(const String &p_path);
 	void close();
-	bool is_open() const { return format != nullptr; }
+	bool is_open() const { return format != nullptr || pushed; }
+
+	// A stream of pushed access units instead of a file (a PC window, docs/pc-windows.md of the player): H.264 or HEVC
+	// ("h264", "hevc") of about p_width x p_height, 8 or 10 bits. No demux thread and no audio; the stream is live (a
+	// seek drops what is queued and waits for the next keyframe). Push the first keyframe before an HWVideoTexture opens
+	// the source, so the decoder starts with the stream's SPS.
+	Error open_stream(const String &p_codec, int p_width, int p_height, int p_bit_depth = 8);
+	// One access unit in Annex B (start codes; a keyframe carries its parameter sets) at p_time_usec on the sender's clock:
+	// its media time is p_time_usec / 1e6 seconds. Any thread, one pusher at a time. False when it was dropped: before the
+	// first keyframe, after end_stream(), or because the consumer is behind (STREAM_QUEUE_MAX access units queued). After
+	// a drop everything up to the next keyframe goes too (the decoder would have no reference), and is_keyframe_wanted()
+	// is true until one comes.
+	bool push_video_packet(const PackedByteArray &p_data, int64_t p_time_usec, bool p_keyframe);
+	// No more access units: what is queued is still decoded, then the decoder ends (is_video_input_done()).
+	void end_stream();
+	bool is_stream() const { return pushed; }
+	bool is_keyframe_wanted() const;
 
 	String get_path() const { return path; }
 	Dictionary get_info() const;

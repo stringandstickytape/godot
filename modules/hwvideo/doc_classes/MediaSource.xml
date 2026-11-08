@@ -350,6 +350,52 @@
 				Returns the ISO 639-1 code for a language as containers and file names give it: ISO 639-2/B and /T codes ([code]"ger"[/code], [code]"deu"[/code]), ISO 639-1 codes, and English names ([code]"German"[/code]) all give [code]"de"[/code]. Lower case, with a region kept after a hyphen ([code]"pt_BR"[/code] gives [code]"pt-br"[/code]). [code]"und"[/code] and other "no language" codes give an empty string; unknown codes come back lower case.
 			</description>
 		</method>
+		<method name="end_stream">
+			<return type="void" />
+			<description>
+				Stream mode ([method open_stream]): no more access units come. What is queued is still decoded; then the decoder ends.
+			</description>
+		</method>
+		<method name="is_keyframe_wanted" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Stream mode: access units were dropped (the decoder fell behind, or a seek) and everything up to the next keyframe is dropped too. Ask the sender for a keyframe. [code]false[/code] again once one came.
+			</description>
+		</method>
+		<method name="is_stream" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] between a successful [method open_stream] and [method close].
+			</description>
+		</method>
+		<method name="open_stream">
+			<return type="int" enum="Error" />
+			<param index="0" name="codec" type="String" />
+			<param index="1" name="width" type="int" />
+			<param index="2" name="height" type="int" />
+			<param index="3" name="bit_depth" type="int" default="8" />
+			<description>
+				Opens a stream of pushed access units instead of a file: no demuxer, no thread, no audio. [param codec] is [code]"h264"[/code] or [code]"hevc"[/code]; [param width] x [param height] the picture's size, or 0 x 0 to take the size and bit depth from the first SPS. Hand each access unit to [method push_video_packet]; open an [HWVideoTexture] on the source ([method HWVideoTexture.open_source]) once the first keyframe is in, and it decodes the stream exactly as a film's (V4L2 in hardware, else software) and shows each frame when the clock passed to [method HWVideoTexture.update] reaches its time. The stream is live: [method seek] drops what is queued and waits for the next keyframe.
+				[codeblock]
+				var source := MediaSource.new()
+				source.open_stream("hevc", 0, 0)
+				source.push_video_packet(keyframe_bytes, time_usec, true)
+				var texture := HWVideoTexture.new()
+				texture.open_source(source)
+				texture.play()
+				# every frame: texture.update(delta, the sender's time to show now, in seconds)
+				[/codeblock]
+			</description>
+		</method>
+		<method name="push_video_packet">
+			<return type="bool" />
+			<param index="0" name="data" type="PackedByteArray" />
+			<param index="1" name="time_usec" type="int" />
+			<param index="2" name="keyframe" type="bool" />
+			<description>
+				Stream mode: one access unit in Annex B (start codes; a keyframe carries its parameter sets) at [param time_usec] microseconds on the sender's clock, so its media time is [code]time_usec / 1e6[/code] seconds. Any thread, one pusher at a time. Returns [code]false[/code] when it was dropped: before the first keyframe, after [method end_stream], or because 120 access units are queued (the decoder is behind). After a drop everything up to the next keyframe is dropped too, and [method is_keyframe_wanted] is [code]true[/code].
+			</description>
+		</method>
 		<method name="open">
 			<return type="int" enum="Error" />
 			<param index="0" name="path" type="String" />

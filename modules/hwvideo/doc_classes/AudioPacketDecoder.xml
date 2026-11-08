@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="AudioPacketDecoder" inherits="RefCounted" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Decodes compressed audio frames that arrive one by one (AAC with its ADTS header) to stereo frames.
+	</brief_description>
+	<description>
+		For audio that comes without a container, a frame at a time: a PC's sound sent over the network. Each [method decode] takes one packet and returns the stereo frames it decoded to, resampled to the output rate. There is no clock: the caller plays them (an [AudioStreamGenerator]) at their time.
+		[codeblock]
+		var decoder := AudioPacketDecoder.new()
+		decoder.open("aac")
+		var frames := decoder.decode(adts_frame)  # PackedVector2Array at decoder.get_output_rate()
+		[/codeblock]
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="close">
+			<return type="void" />
+			<description>
+				Frees the decoder.
+			</description>
+		</method>
+		<method name="decode">
+			<return type="PackedVector2Array" />
+			<param index="0" name="packet" type="PackedByteArray" />
+			<description>
+				Decodes one packet. Returns its frames as stereo at [method get_output_rate] (empty for a damaged packet, which is counted in [method get_stats], or while the resampler fills).
+			</description>
+		</method>
+		<method name="flush">
+			<return type="void" />
+			<description>
+				Drops what the decoder and the resampler hold, so after a gap nothing old comes out first.
+			</description>
+		</method>
+		<method name="get_channels" qualifiers="const">
+			<return type="int" />
+			<description>
+				The stream's channels, once a packet has decoded (0 before).
+			</description>
+		</method>
+		<method name="get_last_error" qualifiers="const">
+			<return type="String" />
+			<description>
+				Why [method open] failed, or why the resampler couldn't be made.
+			</description>
+		</method>
+		<method name="get_output_rate" qualifiers="const">
+			<return type="int" />
+			<description>
+				The rate of the frames [method decode] returns.
+			</description>
+		</method>
+		<method name="get_sample_rate" qualifiers="const">
+			<return type="int" />
+			<description>
+				The stream's own rate, once a packet has decoded (0 before).
+			</description>
+		</method>
+		<method name="get_stats" qualifiers="const">
+			<return type="Dictionary" />
+			<description>
+				[code]codec[/code], [code]open[/code], [code]output_rate[/code], [code]sample_rate[/code], [code]channels[/code], [code]packets[/code], [code]frames_out[/code], [code]errors[/code].
+			</description>
+		</method>
+		<method name="is_open" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] between a successful [method open] and [method close].
+			</description>
+		</method>
+		<method name="open">
+			<return type="int" enum="Error" />
+			<param index="0" name="codec" type="String" default="&quot;aac&quot;" />
+			<param index="1" name="output_rate" type="int" default="0" />
+			<description>
+				Opens FFmpeg's decoder of that name (any audio decoder of the build that needs no extradata; AAC reads the ADTS header of each frame). [param output_rate] 0: the [AudioServer]'s mix rate.
+			</description>
+		</method>
+	</methods>
+</class>
