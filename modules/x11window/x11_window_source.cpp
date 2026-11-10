@@ -162,6 +162,25 @@ void X11WindowSource::_render_flush() {
 					rd->texture_update(op.rd_texture, 0, op.data);
 				}
 				break;
+			case RenderOp::UPLOAD_RECT:
+				// RenderingDevice updates whole layers only: the rectangle goes up as a small texture of its own, and
+				// is copied into place on the GPU.
+				if (rd != nullptr && op.rd_texture.is_valid() && rd->texture_is_valid(op.rd_texture)) {
+					RD::TextureFormat format;
+					format.format = RD::DATA_FORMAT_B8G8R8A8_UNORM;
+					format.width = op.rect.size.x;
+					format.height = op.rect.size.y;
+					format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
+					Vector<Vector<uint8_t>> layers;
+					layers.push_back(op.data);
+					RID part = rd->texture_create(format, RD::TextureView(), layers);
+					if (part.is_valid()) {
+						rd->texture_copy(part, op.rd_texture, Vector3(0, 0, 0), Vector3(op.rect.position.x, op.rect.position.y, 0),
+								Vector3(op.rect.size.x, op.rect.size.y, 1), 0, 0, 0, 0);
+						rd->free_rid(part);
+					}
+				}
+				break;
 		}
 	}
 	render_ops.clear(); // Keeps the capacity.
@@ -179,13 +198,14 @@ void X11WindowSource::_render_free_images(const Array &p_images) {
 	}
 }
 
-void X11WindowSource::_queue_render_op(RenderOp::Type p_type, const Ref<X11DmabufImage> &p_image, RID p_rd_texture, const Vector<uint8_t> &p_data) {
+void X11WindowSource::_queue_render_op(RenderOp::Type p_type, const Ref<X11DmabufImage> &p_image, RID p_rd_texture, const Vector<uint8_t> &p_data, const Rect2i &p_rect) {
 	MutexLock lock(render_mutex);
 	RenderOp op;
 	op.type = p_type;
 	op.image = p_image;
 	op.rd_texture = p_rd_texture;
 	op.data = p_data;
+	op.rect = p_rect;
 	render_ops.push_back(op);
 }
 
@@ -687,11 +707,16 @@ Error X11WindowSource::capture(int64_t p_window) {
 	if (composite_version >= _version(0, 2)) {
 		redirected = _check(xcb->xcb_composite_redirect_window_checked(connection, window, XCB_COMPOSITE_REDIRECT_AUTOMATIC), "RedirectWindow");
 	}
+	// The copy path asks for the damage's bounding box, to read only what changed (a terminal's one line, not the
+	// whole window on every tick). The dmabuf path copies nothing, and only needs to know that something changed.
+	const bool by_copy = !(preferred_mode == CAPTURE_DMABUF && dri3_version > 0 && composite_version >= _version(0, 2));
+	damage_boxes = false;
 	if (damage_version > 0) {
 		damage = xcb->xcb_generate_id(connection);
-		if (!_check(xcb->xcb_damage_create_checked(connection, damage, window, XCB_DAMAGE_REPORT_LEVEL_NON_EMPTY), "DamageCreate")) {
+		if (!_check(xcb->xcb_damage_create_checked(connection, damage, window, by_copy ? XCB_DAMAGE_REPORT_LEVEL_BOUNDING_BOX : XCB_DAMAGE_REPORT_LEVEL_NON_EMPTY), "DamageCreate")) {
 			damage = 0;
 		}
+		damage_boxes = by_copy && damage != 0;
 	}
 	if (damage == 0) {
 		WARN_PRINT("X11WindowSource: no DAMAGE: the window is read every frame.");
@@ -707,7 +732,7 @@ Error X11WindowSource::capture(int64_t p_window) {
 		}
 		mode = (shm_version > 0 && preferred_mode != CAPTURE_GET_IMAGE) ? CAPTURE_SHM : CAPTURE_GET_IMAGE;
 	}
-	dirty = true;
+	dirty = true; dirty_rect_only = false;
 	deferred_frames = 0;
 	pointer_window = 0;
 	button_state = 0;
@@ -764,6 +789,18 @@ void X11WindowSource::_handle_event(xcb_generic_event_t *p_event) {
 	if (damage_version > 0 && type == damage_event_base + XCB_DAMAGE_NOTIFY) {
 		const xcb_damage_notify_event_t *event = (const xcb_damage_notify_event_t *)p_event;
 		if (event->damage == damage && damage != 0) {
+			if (damage_boxes) {
+				// The box of everything drawn since the last subtract. A box that is all there is to read stays one.
+				const Rect2i box(event->area.x, event->area.y, event->area.width, event->area.height);
+				if (!dirty) {
+					dirty_rect_only = true;
+					dirty_rect = box;
+				} else if (dirty_rect_only) {
+					dirty_rect = dirty_rect.merge(box);
+				}
+			} else {
+				dirty_rect_only = false;
+			}
 			dirty = true;
 			damage_events++;
 		}
@@ -776,7 +813,7 @@ void X11WindowSource::_handle_event(xcb_generic_event_t *p_event) {
 				const Size2i new_size(event->width, event->height);
 				if (new_size != size) {
 					size = new_size;
-					dirty = true;
+					dirty = true; dirty_rect_only = false;
 				}
 				_update_root_position();
 			}
@@ -785,7 +822,7 @@ void X11WindowSource::_handle_event(xcb_generic_event_t *p_event) {
 			const xcb_map_notify_event_t *event = (const xcb_map_notify_event_t *)p_event;
 			if (event->window == window && window != 0) {
 				mapped = true;
-				dirty = true;
+				dirty = true; dirty_rect_only = false;
 				_update_root_position();
 				emit_signal(SNAME("mapped_changed"), true);
 			}
@@ -863,7 +900,7 @@ bool X11WindowSource::update() {
 		return false;
 	}
 	if (damage == 0) {
-		dirty = true;
+		dirty = true; dirty_rect_only = false;
 	}
 	if (!dirty) {
 		return false;
@@ -896,9 +933,15 @@ bool X11WindowSource::update() {
 			changed = true;
 		}
 	} else {
-		failed = _fetch_copy() != OK;
+		// Only boxes of damage since the last read, on a texture of this size, and under half of it: read just that.
+		const Rect2i box = dirty_rect.intersection(Rect2i(0, 0, size.width, size.height));
+		const bool partial = damage_boxes && dirty_rect_only && upload_rd_texture.is_valid() && upload_size == size && box.has_area() &&
+				int64_t(box.size.x) * box.size.y * 2 <= int64_t(size.width) * size.height;
+		failed = (partial ? _fetch_copy_rect(box) : _fetch_copy()) != OK;
 		changed = !failed;
 	}
+	dirty_rect_only = false;
+	dirty_rect = Rect2i();
 	if (changed) {
 		dirty = false;
 		deferred_frames = 0;
@@ -1259,7 +1302,8 @@ Error X11WindowSource::_fetch_copy() {
 		format.format = RD::DATA_FORMAT_B8G8R8A8_UNORM;
 		format.width = size.width;
 		format.height = size.height;
-		format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+		// Copy to: a changed rectangle is copied in (UPLOAD_RECT). Copy from: a test can read the texture back.
+		format.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 		RD::TextureView view;
 		if (image_depth != 32) {
 			view.swizzle_a = RD::TEXTURE_SWIZZLE_ONE;
@@ -1271,6 +1315,47 @@ Error X11WindowSource::_fetch_copy() {
 		texture->set_source(upload_texture, size, image_depth == 32);
 	}
 	_queue_render_op(RenderOp::UPLOAD, Ref<X11DmabufImage>(), upload_rd_texture, upload_data);
+	return OK;
+}
+
+// One rectangle of the window, for a texture that already holds the rest (update()).
+Error X11WindowSource::_fetch_copy_rect(const Rect2i &p_rect) {
+	const size_t bytes = size_t(p_rect.size.x) * p_rect.size.y * 4;
+	if (mode == CAPTURE_SHM && _ensure_shm(bytes) != OK) {
+		return _fetch_copy();
+	}
+	Vector<uint8_t> data;
+	data.resize(bytes);
+	xcb_generic_error_t *error = nullptr;
+	if (mode == CAPTURE_SHM) {
+		XCBReply<xcb_shm_get_image_reply_t> reply(xcb->xcb_shm_get_image_reply(connection,
+				xcb->xcb_shm_get_image(connection, window, p_rect.position.x, p_rect.position.y, p_rect.size.x, p_rect.size.y, ~0u, XCB_IMAGE_FORMAT_Z_PIXMAP, shm_segment, 0), &error));
+		if (!reply || reply->size < bytes) {
+			if (error) {
+				_error_event(error);
+				free(error);
+			}
+			last_error = reply ? "ShmGetImage returned fewer bytes than expected." : "ShmGetImage failed: " + last_x_error + ".";
+			return ERR_CANT_ACQUIRE_RESOURCE;
+		}
+		memcpy(data.ptrw(), shm_data, bytes);
+	} else {
+		XCBReply<xcb_get_image_reply_t> reply(xcb->xcb_get_image_reply(connection,
+				xcb->xcb_get_image(connection, XCB_IMAGE_FORMAT_Z_PIXMAP, window, p_rect.position.x, p_rect.position.y, p_rect.size.x, p_rect.size.y, ~0u), &error));
+		if (!reply || (size_t)xcb->xcb_get_image_data_length(reply.reply) < bytes) {
+			if (error) {
+				_error_event(error);
+				free(error);
+			}
+			last_error = reply ? "GetImage returned fewer bytes than expected." : "GetImage failed: " + last_x_error + ".";
+			return ERR_CANT_ACQUIRE_RESOURCE;
+		}
+		memcpy(data.ptrw(), xcb->xcb_get_image_data(reply.reply), bytes);
+	}
+	copies++;
+	partial_copies++;
+	bytes_copied += bytes;
+	_queue_render_op(RenderOp::UPLOAD_RECT, Ref<X11DmabufImage>(), upload_rd_texture, data, p_rect);
 	return OK;
 }
 
@@ -1290,6 +1375,7 @@ Dictionary X11WindowSource::get_stats() const {
 	stats["format"] = fourcc ? X11DmabufImage::fourcc_to_string(fourcc) : String();
 	stats["modifier"] = "0x" + String::num_uint64(modifier, 16);
 	stats["damage_events"] = damage_events;
+	stats["partial_copies"] = partial_copies;
 	stats["frames_updated"] = frames_updated;
 	stats["frames_deferred"] = frames_deferred;
 	stats["imports"] = imports;

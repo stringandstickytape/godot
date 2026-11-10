@@ -107,11 +107,13 @@ private:
 			RELEASE,
 			FREE, // Release if needed, then free.
 			UPLOAD, // Copy path: texture_update of upload_texture.
+			UPLOAD_RECT, // Copy path: only `rect` of upload_texture changed; `data` is that rectangle.
 		};
 		Type type = ACQUIRE;
 		Ref<X11DmabufImage> image;
 		RID rd_texture;
 		Vector<uint8_t> data;
+		Rect2i rect;
 	};
 
 	struct KeyCode {
@@ -149,6 +151,10 @@ private:
 	bool mapped = false;
 	bool window_destroyed = false;
 	bool dirty = false;
+	// Copy path: DAMAGE reports bounding boxes, and while only those made the window dirty just their union is read.
+	bool damage_boxes = false;
+	bool dirty_rect_only = false;
+	Rect2i dirty_rect;
 	int deferred_frames = 0;
 	Size2i size;
 	Point2i root_position;
@@ -198,6 +204,7 @@ private:
 	// Stats.
 	uint64_t frame_counter = 0;
 	uint64_t damage_events = 0;
+	uint64_t partial_copies = 0;
 	uint64_t frames_updated = 0;
 	uint64_t frames_deferred = 0;
 	uint64_t imports = 0;
@@ -216,7 +223,7 @@ private:
 	static void _render_free_images(const Array &p_images);
 
 	void _render_flush();
-	void _queue_render_op(RenderOp::Type p_type, const Ref<X11DmabufImage> &p_image, RID p_rd_texture = RID(), const Vector<uint8_t> &p_data = Vector<uint8_t>());
+	void _queue_render_op(RenderOp::Type p_type, const Ref<X11DmabufImage> &p_image, RID p_rd_texture = RID(), const Vector<uint8_t> &p_data = Vector<uint8_t>(), const Rect2i &p_rect = Rect2i());
 	void _kick_render_ops();
 
 	xcb_atom_t _atom(const String &p_name, bool p_create = true);
@@ -241,6 +248,7 @@ private:
 	void _free_shm();
 	void _free_buffers();
 	void _free_upload_texture();
+	Error _fetch_copy_rect(const Rect2i &p_rect);
 	void _evict_buffers();
 
 	xcb_window_t _pointer_target(int p_x, int p_y, int &r_x, int &r_y);
