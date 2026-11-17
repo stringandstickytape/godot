@@ -12,7 +12,14 @@
          TargetFramework stays net8.0, so GodotPlugins.dll is unchanged; only its .runtimeconfig.json names 9.0.0. -->
     <RollForward>LatestMinor</RollForward>
     <RuntimeFrameworkVersion>9.0.0</RuntimeFrameworkVersion>
+    <!-- The game's export GC (Godot4Test.csproj): editor runs collect and tier up as players do. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
   </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.Runtime.TieredCompilation.CallCountingDelayMs" Value="0" />
+    <RuntimeHostConfigurationOption Include="System.GC.NoAffinitize" Value="true" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\GodotSharp\GodotSharp.csproj" />
