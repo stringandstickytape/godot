@@ -128,10 +128,12 @@ double XRServer::get_world_scale() const {
 }
 
 void XRServer::set_world_scale(double p_world_scale) {
+	// Anthropolis: the upper limit is a project setting, upstream's 1000 by default.
+	const double world_scale_limit = MAX(1000.0, GLOBAL_GET_CACHED(double, "xr/anthropolis_world_scale_limit"));
 	if (p_world_scale < 0.01) {
 		p_world_scale = 0.01;
-	} else if (p_world_scale > 1000.0) {
-		p_world_scale = 1000.0;
+	} else if (p_world_scale > world_scale_limit) {
+		p_world_scale = world_scale_limit;
 	}
 
 	world_scale = p_world_scale;
@@ -489,6 +491,10 @@ void XRServer::end_frame() {
 
 XRServer::XRServer() {
 	singleton = this;
+	// Anthropolis: the largest world scale set_world_scale accepts. Upstream clamps at 1000; a game that shows a whole
+	// city as a model on a table in VR needs more (1:20000 for a 32 km map). Default 1000, so behaviour is upstream's
+	// until a project raises it.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "xr/anthropolis_world_scale_limit", PROPERTY_HINT_RANGE, "1000,1000000,1,or_greater"), 1000.0);
 }
 
 XRServer::~XRServer() {
